@@ -689,6 +689,30 @@ async def _default_flatten(store: Any, *, reason: str = "", by: str = "admin",
 # ================================================================== 应用工厂
 
 
+def _default_panel_sources(cache: "PanelCache",
+                           *, market_source: bool = False) -> views.Sources:
+    """生产装配的面板数据源：tick 的 PanelCache（权益/挂单/现价）+ 可选公开 K 线。
+
+    T10 落地时漏了这一步：`create_app()` 从没把 cache / `app.market` 接进
+    `views.Sources`，面板的仓位现价、止损覆盖、三标的动态永远「无数据源」。
+    K 线是**真 HTTP**，所以只在真正的生产入口（模块级 `app`，`market_source=True`）
+    打开 —— 离线测试与降级测试的装配不因一次 `/symbols` 发网络请求。
+    """
+    bars: Optional[Callable[[str], Any]] = None
+    if market_source:
+        def bars(symbol: str) -> Any:                         # noqa: F811 - 闭包赋值
+            from app.market import DEFAULT_ENVIRONMENT, MarketClient
+            source = getattr(bars, "_source", None)
+            if source is None:
+                env = ((os.environ.get("LIGHTER_ENVIRONMENT") or "").strip()
+                       or DEFAULT_ENVIRONMENT)
+                source = MarketBarSource(MarketClient(env))
+                bars._source = source                         # type: ignore[attr-defined]
+            return source(symbol)
+    return views.Sources(equity=cache.equity, orders=cache.orders,
+                         prices=cache.prices, bars=bars)
+
+
 def create_app(*, panel: Optional[views.Panel] = None,
                store_factory: Optional[Callable[[], Any]] = None,
                sources: Optional[views.Sources] = None,
@@ -703,7 +727,8 @@ def create_app(*, panel: Optional[views.Panel] = None,
                scheduler: Optional[TickScheduler] = None,
                enable_scheduler: bool = False,
                credentials: Optional[Callable[[], Any]] = None,
-               cache: Optional[PanelCache] = None) -> FastAPI:
+               cache: Optional[PanelCache] = None,
+               market_source: bool = False) -> FastAPI:
     """建 app。所有依赖都可注入 —— 测试用 `create_app(panel=..., admin_token=...)`
     就能全离线跑完 6 个只读端点与 3 个写操作。
 
@@ -713,12 +738,14 @@ def create_app(*, panel: Optional[views.Panel] = None,
     """
     resolved_limit = limits if limits is not None else _limits_from_env()
     factory = store_factory or default_store_factory
+    cache = cache if cache is not None else PanelCache()
+    if panel is None and sources is None:
+        sources = _default_panel_sources(cache, market_source=market_source)
     panel = panel if panel is not None else views.Panel(
         factory, sources=sources, limits=resolved_limit, mode=mode, now=clock,
         symbols=symbols,
         credentials=credentials if credentials is not None else credential_status)
     flatten_impl = flatten or _default_flatten
-    cache = cache if cache is not None else PanelCache()
     token = (_configured_token() if admin_token is None else str(admin_token).strip())
     sched_box: Dict[str, Any] = {"scheduler": scheduler, "error": ""}
 
@@ -1088,7 +1115,42 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
                          prices=dict(getattr(executor, "_prices", {}) or {}),
                          ts=time.time(),
                          error=str(getattr(account, "orders_error", "") or ""))
+        await _advance_drawdown(store, executor, reader)
         return report
+
+    async def _advance_drawdown(store: Any, executor: Any, reader: Any) -> None:
+        """`docs/DD_WATCHDOG.md` §6 的接线项：每轮 tick 在 `run_once()` 之后推进 TWR。
+
+        首次没有 `dd_state` 时 `update()` 内部走 `bootstrap()`（以库里最早的权益点为锚）。
+        权益未知（账户读失败）就跳过本轮推进并落事件 —— 面板/风控会按
+        「回撤口径不可用」fail-closed，绝不拿旧 equity 硬算。流水读不到则按
+        「无流水」推进并落事件（有出入金的时段 TWR 会失真，但开仓闸不会瞎掉）。
+        """
+        equity = getattr(getattr(executor, "last_account", None), "equity", None)
+        if equity is None:
+            store.log_event("dd_update_failed", "权益未知，本轮未推进回撤（fail-closed）",
+                            data={"reason": "equity_unavailable"}, ts=time.time())
+            return
+        flows: Sequence[Mapping[str, float]] = ()
+        transfer_reader = getattr(reader, "transfers", None)
+        if callable(transfer_reader):
+            try:
+                flows = tuple(await asyncio.to_thread(transfer_reader))
+            except Exception as exc:                          # noqa: BLE001 - 流水失败不挡 dd
+                store.log_event(
+                    "dd_update_failed",
+                    "出入金流水读取失败，按无流水推进（若该时段有出入金，TWR 会失真）: "
+                    f"{type(exc).__name__}: {exc}",
+                    data={"reason": "flows_unavailable"}, ts=time.time())
+        try:
+            state = DrawdownGuard(store, limits=_limits()).update(
+                equity=float(equity), ts=time.time(), flows=flows)
+            logger.info("dd advanced: index=%.6f peak=%.6f action=%s",
+                        state.index, state.peak, state.action)
+        except Exception as exc:                              # noqa: BLE001 - DD 不挂掉 tick
+            store.log_event("dd_update_failed",
+                            f"回撤推进失败: {type(exc).__name__}: {exc}",
+                            data={"reason": "update_failed"}, ts=time.time())
 
     def _close() -> None:
         """关掉 tick 里自建的 store（**第三个**连接）。
@@ -1114,5 +1176,7 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
 # 模块级 app：`uvicorn app.main:app` 用它。
 #
 # 刻意**不**在 import 时读凭据 / 连库：`/health` 必须永远 200（T1 契约），而容器可能
-# 先起服务、后注入环境变量。DB 与 runner 都是懒建的。
-app = create_app(enable_scheduler=(os.environ.get("PANEL_SCHEDULER", "1") != "0"))
+# 先起服务、后注入环境变量。DB 与 runner 都是懒建的。`market_source=True` 只在这里
+# 打开：生产面板的 K 线走 `app.market` 公开接口（懒建，首个请求才发 HTTP）。
+app = create_app(enable_scheduler=(os.environ.get("PANEL_SCHEDULER", "1") != "0"),
+                 market_source=True)

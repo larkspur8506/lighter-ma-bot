@@ -370,14 +370,29 @@ class HtmlTests(PanelFixture):
                 self.assertIn(f'id="block-{name}"', html)
 
     def test_html_is_self_contained(self) -> None:
-        """自包含 = 没有外链（运行环境可能没外网；CDN 挂了就是空白页）。"""
+        """自包含 = 没有外链（运行环境可能没外网；CDN 挂了就是空白页）。
+
+        内联 `<script>`（⑦ 人工操作区的三个写按钮）是允许的：它同样不依赖任何
+        外部资源 —— 所以禁的是外链形态（http(s)://、<link、src=、@import、cdn.），
+        不是 script 本身。
+        """
         html = self._html()
-        for needle in ("http://", "https://", "<link", "<script", "src=", "@import",
-                       "cdn."):
+        for needle in ("http://", "https://", "<link", "src=", "@import", "cdn.",
+                       "javascript:"):
             with self.subTest(needle=needle):
                 self.assertNotIn(needle, html)
+        self.assertIn("<script>", html)                 # 人工操作脚本是内联的
         self.assertIn("<svg", html)                     # 曲线是内联 SVG
         self.assertIn("<style>", html)                  # 样式内联
+
+    def test_html_has_the_admin_block(self) -> None:
+        """⑦ 人工操作区必须在页面上（kill / 强制清仓 / 重置回撤三个按钮）。"""
+        html = self._html()
+        for needle in ('id="block-admin"', 'id="btn-kill-on"', 'id="btn-kill-off"',
+                       'id="btn-flatten"', 'id="btn-dd-reset"',
+                       'localStorage.setItem'):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, html)
 
     def test_html_escapes_database_text(self) -> None:
         self.store.log_event("skip", "<script>alert('x')</script> 未过密集门槛")

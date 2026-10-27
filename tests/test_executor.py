@@ -820,7 +820,7 @@ class FailureHandlingTests(Base):
                 roots.update(alias.name.split(".")[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 roots.add(node.module.split(".")[0])
-        allowed = {"__future__", "asyncio", "json", "logging", "time", "urllib",
+        allowed = {"__future__", "asyncio", "json", "logging", "math", "time", "urllib",
                    "dataclasses", "decimal", "typing", "app", "tests"}
         self.assertEqual(roots - allowed, set(), f"unexpected imports: {sorted(roots - allowed)}")
 
@@ -942,6 +942,55 @@ class ReaderTests(unittest.TestCase):
         self.assertTrue(blob["blocker"])
         report = executor.ReconcileReport(issues=(issue,))
         self.assertTrue(json.loads(json.dumps(report.as_dict()))["has_blockers"])
+
+
+class TransferFlowTests(unittest.TestCase):
+    """`transfers_to_flows` + `LighterAccountReader.transfers`（TWR 的出入金流水输入）。
+
+    `app.dd.net_flow` 吃的格式是 `{"ts": epoch_s, "amount": 带符号 USDC}`
+    （正 = 入金，负 = 出金）——方向猜反比少一笔更危险，所以认不出的行整条丢弃。
+    """
+
+    def test_parses_direction_signed_amounts(self) -> None:
+        payload = {"code": 200, "transfers": [
+            {"ts": 1793120000000, "amount": "50.5", "direction": "in"},      # ms → s
+            {"timestamp": 1793120000, "amount": 20, "type": "withdrawal"},   # 负
+            {"created_at": 1793120000, "usdc": 5, "side": "deposit"},        # 正
+        ]}
+        flows = executor.transfers_to_flows(payload)
+        self.assertEqual(flows[0], {"ts": 1793120000.0, "amount": 50.5})
+        self.assertEqual(flows[1], {"ts": 1793120000.0, "amount": -20.0})
+        self.assertEqual(flows[2], {"ts": 1793120000.0, "amount": 5.0})
+
+    def test_drops_unrecognisable_rows(self) -> None:
+        payload = {"transfers": [
+            {"amount": "10", "direction": "sideways"},       # 方向不认识
+            {"amount": "10"},                                # 没有方向字段
+            {"ts": 1793120000, "direction": "in"},           # 没有金额
+            {"ts": 0, "amount": "1", "direction": "in"},     # 时间戳非法
+            "junk",                                          # 行不是 Mapping
+        ]}
+        self.assertEqual(executor.transfers_to_flows(payload), ())
+        self.assertEqual(executor.transfers_to_flows({"transfers": []}), ())
+        self.assertEqual(executor.transfers_to_flows(None), ())
+        self.assertEqual(executor.transfers_to_flows("nope"), ())
+        self.assertEqual(executor.transfers_to_flows(12345), ())
+
+    def test_reader_transfers_uses_auth_and_site_root(self) -> None:
+        seen: List[Tuple[str, Dict[str, str]]] = []
+
+        def http_json(url, headers=None, timeout=None):
+            seen.append((url, dict(headers or {})))
+            return {"code": 200, "transfers": [], "cursor": ""}
+
+        reader = executor.LighterAccountReader(
+            base_url="https://host.test/api/v1", account_index=42,
+            auth_provider=lambda: "tok-9", http_json=http_json)
+        self.assertEqual(reader.transfers(), ())
+        url, headers = seen[0]
+        self.assertNotIn("/api/v1/api/v1", url)              # 站点根归一化（403 坑）
+        self.assertIn("/api/v1/transfer/history?account_index=42", url)
+        self.assertEqual(headers.get("Authorization"), "tok-9")
 
 
 if __name__ == "__main__":                                        # pragma: no cover
