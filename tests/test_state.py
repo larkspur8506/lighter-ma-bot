@@ -358,6 +358,20 @@ class DayStartTests(StateTestCase):
         self.assertEqual(snap.trades_today, 5)
         self.assertEqual(snap.trades_today_source, "counter")
 
+    def test_trades_today_drift_is_reported_as_a_warning(self):
+        """两个当日口径不一致要**说出来**（取更严一侧不等于默许不一致）。"""
+        self.seed()
+        self.assertEqual(self.assembler().snapshot().warnings, ())
+        self.store.conn.execute("UPDATE daily_counters SET trades_today=5 WHERE day=?", (DAY,))
+        self.assertTrue(any("trades_today disagrees (counter=5, entry trade rows=2)"
+                            in w for w in self.assembler().snapshot().warnings))
+        self.store.conn.execute("UPDATE daily_counters SET trades_today=1 WHERE day=?", (DAY,))
+        snap = self.assembler().snapshot()
+        self.assertEqual(snap.trades_today, 2)           # 取大：成交行更严
+        self.assertEqual(snap.trades_today_source, "trades")
+        self.assertTrue(any("trades_today disagrees (counter=1, entry trade rows=2)"
+                            in w for w in snap.warnings))
+
     def test_ensure_day_start_writes_once_and_is_the_only_write(self):
         self.store.record_equity(10000.0, ts=TS)
         assembler = self.assembler(equity_provider=lambda: 10500.0)

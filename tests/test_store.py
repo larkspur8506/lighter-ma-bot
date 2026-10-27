@@ -5,6 +5,8 @@
   * 往返读写：开/平仓、成交、权益曲线、每日计数、回撤锚点、事件流；
   * **原子性**：写一半失败不留下「有 OPEN 仓位但没有开仓成交」的半状态；
   * **幂等**：同一 order id / fill id 重复写入，行数不变；部分成交**不**被误合并；
+  * **同 bar 一笔开仓**：同 symbol+bar_ms 的第二笔 entry 成交绝不新增成交行（同价量 =
+    重复同步，价量方向不同 = `EntryConflict` fail-loud），保证 `sum(entry qty) == position.qty`；
   * WAL + `busy_timeout`：第二个连接（面板进程）能读；写锁被占时报 busy 而不是损坏；
   * 崩溃恢复：不 checkpoint 直接关库，重开后状态正确；
   * 回撤锚点：30 天清理只删 `dd_anchors`、**永不碰** `dd_state`，峰值不能被静默调低。
@@ -23,8 +25,8 @@ from unittest import mock
 
 from app import store as store_module
 from app.store import (
-    ALLOWED_TRANSITIONS, MIGRATIONS, SCHEMA_VERSION, InvalidTransition, MigrationError,
-    SchemaError, StateStore, StoreError, day_bounds, trade_key, utc_day,
+    ALLOWED_TRANSITIONS, MIGRATIONS, SCHEMA_VERSION, EntryConflict, InvalidTransition,
+    MigrationError, SchemaError, StateStore, StoreError, day_bounds, trade_key, utc_day,
 )
 
 # 固定时间戳：1760000000 = 2025-10-09T08:53:20Z，落在 UTC 日 '2025-10-09'。
@@ -470,8 +472,197 @@ class AtomicityTests(StoreTestCase):
                     entry_price_int, entry_price, price_decimals, created_at, updated_at)
                VALUES('SOL', 1, 'OPEN', 1, 1000, 1.0, 3, 15000, 150.0, 2, 1.0, 1.0)""")
         findings = self.store.audit()
-        self.assertEqual([f.code for f in findings], ["open_without_entry_trade"])
+        # 一个字都没记的仓位同时违反两条不变量：没有开仓成交、成交合计（0）≠ 仓位量。
+        self.assertEqual([f.code for f in findings],
+                         ["open_without_entry_trade", "entry_qty_mismatch"])
         self.assertEqual(findings[0]["detail"]["symbol"], "SOL")
+        self.assertEqual(findings[1]["detail"]["position_qty"], 1.0)
+        self.assertEqual(findings[1]["detail"]["entry_qty"], 0.0)
+
+
+# ------------------------------------------------------------------ 同 bar 重复 entry
+
+
+class SameBarEntryTests(StoreTestCase):
+    """一根 bar 只记一笔开仓成交 —— 重复同步幂等、价量冲突 fail-loud。
+
+    守的不变式：`sum(该仓位 kind='entry' 的 qty) == positions.qty`（容差 1e-9）。
+    """
+
+    def entry_legs(self, position_id: int):
+        return self.store._fetchall(
+            "SELECT * FROM trades WHERE position_id=? AND kind='entry' ORDER BY id ASC",
+            (int(position_id),))
+
+    def assert_leg_sum_invariant(self) -> None:
+        rows = self.store._fetchall("SELECT id, qty, qty_int FROM positions")
+        self.assertTrue(rows)
+        for row in rows:
+            legs = self.entry_legs(int(row["id"]))
+            self.assertAlmostEqual(sum(float(t["qty"]) for t in legs), float(row["qty"]),
+                                   places=9)
+            if row["qty_int"] is not None:
+                self.assertEqual(sum(int(t["qty_int"] or 0) for t in legs),
+                                 int(row["qty_int"]))
+
+    def assert_nothing_extra(self) -> None:
+        self.assertEqual(self.store.position_count(), 1)
+        self.assertEqual(self.store.trade_count(), 1)
+        self.assertEqual(self.store.event_count(), 1)
+        self.assertEqual(self.store.daily_counter(DAY)["trades_today"], 1)
+        self.assertEqual(self.store.trades_today(DAY), 1)
+        self.assertEqual(self.store.audit(), [])
+
+    def test_same_fill_id_is_fully_idempotent(self):
+        first = self.store.record_entry(**entry_plan(fill_id="FILL-1"))
+        again = self.store.record_entry(**entry_plan(fill_id="FILL-1"))
+        self.assertEqual(again.position_id, first.position_id)
+        self.assertEqual(again.trade_id, first.trade_id)
+        self.assertFalse(again.inserted_position)
+        self.assertFalse(again.inserted_trade)
+        self.assertTrue(again.idempotent)
+        self.assertTrue(again.duplicate_fill)
+        self.assert_nothing_extra()
+        self.assertEqual(self.entry_legs(first.position_id)[0]["fill_id"], "FILL-1")
+
+    def test_different_fill_id_same_price_and_qty_is_a_duplicate_sync(self):
+        """同一根 bar 换个 fill_id 再来一次 = 重复同步，**不新增成交行**（缺陷回归点）。"""
+        first = self.store.record_entry(**entry_plan(fill_id="f1", entry_order_id="o1"))
+        again = self.store.record_entry(**entry_plan(fill_id="f2", entry_order_id="o2"))
+        self.assertEqual(again.position_id, first.position_id)
+        self.assertEqual(again.trade_id, first.trade_id)     # 指回**原来那笔**
+        self.assertFalse(again.inserted_trade)
+        self.assertTrue(again.duplicate_fill)
+        self.assert_nothing_extra()
+        legs = self.entry_legs(first.position_id)
+        self.assertEqual(len(legs), 1)
+        self.assertEqual(legs[0]["fill_id"], "f1")           # 已有值不被覆盖
+        self.assertEqual(legs[0]["order_id"], "o1")            # 已有值不被覆盖
+        self.assertEqual(self.store.position(first.position_id)["qty"], 0.04)
+
+    def test_duplicate_sync_backfills_a_missing_fill_id(self):
+        """先只记了订单号、后到 fill_id → 补全那一行，仍然只有一笔成交。"""
+        first = self.store.record_entry(**entry_plan())                 # 无 fill_id
+        again = self.store.record_entry(**entry_plan(fill_id="f1"))
+        self.assertFalse(again.inserted_trade)
+        self.assertEqual(self.store.trade_count(), 1)
+        leg = self.entry_legs(first.position_id)[0]
+        self.assertEqual(leg["fill_id"], "f1")
+        self.assertEqual(leg["idempotency_key"], "order:OID-ENTRY-1:1:800000:4000")
+        self.assert_nothing_extra()
+
+    def test_different_price_for_the_same_bar_fails_loud(self):
+        self.store.record_entry(**entry_plan(fill_id="f1"))
+        with self.assertRaises(EntryConflict):
+            self.store.record_entry(**entry_plan(fill_id="f2", entry_price_int=801000))
+        self.assert_nothing_extra()
+        # 冲突之后库仍然可用（不是「写坏了」）
+        pid = self.store.position_by_bar("BTC", BAR_MS)["id"]
+        self.store.record_exit(pid, exit_price_int=820000, ts=TS + 60)
+        self.assertEqual(self.store.position(pid)["state"], "CLOSED")
+
+    def test_different_qty_for_the_same_bar_fails_loud(self):
+        self.store.record_entry(**entry_plan(fill_id="f1"))
+        with self.assertRaises(StoreError):        # 是 StoreError 的子类
+            self.store.record_entry(**entry_plan(fill_id="f2", qty_int=2000))
+        self.assert_nothing_extra()
+
+    def test_opposite_side_for_the_same_bar_fails_loud(self):
+        self.store.record_entry(**entry_plan(fill_id="f1"))
+        with self.assertRaises(EntryConflict):
+            # 空单止损要在入场价上方，先过 record_entry 自己的参数校验
+            self.store.record_entry(**entry_plan(fill_id="f2", side=-1, stop_price_int=820000))
+        self.assert_nothing_extra()
+
+    def test_closed_position_duplicate_sync_adds_nothing(self):
+        pid = self.store.record_entry(**entry_plan(fill_id="f1"))["position_id"]
+        self.store.record_exit(pid, exit_price_int=820000, ts=TS + 60)
+        again = self.store.record_entry(**entry_plan(fill_id="f2"))
+        self.assertFalse(again.inserted_trade)
+        self.assertEqual(self.store.trade_count(), 2)          # entry + exit，无第三行
+        self.assertEqual(self.entry_legs(pid).__len__(), 1)
+        self.assertEqual(self.store.audit(), [])
+
+    def test_missing_entry_leg_is_backfilled(self):
+        """历史半状态（有仓无成交）：补记**唯一**那一笔，仓位与计数口径都对齐。"""
+        self.store.conn.execute(
+            """INSERT INTO positions(symbol, side, state, bar_ms, qty_int, qty, size_decimals,
+                    entry_price_int, entry_price, price_decimals, created_at, updated_at)
+               VALUES('BTC', 1, 'OPEN', ?, 4000, 0.04, 5, 800000, 80000.0, 1, 1.0, 1.0)""",
+            (BAR_MS,))
+        pid = int(self.store._scalar("SELECT id FROM positions WHERE symbol='BTC'"))
+        self.assertEqual([f.code for f in self.store.audit()],
+                         ["open_without_entry_trade", "entry_qty_mismatch"])
+
+        result = self.store.record_entry(**entry_plan())
+        self.assertEqual(result.position_id, pid)
+        self.assertTrue(result.inserted_trade)
+        self.assertEqual(self.store.position_count(), 1)
+        self.assertEqual(self.store.trade_count(), 1)
+        self.assertEqual(self.store.audit(), [])
+        self.assert_leg_sum_invariant()
+        self.assertEqual(self.store.trades_today(DAY), 1)
+
+    def test_audit_flags_a_hand_written_second_entry_leg(self):
+        """人为制造「成交合计 ≠ 仓位量」→ `audit()` 必须报 `entry_qty_mismatch`。"""
+        pid = self.store.record_entry(**entry_plan(fill_id="f1"))["position_id"]
+        self.assertEqual(self.store.audit(), [])
+        self.store.conn.execute(
+            """INSERT INTO trades(ts, symbol, side, price, price_int, qty, qty_int, fee, kind,
+                    order_id, fill_id, position_id, bar_ms, idempotency_key, created_at)
+               VALUES(?, 'BTC', 1, 80000.0, 800000, 0.04, 4000, 0.0, 'entry',
+                      'o2', 'f2', ?, ?, 'fill:f2', 1.0)""", (TS, pid, BAR_MS))
+        findings = self.store.audit()
+        self.assertEqual([f.code for f in findings],
+                         ["entry_qty_mismatch", "daily_counter_mismatch"])
+        detail = findings[0]["detail"]
+        self.assertEqual(detail["position_id"], pid)
+        self.assertEqual(detail["entry_legs"], 2)
+        self.assertAlmostEqual(detail["position_qty"], 0.04, places=12)
+        self.assertAlmostEqual(detail["entry_qty"], 0.08, places=12)
+        # 手写的第二笔既破坏了 qty 不变式，也让两个当日口径分叉（2 行 vs 计数 1）
+        self.assertEqual(self.store.trades_today(DAY), 2)
+        self.assertEqual(self.store.daily_counter(DAY)["trades_today"], 1)
+        self.assertEqual(findings[1]["detail"],
+                         {"day": DAY, "counter_trades_today": 1, "entry_trade_rows": 2})
+
+    def test_audit_flags_daily_counter_drift(self):
+        self.store.record_entry(**entry_plan())
+        self.assertEqual(self.store.audit(), [])
+        self.store.conn.execute("UPDATE daily_counters SET trades_today=5 WHERE day=?", (DAY,))
+        findings = self.store.audit()
+        self.assertEqual([f.code for f in findings], ["daily_counter_mismatch"])
+        self.assertEqual(findings[0]["detail"],
+                         {"day": DAY, "counter_trades_today": 5, "entry_trade_rows": 1})
+        self.store.conn.execute("UPDATE daily_counters SET trades_today=1 WHERE day=?", (DAY,))
+        self.assertEqual(self.store.audit(), [])
+
+    def test_audit_flags_entry_trade_without_a_counter_row(self):
+        pid = self.store.record_entry(**entry_plan())["position_id"]
+        self.store.conn.execute("DELETE FROM daily_counters")
+        codes = [f.code for f in self.store.audit()]
+        self.assertEqual(codes, ["daily_counter_mismatch"])
+        self.assertEqual(self.entry_legs(pid)[0]["kind"], "entry")
+
+    def test_entry_exit_rounds_keep_the_leg_sum_invariant(self):
+        """不变式测试：多轮 entry（含重复同步）+ exit 之后，逐仓仍成立。"""
+        symbols = ["BTC", "ETH", "SOL", "DOGE", "ARB", "OP"]
+        for index, symbol in enumerate(symbols):
+            bar = BAR_MS + index * 14400000
+            pid = self.store.record_entry(
+                **entry_plan(symbol=symbol, bar_ms=bar, fill_id=f"f{index}"))["position_id"]
+            self.assert_leg_sum_invariant()
+            # 每仓都来一次重复同步（不同 fill_id、同价量）
+            self.store.record_entry(**entry_plan(symbol=symbol, bar_ms=bar,
+                                                fill_id=f"dup{index}"))
+            self.assert_leg_sum_invariant()
+            self.store.record_exit(pid, exit_price_int=820000, ts=TS + 60 + index)
+            self.assert_leg_sum_invariant()
+        self.assertEqual(self.store.position_count(), len(symbols))
+        self.assertEqual(self.store.trade_count(), 2 * len(symbols))   # entry + exit
+        self.assertEqual(self.store.daily_counter(DAY)["trades_today"], len(symbols))
+        self.assertEqual(self.store.trades_today(DAY), len(symbols))
+        self.assertEqual(self.store.audit(), [])
 
 
 # ------------------------------------------------------------------ 并发 / WAL

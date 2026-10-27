@@ -409,6 +409,13 @@ class StateAssembler:
                             f"the daily order limit cannot be evaluated")
             return None, "unavailable"
         stored_int = None if stored is None else int(stored)
+        if stored_int is not None and stored_int != counted:
+            # 取大是「更严的一侧」，但两个口径本身必须各自准 —— 不一致要说出来，
+            # 否则风控拿到的「当日笔数」永远说不清是哪一边算错了（Store.audit() 的
+            # `daily_counter_mismatch` 是同一件事的持久化视角）。
+            warnings.append(
+                f"trades_today disagrees (counter={stored_int}, entry trade rows={counted}) — "
+                f"using the stricter of the two")
         if stored_int is not None and stored_int > counted:
             # 计数行更大：迁移/运维动过，或成交没同步全 —— 取大者（更严的一侧）
             return stored_int, "counter"

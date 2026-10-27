@@ -159,7 +159,7 @@ with self.write_transaction() as conn:   # BEGIN IMMEDIATE
 
   | 操作 | 一个事务里做的事 |
   |---|---|
-  | `record_entry` | `positions` 一行（`OPEN`）+ `trades` 一行（`entry`）+ `daily_counters` 计数 +1 + `events` 一条 |
+  | `record_entry` | `positions` 一行（`OPEN`）+ `trades` 一行（`entry`）+ `daily_counters` 计数 +1 + `events` 一条；**同 bar 重复调用一行都不新增**（见 §5「同 bar 重复 entry 的处理」） |
   | `record_exit` / `record_stop` | `positions` → `CLOSED`（价格/时间/盈亏）+ `trades` 一行（`exit`/`stop`）+ `daily_counters.realized_pnl` 累加 + `events` 一条 |
   | `begin_close` | `positions` → `CLOSING` + `events` 一条 |
   | `reset_dd_peak` | `dd_state` 更新（含 `reset_count+1`）+ `events` 一条 |
@@ -193,9 +193,67 @@ id，可能是别的表 —— 旧系统为此专门写过注释）。
 ### 仓位
 
 `UNIQUE(symbol, bar_ms)`：同一根 bar 的同一标的只开一次。重复 `record_entry()` 返回原
-`position_id`、不动任何数据（`WriteResult.idempotent == True`）。
+`position_id`、**不新增成交行**（`WriteResult.idempotent == True`；判定规则见下一节）。
 `record_exit()` 对已 `CLOSED` 的仓位直接返回（不改 `closed_at`、不重复记成交、不重复累加
 当日盈亏）。
+
+### 同 bar 重复 entry 的处理（一根 bar 一笔开仓）
+
+**缺陷背景**：早期实现里「同 `symbol+bar_ms` 已有仓位」的分支仍然**插了一笔新成交**
+（想的是「补 `fill_id` 之类的后到信息」），结果是仓位 1 行、开仓成交 2 行，
+`sum(entry qty)` 是仓位量的两倍 —— 交易所对账的基本口径（成交腿合计 = 仓位量）直接崩，
+而 `audit()` 当时只查「有仓无成交 / 成交无仓」，**抓不到**这种「有仓、也有成交，但成交
+比仓位多」的不一致，于是它会永远静默存在。`trades_today()` 也因为 `entry_trade_count`
+虚高而返回 2（计数行是 1），两个当日口径打架。
+
+**判定规则**（`StateStore._reconcile_entry()`）：同 `symbol+bar_ms` 已有仓位时，`record_entry`
+**只做下面三件事之一，绝不新增第二笔开仓成交**：
+
+| 已有开仓腿 | 传入的价/量/方向 | 处理 | `WriteResult` |
+|---|---|---|---|
+| 没有（历史半状态 / 绕过本层写库） | — | **补记**这一条（补的是唯一缺口） | `inserted_trade=True`，当日计数 +1，`events` 记 `entry_backfill` |
+| 有，且价、量、方向**全等** | 同价同量 | **重复同步**：不加行、不改仓位；只把腿上空着的 `fill_id` / `order_id` / `client_order_index` 补上（**不覆盖**已有值，**不改** `idempotency_key`） | `inserted_trade=False`、`duplicate_fill=True`、`trade_id` 指回原那笔 |
+| 有，但价 / 量 / 方向**任一不等** | 有差异 | `EntryConflict`（`StoreError` 子类），事务回滚，**不留半状态** | 抛错 |
+
+判定细节：整数 tick 优先精确比较（`qty_int` / `price_int`），只有两边都缺整数 tick 时才用
+相对容差 `ENTRY_QTY_TOL = 1e-9` 吸收浮点误差 —— 那不是「允许对不上一点」。
+
+**不变式**（任何时刻、每个仓位）：
+
+```
+sum(该仓位 kind='entry' 的成交 qty) == positions.qty      # 容差 1e-9
+sum(该仓位 kind='entry' 的 qty_int) == positions.qty_int   # 整数精确
+```
+
+**为什么不做「部分成交累加」**：`positions` 有 `UNIQUE(symbol, bar_ms)`，PLAN T6 又规定
+「每标的至多一仓」，所以一根 bar 只对应**一笔**开仓，仓位数量在首次 `record_entry` 时
+就定死了（下单量即仓位量，`notional` / `risk_amount` / 止损距离都按它算过）。再来一笔
+「价或量不同」的成交时，累加等于：
+
+* 要么改 `positions.qty`（重算名义/风险、把已经算过的止损距离打空，还和一仓/bar 模型冲突）；
+* 要么把成交记在仓位之外（对账时凭空多出一笔没有对应仓位的成交）。
+
+两条路都会让「成交合计 = 仓位量」失效。而「交易所真把一单拆成多笔成交」与「T8 同步重试
+换了 id」在本地**无法区分**，所以分不清时选**不会让对账不一致**的那条路：**报错**。
+真要支持交易所侧拆单，正确做法是 T8 在下单时就用**实际成交量**调用一次 `record_entry`
+（拆单的细节留在 `trades.raw` / 交易所对账侧），而不是事后往同一根 bar 上叠第二笔仓位腿。
+
+**兜底检查**（`Store.audit()`，面板状态条 / watchdog / T10 直接吃）：
+
+| code | 含义 |
+|---|---|
+| `open_without_entry_trade` | `OPEN`/`CLOSING` 仓位没有开仓成交（半状态） |
+| `trade_without_position` | 成交指向不存在的仓位 id |
+| `entry_qty_mismatch` | **逐仓**比对「开仓腿 qty 合计」与 `positions.qty`/`qty_int`，不等即报（`detail` 带 `position_id` / `entry_legs` / `position_qty` / `entry_qty`） |
+| `daily_counter_mismatch` | `daily_counters.trades_today` 与当天开仓腿行数不等（`detail` 带 `day` / `counter_trades_today` / `entry_trade_rows`；回看库里有数据的最近 90 个自然日） |
+| `dd_peak_below_index` | 峰值 < 指数 |
+
+注意 `trades_today()` **仍然**取「计数行 vs 开仓腿行数」的较大值（更严的一侧，fail-closed），
+但**取大不等于默许不一致**：两条腿各自必须准，不等就由 `daily_counter_mismatch` 报出来，
+`app/state.py` 也会在 `AccountSnapshot.warnings` 里记一条 `trades_today disagrees (...)`。
+已知会触发它的一种合法情形：T8 用 `record_trade(kind='entry')` 补记了本层没记过的开仓
+成交（它不抬计数行）—— 那正是应该被看见的差，T8 收口时应改走 `record_entry` 或显式
+`ensure_day()` + 计数修正。
 
 ---
 
@@ -317,7 +375,7 @@ SQLite 会在最后一个连接关闭时自动 checkpoint。
 |---|---|---|
 | `equity` | 注入 `equity_provider` → `equity_curve` 最后一点 → （`allow_stale_equity=True` 时才允许 provider 失败后退回库值，标 `store_stale`） | `None` → `GATE_STATE` 拒单 |
 | `day_start_equity` | `daily_counters.day_start_equity` → 日界前最后一个权益点（`curve_prev`）→ 当天第一个权益点（`curve_first`） | `None` → `GATE_DAILY_LOSS` 拒单 |
-| `trades_today` | `max(计数行, trades 表开仓腿行数)` —— 取更严的一侧 | `None` → `GATE_DAILY_TRADES` 拒单 |
+| `trades_today` | `max(计数行, trades 表开仓腿行数)` —— 取更严的一侧；两者不等时记一条 `trades_today disagrees (...)` 警告 | `None` → `GATE_DAILY_TRADES` 拒单 |
 | `open_positions` | store 的 `OPEN/CLOSING` **∪** 注入的交易所持仓（并集 = 更严） | 读不出来 → `()` + 警告（store 是唯一写者，正常不会失败） |
 | `open_notional_by_symbol` / `_total` | `qty × price`，`price` 来自注入的 `price_provider`，缺则用**库里的成交价** | 任何一仓算不出 → `by_symbol={}` + `total=None` → `GATE_TOTAL_NOTIONAL` 拒单 |
 | `dd_index` / `dd_peak_index` | 见 §6 | `None` → `GATE_DD` 拒单 |
@@ -334,7 +392,7 @@ SQLite 会在最后一个连接关闭时自动 checkpoint。
 
 ## 11. 测试覆盖（全离线：临时目录 + `:memory:`）
 
-`tests/test_store.py`（54 项）
+`tests/test_store.py`（66 项）
 
 * 建库 / 7 张表 + 索引 / `user_version=2` / `migrate()` 幂等；
 * 老 v1 库就地升级（数据保留、新列 NULL、升级后能走 v2 代码路径）；
@@ -343,6 +401,13 @@ SQLite 会在最后一个连接关闭时自动 checkpoint。
   止损腿、权益曲线顺序/覆盖、成交过滤、跨连接重开；
 * 幂等：`trade_key` 四种形态的**字面值**、同 order id ×3 = 1 行、同 fill id ×3 = 1 行、
   部分成交**不合并**、同 bar 重复开仓、重复平仓不重复记账；
+* **同 bar 一笔开仓**（`SameBarEntryTests`）：同 `fill_id` 完全幂等；不同 `fill_id` + 同价量
+  → 判重复同步、成交行数不变、`trade_id` 指回原那笔、缺 `fill_id` 时补全但不改
+  `idempotency_key`；价/量/方向不同 → `EntryConflict` 且**不留半状态**（仓位/成交/事件/计数
+  全不变，之后库仍可用）；已 `CLOSED` 的仓位重复同步不加行；有仓无成交时补记唯一那一笔；
+  **多轮 entry（含重复同步）+ exit 后逐仓验 `sum(entry qty) == position.qty`**；
+* `audit()`：手写半状态、手写第二笔开仓腿（`entry_qty_mismatch`）、计数行虚高/缺行
+  （`daily_counter_mismatch`）都能抓到；
 * 原子性：成交写入抛错 → 仓位/事件/计数全无；平仓中途失败 → 仓位仍 `OPEN`；
   第二连接占写锁 → `OperationalError`（不是半状态）；嵌套事务整体回滚；
   `audit()` 抓出手写半状态；
@@ -352,7 +417,7 @@ SQLite 会在最后一个连接关闭时自动 checkpoint。
   30 天清理只删 `dd_anchors`、最新一行永不删、`dd_state` 完全不受影响；
 * 非法输入 fail-loud、`from_config` 只认 `sqlite:///`、`app/store.py` 不含网络模块字样。
 
-`tests/test_state.py`（39 项）
+`tests/test_state.py`（40 项）
 
 * 装配出的每个字段的**手算期望值**（3200 / 5000 / 8200 名义、30% 回撤、2 笔当日成交）；
 * `open_positions` 是 **`tuple`**（不是计数），并能直接驱动 T4 的 7 个闸门

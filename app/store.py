@@ -58,8 +58,9 @@
 面板只读接口
 ------------
 `Store.panel_snapshot()` 一次给齐 T10 的 6 区块需要的 DB 数据（当前持仓、权益曲线、最近
-N 笔成交、当日计数、回撤状态、事件流）；`Store.audit()` 给出「半状态」不变量检查结果
-（`OPEN`/`CLOSING` 仓位必须有开仓成交），T8 watchdog / T10 状态条可直接吃。
+N 笔成交、当日计数、回撤状态、事件流）；`Store.audit()` 给出不变量检查结果（`OPEN`/`CLOSING`
+仓位必须有开仓成交、成交腿 qty 合计必须等于仓位量、每日计数与开仓腿行数必须一致、峰值不
+低于指数），T8 watchdog / T10 状态条可直接吃。
 """
 
 from __future__ import annotations
@@ -76,10 +77,11 @@ from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
-    "ALLOWED_TRANSITIONS", "BASE_TWR_INDEX", "DEFAULT_BUSY_TIMEOUT_MS", "DD_ANCHOR_KEEP_DAYS",
-    "DD_STATE_KEY", "MIGRATIONS", "OPEN_STATES", "POSITION_STATES", "SCHEMA_VERSION",
-    "TRADE_KINDS", "AuditFinding", "InvalidTransition", "MigrationError", "SchemaError",
-    "StateStore", "Store", "StoreError", "WriteResult", "day_bounds", "utc_day",
+    "ALLOWED_TRANSITIONS", "BASE_TWR_INDEX", "DAILY_COUNTER_AUDIT_DAYS", "DEFAULT_BUSY_TIMEOUT_MS",
+    "DD_ANCHOR_KEEP_DAYS", "DD_STATE_KEY", "ENTRY_QTY_TOL", "MIGRATIONS", "OPEN_STATES",
+    "POSITION_STATES", "SCHEMA_VERSION", "TRADE_KINDS", "AuditFinding", "EntryConflict",
+    "InvalidTransition", "MigrationError", "SchemaError", "StateStore", "Store", "StoreError",
+    "WriteResult", "day_bounds", "utc_day",
 ]
 
 logger = logging.getLogger(__name__)
@@ -107,6 +109,14 @@ ALLOWED_TRANSITIONS: Mapping[str, Tuple[str, ...]] = {
 
 TRADE_KINDS: Tuple[str, ...] = ("entry", "exit", "stop")
 
+#: 价/量比较的**相对**容差：只吸收浮点表示误差（`0.04156 * 2` 这种求和），
+#: 不是「允许对不上一点」。整数 tick（`qty_int` / `price_int`）总是精确比较。
+ENTRY_QTY_TOL = 1e-9
+
+#: `audit()` 逐日比对 `daily_counters.trades_today` 与开仓腿行数时回看的**自然日**数
+#: （按库里有数据的最近 N 天算，不按墙钟回溯）。
+DAILY_COUNTER_AUDIT_DAYS = 90
+
 
 class StoreError(RuntimeError):
     """存储层可预期错误（路径非法 / 只支持 sqlite / 数据不自洽 …）。"""
@@ -122,6 +132,19 @@ class MigrationError(StoreError):
 
 class InvalidTransition(StoreError):
     """非法的仓位状态迁移（如把 `CLOSED` 改回 `OPEN`、同标的同时开两仓）。"""
+
+
+class EntryConflict(StoreError):
+    """同一根 bar 的第二笔开仓成交与已记录的那笔价/量/方向不一致。
+
+    `positions` 有 `UNIQUE(symbol, bar_ms)`，PLAN T6 又规定「每标的至多一仓」，所以
+    **一根 bar 只对应一笔开仓**：仓位数量在首次开仓时就定死了，不存在合法的「第二笔
+    部分成交」（那需要改 `positions.qty`，等于重算名义/风险/止损，且与一仓/bar 模型冲突）。
+
+    于是「第二笔价量不同」只有两种解释 —— 交易所真拆了单，或者这是重复记账（T8 重试
+    换了 id）。分不清的时候选**抛错**：它不会留下「成交合计 ≠ 仓位量」的静默不一致，
+    而静默忽略/静默新增都会让交易所对账永远对不上。详见 `docs/STATE_STORE.md`。
+    """
 
 
 # ------------------------------------------------------------------ 小工具
@@ -224,6 +247,24 @@ def _key_num(int_value: Any, float_value: Any) -> str:
     return "?" if value is None else f"{value:.12g}"
 
 
+def _same_number(stored_int: Any, stored_float: Any, new_int: Any, new_float: Any) -> bool:
+    """两处记录的数值是否「同一笔」：整数 tick 精确比，缺整数时退回浮点（相对容差）。
+
+    整数优先是刻意的 —— `0.04156` 这种量走浮点求和会有表示误差，而 `qty_int=4156` 永远
+    精确。只有两边都拿不到整数 tick 时才用 `ENTRY_QTY_TOL` 吸收误差。
+    """
+    if stored_int is not None and new_int is not None:
+        try:
+            return int(stored_int) == int(new_int)
+        except (TypeError, ValueError):
+            pass
+    left = _finite(stored_float)
+    right = _finite(new_float)
+    if left is None or right is None:
+        return stored_float is None and new_float is None
+    return abs(left - right) <= ENTRY_QTY_TOL * max(1.0, abs(left), abs(right))
+
+
 class WriteResult(dict):
     """一次写操作的结果（`dict` 子类，既能 `.id` 访问也能直接 JSON 化）。
 
@@ -257,6 +298,11 @@ class WriteResult(dict):
     def idempotent(self) -> bool:
         """True = 这次调用没有新增任何行（重复写入 / 已处理过）。"""
         return not (self.inserted_position or self.inserted_trade)
+
+    @property
+    def duplicate_fill(self) -> bool:
+        """True = 同 bar 的重复开仓同步（已有等价的开仓成交，本次一行都没写）。"""
+        return bool(self.get("duplicate_fill"))
 
 
 # ------------------------------------------------------------------ schema
@@ -649,8 +695,11 @@ class StateStore:
 
         幂等：
         * `UNIQUE(symbol, bar_ms)` —— 同一根 bar 的同一标的只开一次；重复调用返回原
-          `position_id` 且不改任何数据（`idempotent=True`）。
+          `position_id` 且不改仓位（`idempotent=True`）。
         * 成交走 `idempotency_key`（`fill_id` > `order_id+价+量` > 本地键），重复同步不加行。
+        * **同 bar 的第二笔开仓成交绝不新增成交行**：价量方向全等 → 判重复同步（只补全
+          缺失的 `fill_id`/`order_id`），价或量或方向不同 → `EntryConflict`。原因见
+          `_reconcile_entry()` 与 `docs/STATE_STORE.md`「同 bar 重复 entry 的处理」。
 
         前置检查（fail-loud，不静默）：
         * `side` 必须是 ±1；`qty_int > 0`；`entry_price_int > 0`；`stop_price_int` 必须在
@@ -691,19 +740,14 @@ class StateStore:
                 "SELECT * FROM positions WHERE symbol=? AND bar_ms=?",
                 (symbol_u, bar)).fetchone()
             if existing is not None:
-                # 同一根 bar 重复记账：仓位不动，成交仍按幂等键尝试一次（补 fill_id
-                # 之类的后到信息由 T8 的 update 接口处理，这里不覆盖）。
-                trade_id, inserted_trade = self._insert_trade_row(conn, dict(
-                    ts=stamp, symbol=symbol_u, side=side_i, price=entry_f,
-                    price_int=entry_int, qty=qty_f, qty_int=qty, fee=_finite(fee, default=0.0),
-                    fee_token=fee_token, kind="entry", order_id=entry_order_id,
-                    fill_id=fill_id, position_id=int(existing["id"]),
-                    realized_pnl=None, bar_ms=bar, raw=None,
-                    client_order_index=client_order_index,
-                ))
-                return WriteResult(position_id=int(existing["id"]), trade_id=trade_id,
-                                   inserted_position=False, inserted_trade=inserted_trade,
-                                   state=str(existing["state"]))
+                # 同一根 bar 已有仓位：**绝不新增第二笔开仓成交**（一根 bar 一笔开仓）。
+                # 只做两件事：补记缺失的开仓腿，或把重复同步判成幂等；价/量/方向对不上
+                # → `EntryConflict`。见 `_reconcile_entry()` 与 docs/STATE_STORE.md。
+                return self._reconcile_entry(
+                    conn, dict(existing), stamp=stamp, side=side_i, qty_int=qty, qty=qty_f,
+                    price_int=entry_int, price=entry_f, fee=_finite(fee, default=0.0),
+                    fee_token=fee_token, entry_order_id=entry_order_id, fill_id=fill_id,
+                    client_order_index=client_order_index)
 
             live = conn.execute(
                 f"SELECT id, state FROM positions WHERE symbol=? AND state IN "
@@ -753,6 +797,87 @@ class StateStore:
             return WriteResult(position_id=position_id, trade_id=trade_id,
                                inserted_position=True, inserted_trade=inserted_trade,
                                state="OPEN")
+
+    def _reconcile_entry(self, conn: sqlite3.Connection, position: Mapping[str, Any], *,
+                         stamp: float, side: int, qty_int: int, qty: float,
+                         price_int: int, price: float, fee: float,
+                         fee_token: Optional[str], entry_order_id: Optional[str],
+                         fill_id: Optional[str],
+                         client_order_index: Optional[int]) -> WriteResult:
+        """同一 `symbol+bar_ms` 的第二次 `record_entry`：**绝不新增第二笔开仓成交**。
+
+        必须守住的不变式（`audit()` 的 `entry_qty_mismatch` 逐仓验它）：
+
+            该仓位 `kind='entry'` 的成交 qty 合计 == `positions.qty`
+
+        所以这里只有三条路：
+
+        1. **没有开仓腿**（历史半状态 / 有人绕过本模块写库）→ 补记这一条。补的是唯一
+           缺口，不是第二笔，所以仓位行不动、当日计数 +1（保持 `trades_today` 两口径一致）。
+        2. **已有腿且价、量、方向全等** → 判**重复同步**（同步重试换了 `fill_id` 也算）。
+           一仓/bar 模型下不存在合法的「第二笔部分成交」，所以不累加、不新增；只把腿上空着
+           的 `fill_id` / `order_id` / `client_order_index` **补全**（不覆盖已有值，也不改
+           `idempotency_key` —— 那是唯一键，改了等于换一条记录）。
+        3. **价或量或方向不同** → `EntryConflict`，整个事务回滚，不留半状态。
+
+        「交易所真把一单拆成多笔成交」这种情况在本模型里由**首次** `record_entry` 的
+        `qty_int` 表达（下单量就是仓位量），后续 fill 只是同一笔的经济事实 —— 一旦它们的
+        价/量与首次记录不符，说明本地记账与交易所已经分叉，此时**报错**比默默写一行
+        「合计 ≠ 仓位量」的成交更安全。
+        """
+        position_id = int(position.get("id") or 0)
+        legs = conn.execute(
+            "SELECT * FROM trades WHERE position_id=? AND kind='entry' ORDER BY id ASC",
+            (position_id,)).fetchall()
+
+        if not legs:
+            trade_id, inserted = self._insert_trade_row(conn, dict(
+                ts=stamp, symbol=str(position.get("symbol") or ""), side=side, price=price,
+                price_int=price_int, qty=qty, qty_int=qty_int, fee=fee, fee_token=fee_token,
+                kind="entry", order_id=entry_order_id, fill_id=fill_id,
+                position_id=position_id, realized_pnl=None,
+                bar_ms=int(position.get("bar_ms") or 0), raw=None,
+                client_order_index=client_order_index,
+            ))
+            self._bump_counter(conn, utc_day(stamp), entries=1, realized_pnl=0.0)
+            self._log_event(
+                conn, kind="entry_backfill", symbol=str(position.get("symbol") or ""),
+                message=(f"{position.get('symbol')} backfilled the missing entry leg "
+                         f"({qty:g} @ {price:g}) for position {position_id}"),
+                data={"position_id": position_id, "qty_int": qty_int,
+                      "entry_price_int": price_int, "fill_id": fill_id,
+                      "entry_order_id": entry_order_id},
+                ts=stamp)
+            return WriteResult(position_id=position_id, trade_id=trade_id,
+                               inserted_position=False, inserted_trade=inserted,
+                               state=str(position.get("state")), duplicate_fill=False)
+
+        first = dict(legs[0])
+        same_side = int(first.get("side") or 0) == side
+        same_price = _same_number(first.get("price_int"), first.get("price"), price_int, price)
+        same_qty = _same_number(first.get("qty_int"), first.get("qty"), qty_int, qty)
+        if not (same_side and same_price and same_qty):
+            raise EntryConflict(
+                f"{position.get('symbol')} bar {position.get('bar_ms')} already has an entry "
+                f"fill (trade {first.get('id')}: side={first.get('side')}, "
+                f"qty={first.get('qty')}, price={first.get('price')}) — refusing to record a "
+                f"second one (side={side}, qty={qty}, price={price}): one position per bar "
+                f"means a second fill with different price/qty would break "
+                f"sum(entry qty) == position qty"
+            )
+
+        # 重复同步：只补全缺失信息，绝不新增行、不改已有值。
+        patch = {column: value
+                 for column, value in (("fill_id", fill_id), ("order_id", entry_order_id),
+                                       ("client_order_index", client_order_index))
+                 if value is not None and first.get(column) is None}
+        if patch:
+            assignments = ", ".join(f"{column}=?" for column in patch)
+            conn.execute(f"UPDATE trades SET {assignments} WHERE id=?",
+                         (*patch.values(), int(first["id"])))
+        return WriteResult(position_id=position_id, trade_id=int(first["id"]),
+                           inserted_position=False, inserted_trade=False,
+                           state=str(position.get("state")), duplicate_fill=True)
 
     def begin_close(self, position_id: int, *, ts: Optional[float] = None,
                     reason: Optional[str] = None) -> WriteResult:
@@ -1138,6 +1263,9 @@ class StateStore:
 
         为什么要两者取大：计数行会因运维/迁移丢（低估 → 允许重试风暴），`trades` 表可能
         因为只同步了部分成交而少算。取大者是**更严**的一侧，符合 fail-closed。
+
+        **取大不是免责**：两个口径本身必须各自准（`record_entry` 保证一根 bar 只记一笔
+        开仓成交），不等就是缺陷 —— `audit()` 的 `daily_counter_mismatch` 会报出来。
         """
         key = str(day or utc_day())
         counter = self.daily_counter(key)
@@ -1371,10 +1499,17 @@ class StateStore:
     def audit(self) -> List[AuditFinding]:
         """不变量自检（面板状态条 / watchdog 吃）。空列表 = 干净。
 
-        目前三条：
+        五条：
         * `open_without_entry_trade`：`OPEN`/`CLOSING` 仓位没有开仓成交 —— 原子性保证
           不该出现；出现即说明有人绕过本模块直接写库，或历史上出过半状态。
         * `trade_without_position`：成交指向不存在的仓位 id。
+        * `entry_qty_mismatch`：**逐仓**比对「该仓位 `kind='entry'` 成交 qty 合计」与
+          `positions.qty`/`qty_int`，不等即报。这是「成交腿合计 = 仓位量」这条对账基本
+          口径的兜底 —— 只靠 `open_without_entry_trade` + `trade_without_position`
+          抓不到「多记了一笔」（有仓、也有成交，但成交比仓位多）。
+        * `daily_counter_mismatch`：`daily_counters.trades_today` 与当天 `trades` 表开仓
+          腿行数不等（近 `DAILY_COUNTER_AUDIT_DAYS` 天）。`trades_today()` 取两者较大值
+          是**有意**的更严一侧，但两个口径本身必须各自准；不等即说明有一侧丢了或虚增了。
         * `dd_peak_below_index`：峰值 < 指数（回撤会算成负数被人为截断成 0 → 低估）。
         """
         findings: List[AuditFinding] = []
@@ -1395,6 +1530,12 @@ class StateStore:
         for row in orphans:
             findings.append(AuditFinding(code="trade_without_position", detail=dict(row)))
 
+        for row in self._entry_qty_drift():
+            findings.append(AuditFinding(code="entry_qty_mismatch", detail=row))
+
+        for row in self._daily_counter_drift():
+            findings.append(AuditFinding(code="daily_counter_mismatch", detail=row))
+
         state = self.dd_state()
         if state is not None:
             index = _finite(state.get("twr_index"))
@@ -1402,6 +1543,59 @@ class StateStore:
             if index is None or peak is None or peak <= 0 or index > peak + 1e-9:
                 findings.append(AuditFinding(code="dd_peak_below_index", detail=dict(state)))
         return findings
+
+    def _entry_qty_drift(self) -> List[Dict[str, Any]]:
+        """每个仓位：开仓腿 qty 合计 vs `positions.qty`（不等才是问题）。"""
+        rows = self._fetchall(
+            """SELECT p.id AS position_id, p.symbol AS symbol, p.bar_ms AS bar_ms,
+                      p.state AS state, p.qty AS position_qty,
+                      p.qty_int AS position_qty_int,
+                      COUNT(t.id) AS entry_legs,
+                      COALESCE(SUM(t.qty), 0.0) AS entry_qty,
+                      COALESCE(SUM(t.qty_int), 0) AS entry_qty_int
+                 FROM positions p
+                 LEFT JOIN trades t ON t.position_id=p.id AND t.kind='entry'
+                GROUP BY p.id
+                ORDER BY p.id""")
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            want = _finite(row.get("position_qty"), 0.0) or 0.0
+            got = _finite(row.get("entry_qty"), 0.0) or 0.0
+            want_int = row.get("position_qty_int")
+            got_int = int(row.get("entry_qty_int") or 0)
+            int_ok = want_int is None or int(want_int) == got_int
+            float_ok = abs(want - got) <= ENTRY_QTY_TOL * max(1.0, abs(want))
+            if int_ok and float_ok:
+                continue
+            detail = dict(row)
+            detail["position_qty"] = want
+            detail["entry_qty"] = got
+            out.append(detail)
+        return out
+
+    def _daily_counter_drift(self) -> List[Dict[str, Any]]:
+        """`daily_counters.trades_today` vs 当天开仓腿行数。
+
+        两个方向都报：计数行虚高（迁移/运维动过）和计数行偏低（丢了增量、或 T8 用
+        `record_trade` 补记了开仓成交却没抬计数）都会让 `trades_today()` 的口径失去意义。
+
+        窗口按**有数据的自然日**取最近 `DAILY_COUNTER_AUDIT_DAYS` 天，而不是按 `now()`
+        回溯 —— 审计不该因为「库里最新一天比墙钟早」（离线库、回放、测试固定时间戳）就闭嘴。
+        """
+        counted = {str(row["day"]): int(row["n"] or 0) for row in self._fetchall(
+            """SELECT strftime('%Y-%m-%d', ts, 'unixepoch') AS day, COUNT(*) AS n
+                 FROM trades WHERE kind='entry' GROUP BY day""")}
+        stored = {str(row["day"]): int(row["trades_today"] or 0) for row in self._fetchall(
+            "SELECT day, trades_today FROM daily_counters")}
+        out: List[Dict[str, Any]] = []
+        window = max(1, int(DAILY_COUNTER_AUDIT_DAYS))
+        for day in sorted(set(counted) | set(stored))[-window:]:
+            counter_value = stored.get(day, 0)
+            row_value = counted.get(day, 0)
+            if counter_value != row_value:
+                out.append({"day": day, "counter_trades_today": counter_value,
+                            "entry_trade_rows": row_value})
+        return out
 
     def integrity_check(self) -> str:
         """SQLite 自身的结构检查（`ok` = 正常）。"""
