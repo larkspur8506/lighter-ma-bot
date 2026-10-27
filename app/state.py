@@ -52,7 +52,7 @@ from app.risk import RiskState, drawdown as risk_drawdown
 from app.store import StateStore, day_bounds, utc_day
 
 __all__ = [
-    "ACCOUNT_OK", "DD_SOURCE_ANCHOR", "DD_SOURCE_STATE", "DD_SOURCE_UNAVAILABLE",
+    "DD_SOURCE_ANCHOR", "DD_SOURCE_STATE", "DD_SOURCE_UNAVAILABLE",
     "EQUITY_SOURCE_PROVIDER", "EQUITY_SOURCE_STORE", "EQUITY_SOURCE_STALE",
     "EQUITY_SOURCE_UNAVAILABLE", "AccountSnapshot", "DDReading", "StateAssembler",
     "assemble_risk_state",
@@ -67,8 +67,6 @@ EQUITY_SOURCE_UNAVAILABLE = "unavailable"    # 拿不到 → 拒单
 DD_SOURCE_STATE = "dd_state"
 DD_SOURCE_ANCHOR = "dd_anchor"
 DD_SOURCE_UNAVAILABLE = "unavailable"
-
-ACCOUNT_OK = "ok"
 
 
 def _finite(value: Any) -> Optional[float]:

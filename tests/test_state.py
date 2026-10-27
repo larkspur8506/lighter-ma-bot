@@ -21,7 +21,7 @@ from app.risk import GATE_DAILY_LOSS, GATE_DD, GATE_STATE, GATE_TOTAL_NOTIONAL, 
 from app.state import (
     DD_SOURCE_ANCHOR, DD_SOURCE_STATE, DD_SOURCE_UNAVAILABLE,
     EQUITY_SOURCE_PROVIDER, EQUITY_SOURCE_STALE, EQUITY_SOURCE_STORE,
-    EQUITY_SOURCE_UNAVAILABLE, AccountSnapshot, DDReading, StateAssembler,
+    EQUITY_SOURCE_UNAVAILABLE, DDReading, StateAssembler,
     assemble_risk_state,
 )
 from app.store import StateStore, day_bounds, utc_day

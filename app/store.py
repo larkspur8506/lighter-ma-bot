@@ -73,7 +73,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "ALLOWED_TRANSITIONS", "BASE_TWR_INDEX", "DEFAULT_BUSY_TIMEOUT_MS", "DD_ANCHOR_KEEP_DAYS",
@@ -106,8 +106,6 @@ ALLOWED_TRANSITIONS: Mapping[str, Tuple[str, ...]] = {
 }
 
 TRADE_KINDS: Tuple[str, ...] = ("entry", "exit", "stop")
-
-_SQLITE_MAX_INT = 2 ** 63 - 1
 
 
 class StoreError(RuntimeError):
