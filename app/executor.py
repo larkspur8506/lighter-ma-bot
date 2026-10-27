@@ -74,6 +74,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 import urllib.error
 import urllib.parse
@@ -101,7 +102,7 @@ __all__ = [
     "AccountReader", "ExchangeAccount", "ExchangeOrder", "ExchangePosition",
     "Executor", "ExecutorError", "LighterAccountReader", "ReaderError", "ReconcileIssue",
     "ReconcileReport", "SymbolOutcome", "TickReport", "orders_from_payload",
-    "pending_signal", "positions_from_payload", "reconcile",
+    "pending_signal", "positions_from_payload", "reconcile", "transfers_to_flows",
 ]
 
 logger = logging.getLogger(__name__)
@@ -433,6 +434,72 @@ def _default_http_json(url: str, headers: Optional[Mapping[str, str]] = None,
         raise ReaderError(f"GET {url} returned non-JSON body: {body[:120]!r}") from exc
 
 
+def _optional_float(raw: Any) -> Optional[float]:
+    """宽松转 float（垃圾输入 → `None`）；有限性/区间由调用方判断。"""
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def transfers_to_flows(payload: Any) -> Tuple[Dict[str, float], ...]:
+    """`/transfer/history` 载荷 → `app.dd` 的流水格式（`{"ts": epoch_s, "amount": 带符号 USDC}`）。
+
+    服务端没有稳定的字段文档（本账户 `transfers` 至今为空，拿不到真实样本），所以
+    按「认得出的才收」解析：时间戳与金额任一认不出、方向不明确（没有 in/out 语义
+    字段）的条目**整条丢弃**——把方向猜反的流水喂进 TWR，比少一笔流水更危险。
+    """
+    if isinstance(payload, Mapping):
+        rows = payload.get("transfers")
+    else:
+        rows = payload
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        return ()
+
+    _TS_KEYS = ("ts", "timestamp", "time", "created_at", "created", "updated_at")
+    _AMOUNT_KEYS = ("amount", "usdc", "value", "size")
+    _IN = {"in", "deposit", "credit", "deposited", "1", "+1", "inflow"}
+    _OUT = {"out", "withdraw", "withdrawal", "debit", "withdrawn", "-1", "outflow"}
+    _DIRECTION_KEYS = ("direction", "side", "flow", "transfer_type", "type")
+
+    flows: List[Dict[str, float]] = []
+    for row in rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        ts: Optional[float] = None
+        for key in _TS_KEYS:
+            value = _optional_float(row.get(key))
+            if value is None or not math.isfinite(value) or value <= 0:
+                continue
+            ts = value / 1000.0 if value >= 1e12 else value
+            break
+        if ts is None:
+            continue
+        magnitude: Optional[float] = None
+        for key in _AMOUNT_KEYS:
+            value = _optional_float(row.get(key))
+            if value is None or not math.isfinite(value):
+                continue
+            magnitude = abs(value)
+            break
+        if magnitude is None:
+            continue
+        direction = ""
+        for key in _DIRECTION_KEYS:
+            text = str(row.get(key) or "").strip().lower()
+            if text:
+                direction = text
+                break
+        if direction in _IN:
+            amount = magnitude
+        elif direction in _OUT:
+            amount = -magnitude
+        else:
+            continue                                  # 方向不明确 → 整条丢弃
+        flows.append({"ts": ts, "amount": amount})
+    return tuple(flows)
+
+
 class LighterAccountReader(AccountReader):
     """REST 读数器：`/api/v1/account` + `/api/v1/accountActiveOrders`。
 
@@ -495,6 +562,16 @@ class LighterAccountReader(AccountReader):
             logger.warning("active orders unavailable: %s", orders_error)
         return ExchangeAccount(equity=equity, positions=positions, orders=orders,
                                orders_error=orders_error, as_of=self.clock())
+
+    def transfers(self) -> Tuple[Dict[str, float], ...]:
+        """出入金流水（`/api/v1/transfer/history`，需要 auth；TWR 剔出入金的输入）。
+
+        读失败由调用方决定怎么降级（tick 里按「无流水推进 + 落事件」处理），
+        本方法只负责把 HTTP/解析错误如实抛出来。
+        """
+        url = self._url("/api/v1/transfer/history", account_index=self.account_index)
+        payload = self._get(url, self._auth_header())
+        return transfers_to_flows(payload)
 
 
 # ------------------------------------------------------------------ 对账

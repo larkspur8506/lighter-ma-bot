@@ -1214,6 +1214,12 @@ tr:last-child td { border-bottom: none; }
 .warnlist { margin: 8px 0 0; padding: 6px 10px; border-radius: 6px;
             background: #241f14; border: 1px solid #7a6320; color: #e3c169;
             font-size: 12px; }
+.adminbar { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+button { padding: 6px 12px; border-radius: 6px; border: 1px solid #262d38;
+         background: #232a34; color: #e6e8eb; cursor: pointer; font: inherit; }
+button:hover { border-color: #3a4556; }
+button.danger { border-color: #8a2f2f; background: #2a1616; color: #ff9d9d; }
+code { background: #232a34; padding: 1px 5px; border-radius: 4px; }
 .tag { display: inline-block; padding: 1px 6px; border-radius: 4px;
        background: #232a34; color: #9aa4b2; font-size: 11px; }
 .tag.skip { background: #241f14; color: #e3c169; }
@@ -1466,6 +1472,95 @@ def _events_html(block: Mapping[str, Any]) -> str:
             f"{_warn_html(block.get('warnings'))}</section>")
 
 
+# ------------------------------------------------------------------ 人工操作区
+
+
+#: 三个写操作的面板入口（kill / flatten / dd reset）。token 走 `?k=<ADMIN_TOKEN>`
+#: 链接注入：JS 读到后存进 localStorage 并立刻从地址栏抹掉（不进 nginx 日志、
+#: 不进收藏夹以外的任何记录）。没有 token 时点按钮会弹一次输入框。
+_ADMIN_JS = """
+(function () {
+  'use strict';
+  var qs = new URLSearchParams(location.search);
+  var fromUrl = qs.get('k');
+  if (fromUrl) {
+    try { localStorage.setItem('lt_admin_token', fromUrl); } catch (e) {}
+    qs.delete('k');
+    history.replaceState(null, '', location.pathname + (qs.toString() ? '?' + qs.toString() : ''));
+  }
+  function token() {
+    try { return localStorage.getItem('lt_admin_token') || ''; } catch (e) { return ''; }
+  }
+  function msg(text, bad) {
+    var el = document.getElementById('admin-msg');
+    el.style.display = 'block';
+    el.textContent = text;
+    el.style.borderColor = bad ? '#8a2f2f' : '#2f6f4f';
+  }
+  function post(path, params) {
+    var t = token();
+    if (!t) {
+      t = prompt('输入 ADMIN_TOKEN（会保存在本浏览器）');
+      if (!t) { return; }
+      try { localStorage.setItem('lt_admin_token', t); } catch (e) {}
+    }
+    params.k = t;
+    msg('发送中…', false);
+    fetch(path, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
+      body: new URLSearchParams(params).toString()
+    }).then(function (resp) {
+      return resp.json().then(function (data) { return {status: resp.status, data: data}; });
+    }).then(function (r) {
+      var d = r.data || {};
+      if (r.status === 200 && d.ok) {
+        msg('成功：' + JSON.stringify(d).slice(0, 300), false);
+      } else {
+        msg('失败 (' + r.status + ')：' + (d.error || JSON.stringify(d).slice(0, 200)), true);
+      }
+    }).catch(function (err) { msg('请求失败：' + err, true); });
+  }
+  function bind(id, fn) {
+    var el = document.getElementById(id);
+    if (el) { el.addEventListener('click', fn); }
+  }
+  bind('btn-kill-on', function () { post('/admin/kill', {on: '1', reason: 'panel: stop entries'}); });
+  bind('btn-kill-off', function () { post('/admin/kill', {on: '0', reason: 'panel: resume entries'}); });
+  bind('btn-flatten', function () {
+    if (!confirm('强制清仓：市价平掉所有仓位并撤销全部挂单，不可撤销。确认？')) { return; }
+    var typed = prompt('输入 yes 确认清仓');
+    if ((typed || '').trim().toLowerCase() !== 'yes') { return; }
+    post('/admin/flatten', {confirm: 'yes', reason: 'panel: manual flatten'});
+  });
+  bind('btn-dd-reset', function () {
+    var reason = prompt('重置回撤峰值的原因（必填，会写入审计）');
+    if (!reason || !reason.trim()) { return; }
+    post('/admin/dd/reset', {reason: reason.trim()});
+  });
+})();
+"""
+
+
+def _admin_html() -> str:
+    """⑦ 人工操作区：kill / 强制清仓 / 重置回撤峰值（三个写操作的唯一 UI 入口）。"""
+    return (
+        '<section id="block-admin"><h2>⑦ 人工操作（admin token）</h2>'
+        '<div class="adminbar">'
+        '<button id="btn-kill-on" type="button">⛔ 停止开仓（kill ON）</button>'
+        '<button id="btn-kill-off" type="button">▶ 恢复开仓（kill OFF）</button>'
+        '<button id="btn-flatten" type="button" class="danger">强制清仓 + 撤销全部挂单</button>'
+        '<button id="btn-dd-reset" type="button">↺ 重置回撤峰值</button>'
+        '</div>'
+        '<div class="kv dim" id="admin-note" style="margin-top:8px">'
+        '用带 <code>?k=ADMIN_TOKEN</code> 的面板链接打开一次，令牌会存进本浏览器并从地址栏抹掉，'
+        '之后直接点按钮。kill 只停开新仓（离场与交易所侧止损照常）；'
+        '清仓市价成交、不可撤销，需二次确认。</div>'
+        '<div id="admin-msg" class="warnlist" style="display:none"></div>'
+        '</section>'
+    )
+
+
 def render_html(snapshot: Mapping[str, Any], *, symbols: Sequence[str] = DEFAULT_SYMBOLS,
                 mode: str = "live", title: str = "lighter-ma-bot 监控面板") -> str:
     """把 :meth:`Panel.snapshot` 的载荷渲染成**一个**自包含 HTML 文档。
@@ -1483,6 +1578,7 @@ def render_html(snapshot: Mapping[str, Any], *, symbols: Sequence[str] = DEFAULT
         _pnl_html(blocks.get(BLOCK_PNL) or _pnl_fallback("缺失")),
         _symbols_html(blocks.get(BLOCK_SYMBOLS) or _symbols_fallback("缺失", symbols=symbols)),
         _events_html(blocks.get(BLOCK_EVENTS) or _events_fallback("缺失")),
+        _admin_html(),
     ]
     return f"""<!doctype html>
 <html lang="zh-CN"><head>
@@ -1495,7 +1591,8 @@ def render_html(snapshot: Mapping[str, Any], *, symbols: Sequence[str] = DEFAULT
 <h1>{html.escape(title)}</h1>
 {''.join(body)}
 <footer>生成于 {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(generated))} UTC ·
-只读面板 · 本进程不接触私钥路径（读 DB + 公开行情；私有读数由注入的 provider 提供） ·
-写操作只有 POST /admin/kill · /admin/flatten · /admin/dd/reset（需 ADMIN_TOKEN）</footer>
+监控面板（读 DB + 公开行情；私有读数由 tick 注入） · 人工操作见⑦：
+kill / 清仓 / 重置回撤，用带 ?k=&lt;ADMIN_TOKEN&gt; 的链接打开一次即保存到本浏览器</footer>
+<script>{_ADMIN_JS}</script>
 </div></body></html>
 """
