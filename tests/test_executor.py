@@ -889,6 +889,31 @@ class ReaderTests(unittest.TestCase):
         headers = [h for url, h in self.calls if "/api/v1/account?" in url][0]
         self.assertEqual(headers, {})
 
+    def test_base_url_is_normalised_to_the_site_root(self):
+        """base_url 含 `/api/v1` 时**不能**再拼一次，否则 403。
+
+        `config.base_url` 是 `https://<host>/api/v1`（`app.market.BASE_URLS`），
+        而这里的路径参数本身就带 `/api/v1/...`。直接拼会得到
+        `/api/v1/api/v1/account` —— CloudFront 对重复路径回 403（实测：
+        正确路径 200，重复路径 403），长得像「地域限制」，实际是路径错。
+        """
+        import asyncio
+        seen = []
+
+        def http_json(url, headers=None, timeout=None):
+            seen.append(url)
+            return self.ACCOUNT
+
+        for base in ("https://host.test/api/v1", "https://host.test/api/v1/",
+                     "https://host.test"):
+            del seen[:]
+            reader = LighterAccountReader(base_url=base, account_index=42,
+                                          http_json=http_json)
+            asyncio.run(reader.read())
+            for url in seen:
+                self.assertNotIn("/api/v1/api/v1", url)
+                self.assertIn("/api/v1/account", url)
+
     def test_orders_failure_degrades_to_orders_error(self):
         import asyncio
         def http_json(url, headers=None, timeout=None):

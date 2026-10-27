@@ -241,13 +241,22 @@ API_HOSTS: Dict[str, str] = {
 #
 # 两者混用会得到重复路径 `/api/v1/api/v1/nextNonce` —— CloudFront 找不到资源，
 # 回 **403 Forbidden**，看起来像「被地域限制」，实际是路径拼错（实测）。
-def _sdk_api_root(base_url: str) -> str:
-    """把 base_url 归一成 SDK 要的站点根：`https://<host>`。"""
+def _site_root(base_url: str) -> str:
+    """把 base_url 归一成**站点根**：`https://<host>`（去掉尾部 `/api/v1`）。
+
+    全项目只有这一个地方做这件事：`app.executor` 的账户读取器拼的是
+    `/api/v1/account` 这类**完整**路径，而 `config.base_url` 也带 `/api/v1`，
+    不归一化就会拼出重复前缀（实测 403）。
+    """
     parts = urlsplit(base_url)
     path = (parts.path or "").rstrip("/")
     if path.endswith("/api/v1"):
         path = path[: -len("/api/v1")]
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+# 旧名保留：SDK 侧的语义就是这个（它要站点根）。
+_sdk_api_root = _site_root
 
 CODE_OK = 200
 
@@ -1305,8 +1314,11 @@ class LighterSdk(SdkBoundary):
         return int(resp.nonce)
 
     async def tx_status(self, tx_hash: str) -> Optional[Mapping[str, Any]]:
+        # `_headers=` 同 `next_nonce`：SDK 的 transaction_api 端点都没声明鉴权
+        # （`_auth_settings: List[str] = []`），不显式给 Authorization 就是 403。
         try:
-            tx = await self._signer.tx_api.tx(by="hash", value=tx_hash)
+            tx = await self._signer.tx_api.tx(by="hash", value=tx_hash,
+                                              _headers=self.auth_headers())
         except Exception as exc:                              # 未找到 / 400 / 404
             body = getattr(exc, "body", None) or str(exc)
             code, _msg = _parse_api_error_body(body)

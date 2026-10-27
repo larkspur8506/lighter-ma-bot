@@ -66,13 +66,19 @@ jobs:
         # The pushed artifact must be the one that was verified: pull it back
         # and run the real dlopen probe, not a locally built one.
         #
-        # The tag must come from metadata-action's own output, not from
-        # `${{ github.sha }}`: metadata-action names the sha tag `sha-<short>`,
-        # not the full commit hash, so hand-building the tag 404s.
+        # The tag comes from metadata-action's own output. Hand-building it
+        # does not work: metadata-action names the sha tag `sha-<short>`,
+        # and `github.sha` is the *full* hash, so `sha-${{ github.sha }}`
+        # 404s on an image that pushed fine. `${{ steps.meta.outputs.tags }}`
+        # is a newline-separated list of exactly the tags that were pushed.
         run: |
           set -euo pipefail
-          TAG="sha-${{ github.sha }}"
-          docker pull "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG"
-          docker run --rm --entrypoint python \
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG" -c \
-            "import lighter; pk, pub, err = lighter.create_api_key(); assert err is None, err; assert len(pk) == 82; print('published image signer loadable', len(pk))"
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "verifying $tag"
+            docker pull "$tag"
+            docker run --rm --entrypoint python "$tag" -c \
+              "import lighter; pk, pub, err = lighter.create_api_key(); assert err is None, err; assert len(pk) == 82; print('published image signer loadable', len(pk))"
+          done <<'EOF'
+          ${{ steps.meta.outputs.tags }}
+          EOF

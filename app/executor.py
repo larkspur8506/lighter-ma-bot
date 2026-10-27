@@ -84,7 +84,7 @@ from typing import (Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Opt
                     Sequence, Tuple)
 
 from app import strategy
-from app.exchange import OrderResult, client_order_index
+from app.exchange import OrderResult, _site_root, client_order_index
 from app.lifecycle import (ACTION_ENTRY, ACTION_EXIT, ACTION_SKIP, ACTION_STOP,
                            IDLE, OPEN, Decision, Lifecycle, Rejection)
 from app.risk import RiskLimits, RiskState
@@ -449,7 +449,11 @@ class LighterAccountReader(AccountReader):
                  http_json: Optional[Callable[..., Any]] = None,
                  timeout: float = 20.0,
                  clock: Callable[[], float] = time.time) -> None:
-        self.base_url = str(base_url).rstrip("/")
+        # base_url 归一化成**站点根**：`config.base_url` 是含 `/api/v1` 的
+        # （`app.market.BASE_URLS`），而这里的路径参数本身就带 `/api/v1/...`。
+        # 直接拼会得到 `/api/v1/api/v1/account` ⇒ CloudFront 403（实测：
+        # 正确路径 200，重复路径 403）。归一化放在这里，调用方传哪种形式都对。
+        self.base_url = _site_root(str(base_url))
         self.account_index = int(account_index)
         self.auth_provider = auth_provider
         self._http_json = http_json or _default_http_json
