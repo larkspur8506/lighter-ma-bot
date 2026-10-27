@@ -7,7 +7,8 @@
   fail-closed，不用「看起来合理」的默认值顶上（默认值最容易在实盘里静默变成
   「用错账户下单」）。
 * **可选（有文档化默认值）**：`LIGHTER_ENVIRONMENT=mainnet`、`DB_PATH=./data/state.db`、
-  `DB_URL`（空则从 `DB_PATH` 推导）、`RISK_PCT=0.01`、`HOST=0.0.0.0`、`PORT=8100`。
+  `DB_URL`（空则从 `DB_PATH` 推导）、`RISK_PCT=0.01`、`HOST=0.0.0.0`、`PORT=8100`、
+  `LIGHTER_PROXY_URL`（空 = 直连；判定与注入见 `app.proxy` / `docs/PROXY.md`）。
 * **secret**：`LIGHTER_API_PRIVATE_KEY`、`ADMIN_TOKEN`（以及可能带凭据的 `DB_URL`）在
   `repr()` / `str()` / `public()` 里全部脱敏。异常消息只报**变量名**，绝不带回值 ——
   否则一个 PK 格式错误就会把私钥抄进日志和通知。
@@ -27,10 +28,11 @@ from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from app.market import BASE_URLS, DEFAULT_ENVIRONMENT
+from app.proxy import PROXY_ENV_KEY, ProxyConfigError, parse_proxy_url, redact_proxy_url
 
 __all__ = [
     "ADMIN_TOKEN_KEY", "DEFAULT_ENVIRONMENT", "IDENTITY_KEYS", "OPTIONAL_KEYS",
-    "REQUIRED_KEYS", "REDACTED", "SECRET_KEYS", "Config", "ConfigError",
+    "PROXY_ENV_KEY", "REQUIRED_KEYS", "REDACTED", "SECRET_KEYS", "Config", "ConfigError",
 ]
 
 REDACTED = "***"
@@ -51,7 +53,8 @@ PORT_KEY = "PORT"
 IDENTITY_KEYS = (ACCOUNT_INDEX_KEY, API_KEY_INDEX_KEY, API_PRIVATE_KEY_KEY, L1_ADDRESS_KEY)
 REQUIRED_KEYS = IDENTITY_KEYS + (ADMIN_TOKEN_KEY,)
 SECRET_KEYS = (API_PRIVATE_KEY_KEY, ADMIN_TOKEN_KEY)
-OPTIONAL_KEYS = (ENVIRONMENT_KEY, DB_PATH_KEY, DB_URL_KEY, RISK_PCT_KEY, HOST_KEY, PORT_KEY)
+OPTIONAL_KEYS = (ENVIRONMENT_KEY, DB_PATH_KEY, DB_URL_KEY, RISK_PCT_KEY, HOST_KEY,
+                 PORT_KEY, PROXY_ENV_KEY)
 
 DEFAULTS: Dict[str, str] = {
     ENVIRONMENT_KEY: DEFAULT_ENVIRONMENT,
@@ -147,6 +150,7 @@ class Config:
     risk_pct: float
     host: str
     port: int
+    proxy_url: str = ""
 
     # ---------------------------------------------------------------- 派生
 
@@ -158,6 +162,11 @@ class Config:
     @property
     def is_testnet(self) -> bool:
         return self.environment == "testnet"
+
+    @property
+    def proxy_enabled(self) -> bool:
+        """`LIGHTER_PROXY_URL` 是否配了代理（空串 = 直连，默认）。"""
+        return bool(self.proxy_url)
 
     @property
     def sqlite_path(self) -> Optional[str]:
@@ -181,6 +190,8 @@ class Config:
             "risk_pct": self.risk_pct,
             "host": self.host,
             "port": self.port,
+            # 代理 URL 可能带 user:pass@ —— 与 db_url 同一套脱敏规则。
+            "proxy_url": redact_proxy_url(self.proxy_url) or UNSET,
         }
 
     def __repr__(self) -> str:
@@ -225,6 +236,13 @@ class Config:
         db_path = _read(source, DB_PATH_KEY) or DEFAULTS[DB_PATH_KEY]
         db_url = _read(source, DB_URL_KEY) or f"sqlite:///{db_path}"
 
+        # 代理：空 = 直连（默认）；非法 = 直接失败。静默忽略会让「以为走代理其实直连」
+        # 变成运行时才暴露的 20558，所以这里 fail-closed。
+        try:
+            proxy_url = parse_proxy_url(_read(source, PROXY_ENV_KEY))
+        except ProxyConfigError as exc:
+            raise ConfigError(str(exc)) from None
+
         return cls(
             account_index=_parse_int(source, ACCOUNT_INDEX_KEY),
             api_key_index=_parse_int(source, API_KEY_INDEX_KEY),
@@ -239,4 +257,5 @@ class Config:
             host=_read(source, HOST_KEY) or DEFAULTS[HOST_KEY],
             port=_parse_int(source, PORT_KEY, minimum=1,
                             default=int(DEFAULTS[PORT_KEY])),
+            proxy_url=proxy_url or "",
         )
