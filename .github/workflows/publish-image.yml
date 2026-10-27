@@ -65,9 +65,14 @@ jobs:
       - name: Verify the published image loads the WASM signer
         # The pushed artifact must be the one that was verified: pull it back
         # and run the real dlopen probe, not a locally built one.
+        #
+        # The tag must come from metadata-action's own output, not from
+        # `${{ github.sha }}`: metadata-action names the sha tag `sha-<short>`,
+        # not the full commit hash, so hand-building the tag 404s.
         run: |
           set -euo pipefail
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          TAG="sha-${{ github.sha }}"
+          docker pull "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG"
           docker run --rm --entrypoint python \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} -c \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG" -c \
             "import lighter; pk, pub, err = lighter.create_api_key(); assert err is None, err; assert len(pk) == 82; print('published image signer loadable', len(pk))"

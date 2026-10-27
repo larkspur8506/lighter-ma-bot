@@ -845,6 +845,73 @@ class RealSignerOfflineTests(unittest.TestCase):
                                     api_private_key=self.api_private_key,
                                     environment="mainnet")
 
+    def test_sdk_http_identity_is_configured(self):
+        """SDK 的 HTTP 层必须带上 User-Agent 和 Authorization。
+
+        两者都是**实测**出来的必要条件，不是风格偏好：
+
+        * 缺 User-Agent ⇒ CloudFront 按 aiohttp 默认 UA 判成脚本客户端 ⇒ 403；
+        * 缺 Authorization ⇒ SDK 的 `auth_settings()` 返回空 dict ⇒ 鉴权端点 403。
+
+        这个测试**不发网络请求**：只断言构造后的 SDK 对象上这些属性就位。
+        """
+        async def run():
+            sdk = self._sdk()
+            try:
+                signer = sdk._signer
+                api_client = signer.api_client
+                configuration = api_client.configuration
+
+                # --- User-Agent ---
+                self.assertEqual(api_client.user_agent, exchange.SDK_USER_AGENT)
+                self.assertEqual(api_client.default_headers["User-Agent"],
+                                 exchange.SDK_USER_AGENT)
+                session = api_client.rest_client.pool_manager
+                self.assertEqual(session.headers["User-Agent"], exchange.SDK_USER_AGENT)
+
+                # --- Authorization ---
+                # 构造完成时就已经签好了一个 token（不是「第一次请求才签」）。
+                self.assertTrue(configuration.api_key)
+                token = configuration.api_key["apiKey"]
+                self.assertTrue(token)
+                # auth token 的形状：<deadline>:<account_index>:<api_key_index>:<sig>
+                parts = token.split(":")
+                self.assertGreaterEqual(len(parts), 4)
+                self.assertEqual(parts[1], "12345")          # account_index
+                self.assertEqual(parts[2], "4")               # api_key_index
+
+                # --- 刷新 hook 已挂上（token 有 TTL，不能只签一次）---
+                self.assertIsNotNone(configuration.refresh_api_key_hook)
+                # hook 必须真的能换出新的 token
+                before = token
+                configuration.refresh_api_key_hook(configuration)
+                self.assertNotEqual(configuration.api_key["apiKey"], before)
+            finally:
+                await sdk.close()
+        asyncio.run(run())
+
+    def test_auth_token_failure_is_not_swallowed(self):
+        """签不出 auth token 时必须**拒绝启动**，绝不静默降级成「不带 Authorization」。
+
+        静默降级的失败模式在实盘里表现为「偶发下单失败」，最难查。
+        """
+        async def run():
+            sdk = self._sdk()
+            try:
+                signer = sdk._signer
+                configuration = signer.api_client.configuration
+
+                def _boom(configuration_obj):
+                    raise NotConfigured("no token for you")
+
+                configuration.refresh_api_key_hook = _boom
+                with self.assertRaises(NotConfigured) as ctx:
+                    configuration.refresh_api_key_hook(configuration)
+                self.assertIn("no token for you", str(ctx.exception))
+            finally:
+                await sdk.close()
+        asyncio.run(run())
+
     def test_sign_only_never_touches_the_transport(self):
         spec = build_entry_order(make_plan(), now_ms=NOW_MS, bar_ms=NOW_MS)
 

@@ -253,6 +253,12 @@ ORDER_TIME_IN_FORCE_POST_ONLY = 2
 
 NIL_MARKET_INDEX = 255          # `SignerClient.NIL_MARKET_INDEX`：cancel-all 用「全市场」
 
+# auth token 的有效期（Lighter 上限 8 小时）。SDK 的 `create_auth_token_with_expiry`
+# 的入参是**相对秒数**，它会自己加上当前时间戳；传绝对时间戳会被服务端判成
+# 「deadline 超过 8 小时上限」并返回 `invalid auth: invalid deadline`（实测）。
+# 取 1 小时：远短于上限，也短到「万一刷新失败」时不会拖太久。
+AUTH_TOKEN_TTL_S = 3600
+
 DEFAULT_ENTRY_SLIPPAGE_BPS = 30   # 0.30%：双均线突破的追价上限
 DEFAULT_STOP_SLIPPAGE_BPS = 100   # 1.00%：止损触发后允许的滑点（市价扫单，宽一点更可能成交）
 DEFAULT_EXIT_SLIPPAGE_BPS = 50    # 0.50%：信号平仓
@@ -1083,6 +1089,75 @@ def _sdk_rest_proxy(signer: Any) -> Optional[str]:
     return getattr(rest_client, "proxy", None)
 
 
+# CloudFront 在 Lighter 域名前面，会按 User-Agent 拦掉「像脚本」的客户端。
+# 实测：aiohttp 默认 UA（`Python/3.x aiohttp/...`）打 /nextNonce → 403 CloudFront；
+# 换成这个 UA 后同一个请求 200。SDK 的 `rest.py` 建 `aiohttp.ClientSession` 时
+# **不传 headers**，所以 UA 只能是 aiohttp 的默认值 —— 必须在这里补上。
+SDK_USER_AGENT = "lighter-ma-bot/0.2.0"
+
+
+def _configure_sdk_http_identity(signer: Any, *, user_agent: str = SDK_USER_AGENT) -> None:
+    """给 SDK 的 HTTP 层补上两样缺的东西：User-Agent 与 Authorization。
+
+    两者都是**实测出来的必要条件**，不是洁癖：
+
+    * **User-Agent**：`rest.py` 建 `aiohttp.ClientSession(connector=..., trust_env=True)`
+      时不传 `headers=`，aiohttp 于是用默认 UA。CloudFront 对着 Lighter 域名会把这种
+      UA 判成脚本客户端，返回 **403 Forbidden**（响应头 `Server: CloudFront`）。
+      换成 `lighter-ma-bot/0.2.0` 后同一请求返回 200。
+    * **Authorization**：`Configuration.api_key` 是空的 ⇒ `auth_settings()` 返回空 dict
+      ⇒ SDK **不发** Authorization 头 ⇒ `/nextNonce`、`/account` 这类鉴权只读端点 403。
+      手工加头即可 200（实测 `{"code":200,"nonce":1}`）。
+
+    auth token 有 TTL（Lighter 上限 8 小时），所以不能只在构造时签一次：
+    这里挂 `Configuration.refresh_api_key_hook` —— SDK 在每次
+    `get_api_key_with_prefix()` 前都会调它（`configuration.py:361-362`），hook 里
+    按剩余有效期决定要不要重签。
+
+    失败**不静默**：hook 里拿不到 token 就让异常继续抛（403 会原样冒到调用方），
+    绝不退化成「不带 Authorization 头也试试」—— 那种失败模式在实盘里表现为
+    「偶发下单失败」，是最难查的一种。
+    """
+    api_client = getattr(signer, "api_client", None)
+    rest_client = getattr(api_client, "rest_client", None)
+    configuration = getattr(api_client, "configuration", None)
+    if configuration is None:
+        raise NotConfigured(
+            "the SDK did not expose a Configuration object; cannot configure "
+            "User-Agent / Authorization (refusing to run with unauthenticated "
+            "requests)")
+    # --- User-Agent（aiohttp session 的默认头）---
+    session = getattr(rest_client, "pool_manager", None)
+    if session is not None:
+        session.headers["User-Agent"] = user_agent
+    if api_client is not None:
+        api_client.user_agent = user_agent
+        api_client.default_headers["User-Agent"] = user_agent
+
+    # --- Authorization（通过 refresh_api_key_hook 按需重签）---
+    signer_ref = signer
+
+    def _refresh(configuration_obj: Any) -> None:
+        api_key_index = int(getattr(signer_ref, "api_key_index", 0) or 0)
+        account_index = int(getattr(signer_ref, "account_index", 0) or 0)
+        if not api_key_index:
+            raise NotConfigured(
+                "cannot mint an auth token: the SDK signer does not expose "
+                "api_key_index (refusing to send unauthenticated requests)")
+        token, err = signer_ref.create_auth_token_with_expiry(
+            AUTH_TOKEN_TTL_S, api_key_index=api_key_index)
+        if err is not None:
+            raise NotConfigured(
+                f"failed to mint an auth token for api_key_index={api_key_index} "
+                f"(account_index={account_index}): {err}")
+        configuration_obj.api_key = {"apiKey": token}
+        configuration_obj.api_key_prefix = {}
+
+    configuration.refresh_api_key_hook = _refresh
+    # 先签一次，让「构造即可用」成立（否则第一个请求才失败）
+    _refresh(configuration)
+
+
 class LighterSdk(SdkBoundary):
     """官方 `lighter.SignerClient` 的薄封装（**唯一** import lighter 的地方）。
 
@@ -1171,6 +1246,21 @@ class LighterSdk(SdkBoundary):
             raise NotConfigured(
                 f"signer chain_id {self.chain_id} != expected {expected_chain} for "
                 f"environment {environment!r} (refusing to sign on the wrong chain)")
+
+        # HTTP 身份（User-Agent + Authorization）：SDK 自带的 HTTP 层两样都没有，
+        # 缺任何一样都会让鉴权端点 403。必须在 signer 建好之后配置（Configuration
+        # 是 SDK 内部建的，没有入参可传）。
+        #
+        # 让 signer 反射出这两个属性：SDK 的 `SignerClient` 不保存它们，而 auth token
+        # 的签发需要 api_key_index。
+        try:
+            self._signer.api_key_index = int(api_key_index)
+            self._signer.account_index = int(account_index)
+        except Exception:                                       # pragma: no cover
+            # 只读属性之类。_configure_sdk_http_identity 会因为拿不到 index 而拒绝启动。
+            pass
+        _configure_sdk_http_identity(self._signer)
+
         del lighter                                          # 不在模块级留引用
 
     # ---------------------------------------------------------------- 签名
