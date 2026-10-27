@@ -11,6 +11,24 @@
 
 与旧系统的关系：**并行运行，互不干扰**。旧系统（HL）继续 live，不降级不改动；新系统独立仓库、独立 DB、独立容器、独立 Lighter 账户。
 
+### 0.1 阶段划分（2026-10-27 调整）
+
+本计划分两个阶段，**当前只做第一阶段**：
+
+| 阶段 | 范围 | 状态 |
+|---|---|---|
+| **阶段一：开发期** | T1–T11 全部开发 + 离线验证（回测、dry-run、纸面链路） | **进行中** |
+| **阶段二：上线期** | T12/T13 + 真实账户、真实资金 | **暂缓**，等策略验证完成、正式转移前再做 |
+
+**为什么分阶段**：现阶段 HL 仍在验证策略阶段、资金处于测试阶段，**没有必要也不应该**
+为了「让 T13 能跑」而提前创建真实账户、入金、注册 API key。真实上线涉及真钱与不可逆
+操作（入金、开户、签 key），应该留到策略验证完成、真正要转移资金的时候再做，且届时
+用最新代码重新验证一遍。
+
+**阶段一不受此影响**：T1–T11 全部用**注入的假账户 / dry-run / 只读实测**完成并验证，
+**不需要任何真实凭据**。`scripts/offline_sign.py` 和真实下单链路在阶段一就已实现并测试
+（签名产物可离线验证），到阶段二只需配置凭据并跑演练。
+
 ---
 
 ## 1. 决策点（已确认）
@@ -21,6 +39,30 @@
 | L1 钱包 | **新建专用 Ethereum 钱包**，只放 Lighter 的钱 |
 | 账户模式 | **Simple Trading Account（Classic）**，`account_trading_mode=0` |
 | 机器人群组 | **独立 sub-account**，只放机器人有权亏的钱 |
+| 部署机器 | **待定**（见 1.1） |
+| 当前阶段 | **只做开发**，真实上线（T12/T13）推迟到正式转移前 |
+
+### 1.1 部署约束（2026-10-27 实测）
+
+Lighter 对**交易端点**（`/api/v1/sendTx`、`/api/v1/sendTxBatch`、WS `/stream`）做服务端 IP
+地域拦截，命中返回 `{"code":20558,"message":"You are accessing Lighter from a restricted
+jurisdiction..."}`。**读端点**（candles / orderBookDetails / account / nextNonce /
+accountsByL1Address）全部正常。
+
+实测各机器出口：
+
+| 机器 | 出口 | `sendTx` |
+|---|---|---|
+| 家网本机 | 印度 孟买 `137.23.52.79` | ✅ `20001`（过地域检查，仅参数无效） |
+| oracle1 | 美国 圣何塞 `64.181.225.174` | ❌ `20558` |
+| oracle2 | 美国 圣何塞 `152.70.122.121` | ❌ `20558` |
+| google | 美国 俄勒冈 `35.212.253.78` | ❌ `20558` |
+
+对照：Hyperliquid 的下单端点在同一台美国机器上返回 `422`（请求已进入撮合逻辑），
+说明 HL 只在前端层拦，**Lighter 是在 API 服务端层拦**。因此「HL 能跑」不能推出
+「Lighter 能跑」。
+
+**推论**：真实下单必须部署在**非受限地区**机器。美国节点只能做只读（回测、面板数据源）。
 
 ---
 
@@ -202,48 +244,61 @@ symbol ｜ 当前价 ｜ 6MA 带宽% ｜ **距密集门槛**（带宽 vs 该标�
 
 ---
 
-## 7. 任务分解（13 个 task）
+## 7. 任务分解（11 个开发 task + 2 个阶段二 task）
 
 每个 task = 一次子代理实现 + 一次独立审核 + 我的验收。子代理在 worktree 里干活，走 PR → CI → merge。
 
-### T1 — 仓库骨架 + CI
+**当前范围：T1–T11**（阶段一）。T12/T13 属阶段二，见 0.1。
+
+**任务标题后的 `[已完成]` 是实际落地时的文件名/口径**（与本节最初的草稿有出入，
+以实际实现为准 —— 草稿写于定稿前，落地时按 T2 冻结口径和 T4 的整数化设计做了调整）。
+「上线四步」已从 T11 拆出，见 T11/T12/T13。
+
+### T1 — 仓库骨架 + CI `[已完成 e65c4f6]`
 - 建 `requirements.txt`（`lighter-sdk==1.1.8`）、`Dockerfile`（装 WASM 签名器）、`.gitignore`、`README.md`（含第 6 节证据表）
 - GitHub Actions：test → build
 - **验收**：`import lighter` 成功；CI 绿；容器起得来
+- *落地补充*：默认 CMD 必须真能起（曾用 `--entrypoint` 覆盖导致假绿，已修）；签名器检查改真实加载探针；依赖显式钉版（含 `httpx2`）；私钥类文件不入库不入镜像
 
-### T2 — `strategy.py` 逐字移植 + 基线
+### T2 — `strategy.py` 逐字移植 + 基线 `[已完成 8ef1896]`
 - 从旧仓库复制 `app/strategy.py`（528 行，**一字节不改**）
 - 同时复制旧仓库 `scripts/xvalidate.py` 作对照工具
 - **验收**：同一组 K 线喂新旧两版，信号集合（bar_ms + 方向 + 止损价）**逐笔完全一致**
+- *落地*：sha256 `8682667…` 冻结；测试三路夹住（字节身份 / 独立参考实现 / 写死数值）；数据源改为 Lighter 自身 4h K 线，1251 笔信号逐笔一致
 
-### T3 — `symbol_registry.py` + `market.py`
+### T3 — `symbol_registry.py` + `market.py` `[已完成 a70ea40]`
 - 注册表：symbol → `{market_id, price_decimals, size_decimals, min_base_amount, min_quote_amount, min_initial_margin_fraction}`，**运行时从 `orderBookDetails` 拉取并缓存，禁止硬编码 market_id**（官方明确会变）
 - `market.py`：`candles` 翻页、只保留已收盘 bar、**fail-closed**（主源失败抛 `FeedError`，绝不换源）、新鲜度校验（最后一根收盘 ≤ 8h）
 - **验收**：最新 bar 与官方 UI 一致；时间戳单调；根数 ≥ 376；未收盘 bar 被剔除
+- *落地*：注册表并入 `market.py`（共享限流器）；`/orderBooks` 不返回深度，深度在 `/orderBookOrders`；testnet 的 market_id 与 mainnet 不同，必须运行时解析
 
-### T4 — `sizing_lt.py`（整数化 sizing）
+### T4 — `sizing_lt.py`（整数化 sizing）`[已完成 24b881f]`
 纯函数：
 - `target_notional(equity, risk_pct, stop_dist) -> float`
 - `to_int_qty(notional, price, size_decimals) -> int`（**floor**）
 - `to_int_price(price, price_decimals) -> int`
 - `round_trip_check(...) -> bool`（反算名义偏差 ≤ 1 tick）
 - **验收**：BTC sizeDec=5 / ETH=4 / SOL=3 边界各有用例；名义误差 < 0.01%；不产生 0 股或低于 `min_base_amount` 的单
+- *落地*：文件名 `app/sizing.py`；另加 `app/symbol_registry.py` 与 `app/risk.py`（7 道 fail-closed 闸门）
 
-### T5 — `db.py` + 迁移
+### T5 — `db.py` + 迁移 `[已完成 17399a8]`
 新表：`positions`（无 pending/ignore）、`orders`（`client_order_index` 幂等键）、`fills`、`events`、`snapshots`。保留「DB > env > 默认」优先级。
 - **验收**：迁移脚本幂等；`Config().apply_db()` 回读值正确（**旧系统踩过的坑**：数字被存成字符串会静默失效）
+- *落地*：文件名 `app/store.py` + `app/state.py`；表名 `trades`/`equity_curve`/`daily_counters`/`dd_anchors`；不变式 `sum(entry qty) == position.qty`
 
-### T6 — `engine.py` 状态机（去人工流）
+### T6 — `engine.py` 状态机（去人工流）`[已完成 742f3e6]`
 - 状态 `IDLE → OPEN → CLOSED`，每标的至多一仓
 - `walk()` 纯函数，输出入场/离场/止损事件
 - **验收**：用旧系统 dry-run 回放的同一组 bar，新引擎的**开平仓回合**逐笔一致（入场 bar、方向、止损价、离场 bar、R 倍数）
+- *落地*：文件名 `app/lifecycle.py`；状态机 `IDLE→OPEN→CLOSING→CLOSED`；**减仓不受熔断阻挡**（结构性保证）；`walk()` 未做（`decide()` 即循环体，整段回放归 T11，避免第二套口径）
 
-### T7 — `exchange.py`（唯一写路径）
+### T7 — `exchange.py`（唯一写路径）`[已完成 f9ff5e0]`
 - 懒加载 `SignerClient`；缺 SDK/缺凭据 → **fail-closed**
 - `place_market_with_slippage(coin, side, notional, slip_bps) -> tx_hash`
 - `place_stop_loss(coin, side, qty, trigger_price, expiry_ms)`
 - `cancel_all(coin)` / `cancel_all_orders()`
 - **验收**：异常归一化成 `{ok, code, error}`；**`code=200` 只表示已接受**，必须等 `tx` 确认或 WS `account_tx`
+- *落地*：入口改为 `place_entry(plan)` / `place_stop(plan)` / `place_exit(...)`（以 T4 的 `OrderPlan` 整数 tick 为准）；三道门（env flag + 环境匹配 + 每次调用 `confirm_live=<account_index>`）；重试**只重发不重签**（nonce 恒定），传输错误先查 `/tx?by=hash`；另有 `scripts/offline_sign.py`（用户本机跑，私钥只走 env/getpass，不进 argv）
 
 ### T8 — `executor.py`（状态机 + 风控 + 对账）
 - 幂等：`client_order_index` 唯一键
@@ -284,15 +339,37 @@ symbol ｜ 当前价 ｜ 6MA 带宽% ｜ **距密集门槛**（带宽 vs 该标�
 - 事件流：最近 20 条，含**「跳过」**类事件（如「未过密集门槛」）——否则用户以为系统坏了
 - **验收**：曲线口径与 `dd.py` 一致（同一测试断言两个口径相等）
 
-### T11 — 回测 + 上线验证
+### T11 — 回测（全历史）
 - `scripts/backtest.py`：Lighter 全历史 1.77 年、299 笔 → 均R/胜率/最大回撤/CAGR
-- `scripts/xvalidate.py`：回测引擎 vs 线上 `engine.py` 信号逐笔一致
+- `scripts/xvalidate.py`：回测引擎 vs 线上信号逐笔一致（T2 已完成基础版，此处补全历史与统计）
+- **验收**：回测数字与旧系统基线可比（同口径、同数据源差异要标注）；信号集合逐笔一致
+
+### T12 — 部署（阶段二）
+
+> **阶段二任务，当前不做。** 等策略验证完成、正式转移前再做；届时用最新代码重新验证一遍。
+
+- Docker Compose + systemd（或 1Panel）部署；配置走 env；镜像 tag 化可回滚
+- **验收**：容器起来后 `/health` 200；重启后状态从 DB 恢复
+
+### T13 — 上线演练（阶段二）
+
+> **阶段二任务，当前不做。** 涉及真钱与不可逆操作。
+
 - 上线四步 `off → dry → live → 常态化`，每步有验收
+- **前置**（需用户参与，一次性）：
+  1. 新建专用 Ethereum 钱包（只放 Lighter 的钱）
+  2. 用 UDA（`bridge.lighter.xyz`）从 Arbitrum 入金 USDC，**首次入金自动建账户**
+  3. 建 sub-account（机器人专用）
+  4. 注册 API key（`scripts/offline_sign.py`，**用户离线签名**，私钥不落服务器）
+- **部署机器前置**：必须是**非受限地区**机器（见 1.1；美国 IP 会被 `sendTx` 拒）
 - **验收**：dry 跑满至少 2 根 4h bar，信号数与回测预期一致
 
 ---
 
-## 8. 一次性人工步骤（需用户参与）
+## 8. 一次性人工步骤（需用户参与）—— **阶段二再做**
+
+> 这些步骤涉及真钱与不可逆操作，**当前阶段不做**。等策略验证完成、正式转移资金前，
+> 用当时的最新代码重新走一遍。
 
 | # | 步骤 | 谁能做 |
 |---|---|---|
@@ -301,6 +378,15 @@ symbol ｜ 当前价 ｜ 6MA 带宽% ｜ **距密集门槛**（带宽 vs 该标�
 | 3 | 建 sub-account（机器人专用） | agent（需 L1 签名配合） |
 | 4 | 注册 API key（链上 `ChangePubKey`） | agent 写脚本，**用户离线签名**（私钥不落服务器） |
 | 5 | 切 Plus/Premium 档 | agent |
+
+> **补充（2026-10-27 实测）**：第 2 步的入金链**支持 Arbitrum**（UDA 覆盖 Ethereum /
+> Arbitrum / Base / Optimism / Polygon / BNB / HyperEVM / Monad / Robinhood / Solana / Tron /
+> Bitcoin）。入金后用 `GET /api/v1/accountsByL1Address?l1_address=0x...` 查
+> `account_index`（**只读、无需鉴权**），`sub_accounts` 里 `account_type == 0` 的那项是 master。
+>
+> 注意：**Lighter RH（Robinhood Chain）是完全独立的交易所**，账户/余额/API key/nonce 全部
+> 不互通，抵押是 **USDG**（不是 USDC），签名 chain ID `466324`，且 market_id 要重新读。
+> 实测美国 IP 访问 RH 的 `/sendTx` 同样被 `20558` 拒 —— **RH 不是绕过地域限制的路径**。
 
 ---
 
