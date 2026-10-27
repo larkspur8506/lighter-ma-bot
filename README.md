@@ -77,10 +77,12 @@ CAGR +39.9%，最大回撤 23.3%）。
 ## 目录结构
 
 ```
-app/           策略(strategy.py)、市场数据(market.py)、配置(config.py)、HTTP 服务(T1 只有 main.py 的 /health)
+app/           策略(strategy.py)、市场数据(market.py)、配置(config.py)、
+               标的注册表(symbol_registry.py)、仓位(sizing.py)、风控闸门(risk.py)、
+               HTTP 服务(T1 只有 main.py 的 /health)
 scripts/       xvalidate.py(信号交叉验证) / probe_market.py(数据层探针) / backtest_engine.py(独立回测实现)
 tests/         stdlib unittest（不引入 pytest）
-docs/          PLAN.md + STRATEGY_PORT.md；DESIGN.md / RUNBOOK.md 由 T11 创建
+docs/          PLAN.md + STRATEGY_PORT.md + SIZING_RISK.md；DESIGN.md / RUNBOOK.md 由 T11 创建
 Dockerfile     单容器部署，暴露 8100，非 root 运行，仅 linux/amd64
 ```
 
@@ -112,6 +114,24 @@ LIGHTER_LIVE_TEST=1 python3 -m unittest tests.live_network_checks -v
 
 配置走环境变量，secret 在 `repr`/日志/异常里全部打码，必填项缺失直接报错（fail-closed）：
 `python3 -c "from app.config import Config; print(Config.from_env())"`。
+
+## 仓位与风控（T4）
+
+`app/sizing.py`（风险定仓 + 杠杆上限 + Lighter 整数化精度）、`app/symbol_registry.py`
+（BTC/ETH/SOL 白名单，未注册标的显性拦截）、`app/risk.py`（每日亏损 / 笔数 / 持仓数 /
+名义上限 / DD Guard，全部 fail-closed 并返回结构化拒单理由）。三者都是纯函数，**不碰网络**。
+
+```bash
+# 完整算例：10,000 权益 / 1.33% 风险 / 80,000 入 / 76,800 损 → 0.04156 BTC，名义 3,324.80，5x
+python3 - <<'PY'
+from app import sizing, symbol_registry as reg
+info = reg.spec_strict("BTC").as_market_info()
+d = sizing.plan_order(sizing.SizingRequest("BTC", 1, 80000.0, 76800.0, 10000.0), info)
+print(d, "|", d.rejection or d.plan.as_dict())
+PY
+```
+
+口径、精度规则、风控闸门阈值与 fail-closed 清单见 `docs/SIZING_RISK.md`。
 
 配置走 `.env`（`.gitignore` 已排除，模板见 `.env.example`）：
 
