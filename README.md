@@ -77,10 +77,10 @@ CAGR +39.9%，最大回撤 23.3%）。
 ## 目录结构
 
 ```
-app/           策略、引擎、执行器、只读客户端、HTTP 服务（T1 只有 main.py 的 /health）
-scripts/       回测 / 交叉验证 / 一次性密钥与账户设置（T2、T11 陆续落地，当前为空）
+app/           策略(strategy.py)、市场数据(market.py)、配置(config.py)、HTTP 服务(T1 只有 main.py 的 /health)
+scripts/       xvalidate.py(信号交叉验证) / probe_market.py(数据层探针) / backtest_engine.py(独立回测实现)
 tests/         stdlib unittest（不引入 pytest）
-docs/          当前只有 PLAN.md；DESIGN.md / RUNBOOK.md 由 T11 创建
+docs/          PLAN.md + STRATEGY_PORT.md；DESIGN.md / RUNBOOK.md 由 T11 创建
 Dockerfile     单容器部署，暴露 8100，非 root 运行，仅 linux/amd64
 ```
 
@@ -93,6 +93,25 @@ python -m unittest discover -s tests -t . -v
 ```
 
 CI（GitHub Actions）跑同一套命令；本地机器资源有限，全量测试以 CI 为准。
+
+## 市场数据层（T3）
+
+`app/market.py` 是**取数的唯一实现**（`scripts/xvalidate.py` 也 import 它）：4h K 线向前翻页、
+升序去重、缺口报告、未收盘 bar 剔除、新鲜度校验（≤ 8h）、盘口快照、限流退避重试。
+主源失败抛 `FeedError`，**不换源**。
+
+```bash
+# 一条命令看数据层是否健康（真实网络）
+python3 scripts/probe_market.py                      # BTC/ETH/SOL，最近 500 根
+python3 scripts/probe_market.py --json --bars 120    # 给脚本消费
+python3 scripts/probe_market.py --env testnet        # testnet 的 market_id 与 mainnet 不同
+
+# 真网络测试单独放，CI 的 discover 不会收集它（CI 对 skip 是硬失败）
+LIGHTER_LIVE_TEST=1 python3 -m unittest tests.live_network_checks -v
+```
+
+配置走环境变量，secret 在 `repr`/日志/异常里全部打码，必填项缺失直接报错（fail-closed）：
+`python3 -c "from app.config import Config; print(Config.from_env())"`。
 
 配置走 `.env`（`.gitignore` 已排除，模板见 `.env.example`）：
 

@@ -82,8 +82,11 @@ class OfflineValidationTest(unittest.TestCase):
 
     def test_unclosed_last_bar_is_dropped_by_default(self):
         rows = _candle_rows(self.bars)
-        with mock.patch.object(xvalidate.time, "time", return_value=self.bars[-1].open_ms / 1000 + 60):
-            kept = xvalidate.drop_unclosed(xvalidate._bars_from_lighter_rows(rows))
+        # `now` is passed explicitly: the freshness/closed-bar rule lives in
+        # `app.market` (T3 lifted it out of this script), which takes `now_ms`
+        # as a parameter precisely so tests never depend on the wall clock.
+        now_ms = self.bars[-1].open_ms + 60_000
+        kept = xvalidate.drop_unclosed(xvalidate._bars_from_lighter_rows(rows), now_ms=now_ms)
         self.assertEqual(kept[-1].open_ms, self.bars[-2].open_ms)
 
     def test_rows_are_deduped_and_sorted(self):

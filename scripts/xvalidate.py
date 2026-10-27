@@ -43,8 +43,6 @@ import datetime as dt
 import json
 import os
 import sys
-import time
-import urllib.request
 from typing import Dict, List, Optional
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -54,106 +52,59 @@ if ROOT not in sys.path:
 from app.strategy import (                       # noqa: E402
     MIN_BARS_REQUIRED, Bar, compute_indicators, scan, squeeze_flags,
 )
+# 取数逻辑的唯一实现是 `app.market`（T3 从这里上提）。xvalidate 只 import，
+# 不再自带一份 —— 否则「交叉验证通过」可能只是两份取数代码互相自洽。
+from app.market import (                         # noqa: E402
+    EARLIEST_MS, FALLBACK_MARKET_IDS, MAINNET_API, MAX_PAGES, PAGE_LIMIT,
+    FeedError, bars_from_rows, default_client, drop_unclosed, fmt_ms,
+)
 from scripts.backtest_engine import (            # noqa: E402
     REGIME_MA, build_frame, signals as engine_signals, squeeze_pct_flags,
 )
 
-API = "https://mainnet.zklighter.elliot.ai/api/v1"
-CANDLES_URL = f"{API}/candles"
+API = MAINNET_API
+CANDLES_URL = f"{API}/candles"           # kept for anyone grepping the endpoint
 DETAILS_URL = f"{API}/orderBookDetails"
 
-RESOLUTION = "4h"
-PAGE_LIMIT = 500                  # server-side maximum per call
-EARLIEST_MS = 1_737_100_800_000   # 2025-01-17T08:00:00Z — Lighter's first 4h bar
-MAX_PAGES = 80                    # hard stop: ~40k bars, well past any Lighter history
-BAR_MS = 4 * 3600 * 1000
 STOP_MIN, STOP_MAX = 0.015, 0.10
 DEFAULT_SYMBOLS = "BTC,ETH,SOL"
-
-# Fallback only: perp market ids observed 2026-10-27. `orderBookDetails` is
-# authoritative and wins whenever it answers (the docs warn ids can change), and
-# `--market-ids` wins over both. Kept in one place so no id is hardcoded at a
-# call site.
-FALLBACK_MARKET_IDS = {"BTC": 1, "ETH": 0, "SOL": 2}
 
 
 # ------------------------------------------------------------------ network
 
-def _get_json(url: str, timeout: float = 30.0) -> dict:
-    req = urllib.request.Request(url, headers={"User-Agent": "lighter-ma-bot/xvalidate"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.load(resp)
-
-
 def resolve_market_ids(timeout: float = 20.0) -> Dict[str, int]:
-    """symbol -> perp market_id from `orderBookDetails`; empty if unreachable."""
+    """symbol -> perp market_id from `orderBookDetails`; empty if unreachable.
+
+    Thin view over `app.market.default_client().market_details()` — two extra
+    fields (`price_decimals` …) are dropped here because the validator only
+    needs the id.
+    """
     try:
-        payload = _get_json(DETAILS_URL, timeout)
-    except OSError as exc:                       # network down / blocked
+        details = default_client().market_details()
+    except FeedError as exc:                     # network down / blocked / bad payload
         print(f"WARNING: orderBookDetails unavailable ({exc}); falling back to the "
               f"documented market ids {FALLBACK_MARKET_IDS}", file=sys.stderr)
         return {}
-    out: Dict[str, int] = {}
-    for row in payload.get("order_book_details") or []:
-        if row.get("market_type") != "perp" or row.get("status") != "active":
-            continue
-        out[str(row.get("symbol", "")).upper()] = int(row["market_id"])
-    return out
+    return {symbol: info.market_id for symbol, info in details.items()}
 
 
 def fetch_lighter(market_id: int, since_ms: int = EARLIEST_MS,
                   now_ms: Optional[int] = None) -> List[dict]:
     """Page Lighter's 4h candles back to ``since_ms``; returns raw rows ascending.
 
-    Paging contract (measured): a call with ``start_timestamp=0`` and an
-    ``end_timestamp`` returns the most recent ``count_back`` bars ending at that
-    timestamp, ascending. Feeding back ``earliest_t - 1`` therefore walks
-    backwards without overlaps or gaps.
+    Delegates to `app.market.MarketClient.fetch_rows` (rate-limited + retried);
+    see that method for the measured paging contract.
     """
-    rows: List[dict] = []
-    end = int(now_ms if now_ms is not None else time.time() * 1000)
-    for page_no in range(1, MAX_PAGES + 1):
-        url = (f"{CANDLES_URL}?market_id={int(market_id)}&resolution={RESOLUTION}"
-               f"&start_timestamp=0&end_timestamp={end}&count_back={PAGE_LIMIT}")
-        page = _get_json(url).get("c") or []
-        if not page:
-            break
-        rows = list(page) + rows
-        earliest = min(int(r["t"]) for r in page)
-        if earliest <= since_ms or len(page) < PAGE_LIMIT:
-            break
-        end = earliest - 1
-        if page_no == MAX_PAGES:
-            print(f"WARNING: stopped paging at {MAX_PAGES} pages; history is truncated",
-                  file=sys.stderr)
-    return rows
+    return default_client().fetch_rows(market_id, since_ms=since_ms, now_ms=now_ms,
+                                       page_limit=PAGE_LIMIT, max_pages=MAX_PAGES)
 
 
 # --------------------------------------------------------------------- bars
 
-def _bars_from_lighter_rows(rows: List[dict]) -> List[Bar]:
-    """Raw candle rows -> `app.strategy.Bar`, deduped and sorted by open time.
-
-    Lighter's row shape: ``{t, o, h, l, c, v, V, i}`` with ``t`` in **ms**.
-    """
-    by_ts: Dict[int, Bar] = {}
-    for row in rows:
-        open_ms = int(row["t"])
-        by_ts[open_ms] = Bar(
-            open_ms=open_ms,
-            open=float(row["o"]),
-            high=float(row["h"]),
-            low=float(row["l"]),
-            close=float(row["c"]),
-            volume=float(row.get("v") or 0.0),
-        )
-    return [by_ts[ts] for ts in sorted(by_ts)]
-
-
-def drop_unclosed(bars: List[Bar], now_ms: Optional[int] = None) -> List[Bar]:
-    """Remove the bar that is still forming: its close is not a close."""
-    now = int(now_ms if now_ms is not None else time.time() * 1000)
-    return [b for b in bars if b.open_ms + BAR_MS <= now]
+# `_bars_from_lighter_rows` / `drop_unclosed` / `_fmt` are re-exported from
+# `app.market` on purpose: the validator must judge the live engine on exactly
+# the bars the live engine would see, so it may not carry its own converter.
+_bars_from_lighter_rows = bars_from_rows
 
 
 def load_bars_file(path: str) -> Dict[str, List[dict]]:
@@ -171,8 +122,7 @@ def load_bars_file(path: str) -> Dict[str, List[dict]]:
     raise ValueError(f"{path}: expected a candle list or a symbol -> candles mapping")
 
 
-def _fmt(ms: int) -> str:
-    return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).strftime("%Y-%m-%d %H:%M")
+_fmt = fmt_ms
 
 
 # --------------------------------------------------------------- validation
@@ -324,7 +274,7 @@ def main(argv=None) -> int:
                 print(f"（{symbol} market_id={market_id} 来自 {source}）")
                 try:
                     rows = fetch_lighter(market_id, since_ms)
-                except OSError as exc:
+                except (FeedError, OSError) as exc:
                     print(f"\n=== {symbol} ===\n  ❌ 拉取 Lighter K 线失败：{exc}")
                     ok_all = False
                     continue
