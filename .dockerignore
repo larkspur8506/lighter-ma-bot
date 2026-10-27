@@ -1,0 +1,15 @@
+# Keep the build context small and free of secrets/runtime state.
+.git
+.gitignore
+.github
+.venv
+venv
+__pycache__
+*.pyc
+*.db
+*.sqlite3
+.env
+.env.*
+docs
+tests
+*.log

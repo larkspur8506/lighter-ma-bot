@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        # Tests must run against the real SDK — never let a missing dependency
+        # quietly turn the smoke test into a skip.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Show resolved versions
+        run: |
+          python -V
+          python -m pip show lighter-sdk | sed -n '1,3p'
+          python -c "import lighter, os; print('lighter from', lighter.__file__); print('signers:', sorted(os.listdir(os.path.join(os.path.dirname(lighter.__file__), 'signers'))))"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Assert tests were actually collected
+        # `unittest discover` exits 0 with zero tests; that is a silent-pass
+        # failure mode we explicitly guard against.
+        run: |
+          out=$(python -m unittest discover -s tests -t . 2>&1)
+          echo "$out"
+          echo "$out" | grep -Eq 'Ran [1-9][0-9]* test' || { echo "::error::no tests were collected"; exit 1; }
+          echo "$out" | grep -Eq 'skipped' && { echo "::error::tests were skipped"; exit 1; } || true
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (linux/amd64)
+        run: docker build --platform linux/amd64 -t lighter-ma-bot:ci .
+
+      - name: Verify the WASM signer binary is inside the image
+        run: |
+          docker run --rm --entrypoint python lighter-ma-bot:ci -c \
+            "import lighter, os; d=os.path.join(os.path.dirname(lighter.__file__), 'signers'); f=os.path.join(d,'lighter-signer-linux-amd64.so'); assert os.path.isfile(f), 'signer missing: '+str(os.listdir(d)); print('signer ok', os.path.getsize(f), 'bytes')"

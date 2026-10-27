@@ -1,0 +1,14 @@
+# Runtime dependencies — pinned/constrained.
+# lighter-sdk 1.1.8 ships the WASM signer binaries inside the wheel
+# (lighter/signers/lighter-signer-linux-amd64.so et al.), so the Docker
+# base image must be linux/amd64.
+lighter-sdk==1.1.8
+
+# HTTP service (monitoring panel + JSON API, T10)
+fastapi>=0.110,<1.0
+uvicorn>=0.27,<1.0
+python-multipart>=0.0.9,<1.0
+# apscheduler drives the 4h bar tick
+apscheduler>=3.10,<4.0
+# httpx is required by fastapi.testclient (route-level smoke tests)
+httpx>=0.27,<1.0
