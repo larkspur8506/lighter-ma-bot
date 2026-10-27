@@ -24,9 +24,19 @@ ENV/
 htmlcov/
 
 # Secrets & runtime state
+# NOTE: a pattern without a slash matches at any depth in git, so `*.key`
+# already covers `conf/lighter.key`. Files that hold private keys have no
+# legitimate reason to be committed, anywhere in this tree.
 .env
 .env.*
 !.env.example
+.envrc
+*.key
+*.pem
+*.p12
+id_rsa*
+id_ed25519*
+secrets/
 *.db
 *.db-journal
 *.db-wal
