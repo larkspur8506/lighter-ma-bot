@@ -1,8 +1,8 @@
 """Signal-level cross-validation: `app.strategy` (the live engine) vs
 `scripts/backtest_engine` (a second, independent implementation of the same
-rules).
+rules) — **plus the performance numbers both produce**.
 
-This is the port of the previous system's `scripts/xvalidate.py`, with two
+This is the port of the previous system's `scripts/xvalidate.py`, with three
 deliberate changes:
 
 * **Data source: Lighter instead of MEXC/Binance.** The old tool pulled 4h
@@ -17,6 +17,12 @@ deliberate changes:
   directory with an `exec`-truncation trick. That path does not exist in this
   repository, in CI or in the container, so the two primitives it needed live in
   `scripts/backtest_engine.py` (stdlib only, no pandas).
+* **Statistics, not just signal equality (T11).** Both signal sets are walked
+  through the *same* simulator and the *same* `summarise()` that
+  `scripts/backtest.py` uses — no numbers are recomputed here. If the two
+  engines agree signal-by-signal, their trade counts, R multiples, CAGR and
+  drawdown **must** come out identical; a difference means one of the two
+  engines produces a signal the other does not, and the tool fails.
 
 The property under test is unchanged and is the reason the tool exists: for the
 same bars, the two engines must emit the *same set of signals* — same bar open
@@ -43,7 +49,7 @@ import datetime as dt
 import json
 import os
 import sys
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -61,6 +67,10 @@ from app.market import (                         # noqa: E402
 from scripts.backtest_engine import (            # noqa: E402
     REGIME_MA, build_frame, signals as engine_signals, squeeze_pct_flags,
 )
+# 统计口径的唯一实现：回测引擎只出信号，**数字一律交给 scripts/backtest.py**
+# （`simulate` + `summarise`），否则「回测统计」会有两份口径，两份都需要维护。
+from scripts import backtest                         # noqa: E402
+from scripts.backtest import Signal as BtSignal      # noqa: E402  (同一份 app.strategy.Signal)
 
 API = MAINNET_API
 CANDLES_URL = f"{API}/candles"           # kept for anyone grepping the endpoint
@@ -127,7 +137,87 @@ _fmt = fmt_ms
 
 # --------------------------------------------------------------- validation
 
-def validate(symbol: str, bars: List[Bar]) -> bool:
+def reference_signals(symbol: str, frame: Dict[str, list],
+                      squeeze: List[bool]) -> List[BtSignal]:
+    """第二实现（`scripts/backtest_engine`）的信号 → `app.strategy.Signal` 列表。
+
+    转换里只做两件**冻结策略本来就有**的事，且都只写一次：
+
+    * 止损距离必须落在 `[STOP_MIN, STOP_MAX]`（`evaluate_entry` 的同一组常数）；
+    * 做空要求收盘低于 SMA200（`REGIME_MA` 趋势过滤）。
+
+    产出的 `Signal` 形状与实盘完全一致，于是可以喂进 `scripts/backtest` 的模拟器 ——
+    统计口径不需要第二份。
+    """
+    open_, close = frame["open"], frame["close"]
+    sma200, open_ms = frame["sma200"], frame["open_ms"]
+    ma_max, ma_min, band = frame["ma_max"], frame["ma_min"], frame["band"]
+    out: List[BtSignal] = []
+    for (t, side, stop) in engine_signals(frame, squeeze, "breakout"):
+        entry = float(open_[t + 1])
+        stop = float(stop)
+        if entry <= 0 or stop <= 0:
+            continue
+        dist = abs(entry - stop) / entry
+        if not (STOP_MIN <= dist <= STOP_MAX):
+            continue
+        if side == -1 and (sma200[t] is None or close[t] >= sma200[t]):
+            continue
+        prev = t - 1
+        out.append(BtSignal(
+            symbol=symbol, bar_index=int(t), bar_open_ms=int(open_ms[t]),
+            entry_price=entry, stop_price=stop, stop_dist=dist,
+            ma_max=float(ma_max[prev]), ma_min=float(ma_min[prev]),
+            band=float(band[prev]), side=int(side)))
+    out.sort(key=lambda sig: (sig.bar_index, sig.side))
+    return out
+
+
+#: 两个引擎的统计必须逐项一致的那几个字段（同一份 `summarise` 的输出）
+_STATS_KEYS = ("trades", "wins", "losses", "win_rate", "avg_r", "avg_r_net", "total_r",
+               "final_equity", "multiple", "cagr", "max_dd")
+
+
+def stats_block(symbol: str, bars: List[Bar], live: List[BtSignal],
+                reference: List[BtSignal],
+                funding: Optional["backtest.FundingRates"] = None) -> bool:
+    """把两侧信号各走一遍**同一个**模拟器/统计函数，打印并比对。
+
+    这不是"再算一遍回测"：`scripts/backtest.simulate` + `summarise` 是唯一的实现，
+    这里只换「信号从哪个引擎来」。两份统计因此必须完全相同 —— 不完全相同就说明两个
+    引擎对同一段行情的交易解释不同，交叉验证没通过。
+    """
+    risk = backtest.TIER_RISK_PCTS[0]
+    print(f"  回测统计（同一实现 scripts/backtest，风险档 {risk * 100:.2f}%"
+          + ("，含真实资金费" if funding is not None else "，不含资金费") + "）：")
+    out: Dict[str, Dict[str, Any]] = {}
+    for tag, sigs in (("实盘信号", live), ("回测引擎信号", reference)):
+        series = backtest.build_series(symbol, list(bars), funding=funding,
+                                       signals=list(sigs))
+        stats = backtest.run_scenario(f"{symbol}/{tag}", {symbol: series}, risk_pct=risk,
+                                      use_funding=funding is not None)
+        out[tag] = stats
+        print(f"    {tag:<8} 笔数 {stats['trades']:>4}  胜率 {stats['win_rate'] * 100:>5.1f}%  "
+              f"均R {stats['avg_r']:>+5.2f}  CAGR {stats['cagr'] * 100:>+7.2f}%  "
+              f"终值 {stats['multiple']:>5.3f}x  最大回撤 {stats['max_dd'] * 100:>5.2f}%"
+              + (f"  均R(净) {stats['avg_r_net']:>+5.2f}" if funding is not None else ""))
+
+    same = True
+    for key in _STATS_KEYS:
+        left, right = out["实盘信号"][key], out["回测引擎信号"][key]
+        if isinstance(left, float) or isinstance(right, float):
+            if abs(float(left) - float(right)) > 1e-9:
+                same = False
+                print(f"    ❌ {key}: 实盘 {left} vs 回测引擎 {right}")
+        elif left != right:
+            same = False
+            print(f"    ❌ {key}: 实盘 {left} vs 回测引擎 {right}")
+    print(f"    → {'✅ 两个引擎的统计逐项一致' if same else '❌ 统计不一致：先修信号口径'}")
+    return same
+
+
+def validate(symbol: str, bars: List[Bar],
+             funding: Optional["backtest.FundingRates"] = None) -> bool:
     """Compare both engines on one symbol's bars. Returns True if identical."""
     print(f"\n=== {symbol}  {len(bars)} 根  {_fmt(bars[0].open_ms)} → {_fmt(bars[-1].open_ms)} ===")
     if len(bars) < MIN_BARS_REQUIRED:
@@ -144,17 +234,10 @@ def validate(symbol: str, bars: List[Bar]) -> bool:
     # B) reference engine on the same bars
     frame = build_frame(bars)
     sq = squeeze_pct_flags(frame)
-    open_, close = frame["open"], frame["close"]
-    sma200, open_ms = frame["sma200"], frame["open_ms"]
-    bt_map: Dict[tuple, tuple] = {}
-    for (t, side, stop) in engine_signals(frame, sq, "breakout"):
-        entry = float(open_[t + 1])
-        dist = abs(entry - stop) / entry
-        if not (STOP_MIN <= dist <= STOP_MAX):
-            continue
-        if side == -1 and (sma200[t] is None or close[t] >= sma200[t]):
-            continue
-        bt_map[(int(open_ms[t]), side)] = (entry, stop)
+    close, sma200 = frame["close"], frame["sma200"]
+    ref_signals = reference_signals(symbol, frame, sq)
+    bt_map: Dict[tuple, tuple] = {(int(s.bar_open_ms), s.side): (s.entry_price, s.stop_price)
+                                  for s in ref_signals}
     bt_long = sum(1 for key in bt_map if key[1] == 1)
     print(f"  回测引擎：多 {bt_long} 笔 / 空 {len(bt_map) - bt_long} 笔")
 
@@ -174,6 +257,9 @@ def validate(symbol: str, bars: List[Bar]) -> bool:
     same = not only_live and not only_bt and d_entry < 1e-9 and d_stop < 1e-9
     print(f"  → {'✅ 信号集合逐笔完全一致' if same else '❌ 存在差异，必须先修'}")
 
+    # C) 统计（T11）：两侧信号各走一遍 scripts/backtest 的模拟器与统计函数
+    stats_same = stats_block(symbol, bars, live, ref_signals, funding=funding)
+
     # Indicators: the same numbers, computed twice (also shows how far the
     # reference engine's arithmetic sits from the live one).
     ind = compute_indicators(bars)
@@ -189,7 +275,22 @@ def validate(symbol: str, bars: List[Bar]) -> bool:
         diffs.append(spread)
     print(f"  band/sma200 最大绝对差 = {max(diffs) if diffs else 0.0:.3e}；"
           f"密集标记差异根数 = {sq_diff}")
-    return same
+    return same and stats_same
+
+
+def _funding_for(symbol: str, args) -> Optional["backtest.FundingRates"]:
+    """资金费（可选）：`--funding-from-file` 或 `<cache-dir>/FUNDING_<SYM>.json`。
+
+    取不到就返回 `None`：统计照出，只是不计资金费并在输出里写明 —— 绝不编一个费率
+    把「含资金费」这列凑出来。
+    """
+    try:
+        return backtest.load_funding(symbol, 0, cache_dir=args.cache_dir,
+                                     from_file=args.funding_from_file, quiet=True,
+                                     fetch=False)
+    except (OSError, ValueError) as exc:
+        print(f"  ⚠ {symbol} 资金费不可用（{exc}）；统计按不计资金费输出", file=sys.stderr)
+        return None
 
 
 def _parse_market_ids(raw: Optional[str]) -> Dict[str, int]:
@@ -222,6 +323,9 @@ def main(argv=None) -> int:
                     help="只取该日期之后（YYYY-MM-DD，默认 Lighter 全历史 2025-01-17）")
     ap.add_argument("--keep-open-bar", action="store_true",
                     help="保留尚未收盘的最后一根（默认剔除：未收盘的 close 不是 close）")
+    ap.add_argument("--funding-from-file", default=None,
+                    help="本地资金费 JSON（可选；默认读 <cache-dir>/FUNDING_<SYM>.json，"
+                         "都没有就不计资金费）")
     args = ap.parse_args(argv)
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -297,7 +401,7 @@ def main(argv=None) -> int:
             continue
 
         validated += 1
-        ok_all &= validate(symbol, bars)
+        ok_all &= validate(symbol, bars, _funding_for(symbol, args))
 
     print()
     if validated == 0:

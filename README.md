@@ -28,7 +28,9 @@
 
 旧回测（HL / Binance 4h 全历史）：**700 笔 / 6.10 年**（年化 115 笔，均 R +0.2442，
 CAGR +39.9%，最大回撤 23.3%）。
-（以上统计量来自旧系统 `crypto-ma-alert` 的回测，本仓库尚未复现 —— 见 T11。）
+（以上统计量来自旧系统 `crypto-ma-alert` 的回测。本仓库的回测见下方「回测（T11）」：
+Lighter 自己的数据上 **208 笔 / 1.77 年，均 R +0.21，CAGR +25.65%（含资金费），
+最大回撤 22.16%** —— 与旧基线的对比是**分层**的，见 `docs/BACKTEST.md` §6。）
 
 **结论，不要含糊：**
 
@@ -80,9 +82,10 @@ CAGR +39.9%，最大回撤 23.3%）。
 app/           策略(strategy.py)、市场数据(market.py)、配置(config.py)、
                标的注册表(symbol_registry.py)、仓位(sizing.py)、风控闸门(risk.py)、
                HTTP 服务(T1 只有 main.py 的 /health)
-scripts/       xvalidate.py(信号交叉验证) / probe_market.py(数据层探针) / backtest_engine.py(独立回测实现)
+scripts/       backtest.py(全历史回测：信号=app.strategy / 回撤=app.dd) / xvalidate.py(信号+统计交叉验证)
+               probe_market.py(数据层探针) / backtest_engine.py(独立回测实现，只当第二证人)
 tests/         stdlib unittest（不引入 pytest）
-docs/          PLAN.md + STRATEGY_PORT.md + SIZING_RISK.md；DESIGN.md / RUNBOOK.md 由 T11 创建
+docs/          PLAN.md + STRATEGY_PORT.md + SIZING_RISK.md + BACKTEST.md 等
 Dockerfile     单容器部署，暴露 8100，非 root 运行，仅 linux/amd64
 ```
 
@@ -164,6 +167,42 @@ POST /admin/dd/reset ?k=<ADMIN_TOKEN>&reason=...               ← 重置回撤�
 
 6 个区块、鉴权权衡（token 进 URL 的代价）、降级策略、盈亏双口径与「面板永远不碰私钥路径」
 这条约束见 `docs/DASHBOARD.md`。
+
+## 回测（T11）
+
+`scripts/backtest.py` 用**冻结的信号口径**（`app.strategy`）与**同一套 TWR 回撤**
+（`app.dd`）跑 Lighter 全历史：进场 = 信号次根开盘、止损 = `Signal.stop_price`
+（同 bar 内止损优先）、离场 = `exit_triggered`、资金费按 Lighter 真实逐小时费率计提。
+
+```bash
+python3 scripts/backtest.py --cache-dir .cache            # 三档风险 × 4 场景 × 有/无资金费
+python3 scripts/backtest.py --cache-dir .cache --json out.json
+python3 scripts/xvalidate.py --cache-dir .cache           # 信号逐笔 + 统计逐项一致
+```
+
+**Lighter 全历史（2025-01-17 → 2026-10-27，1.77 年，3,889 根/标的）实跑结果**
+（起 10,000 USDC，1.33% 风险档，已扣真实资金费）：
+
+| 场景 | 笔数 | 胜率 | 均R | CAGR | 终值 | 最大回撤 |
+|---|---|---|---|---|---|---|
+| BTC | 63 | 33.3% | +0.07 | +2.30% | 1.04x | 15.89% |
+| ETH | 75 | 33.3% | +0.19 | +9.24% | 1.17x | 13.43% |
+| SOL | 70 | 34.3% | +0.36 | +18.39% | 1.35x | 11.51% |
+| **合计** | **208** | **33.7%** | **+0.21** | **+25.65%** | **1.50x** | **22.16%** |
+
+三档风险（合计、含资金费）：1.33% → **+25.65%** / 回撤 22.2%；
+2% → **+33.80%** / 31.9%；3% → **+40.73%** / **45.1%**。
+风险翻倍换不回线性收益，回撤却翻倍 —— 这是「不要加杠杆」的直接证据。
+
+**与旧系统 HL 基线的关系是分层的，不是并列**（详见 `docs/BACKTEST.md` §6）：
+信号层**可比**（同一份冻结字节，1,251 笔信号逐笔一致；成交频率 117 笔/年 vs 旧研究 115 笔/年），
+绩效层**不可比**（历史 1.77 年 vs 6.10 年、手续费 0 vs 0.045%/边、深度约 1/5、资金费结构不同）。
+**不把 700 笔的统计显著性借给 208 笔。**
+
+> ⚠️ 上面「证据基础」表里的「过密集门槛 299 笔」是早期估算，与冻结口径**不可混用**
+> （`docs/STRATEGY_PORT.md` §4 已注明）。冻结口径下的真实漏斗是
+> 6,874 根破线 → 1,582 根过密集 → **1,251 笔信号 → 208 笔成交**（每标的至多一仓）。
+> 以 `docs/BACKTEST.md` 与 `scripts/backtest.py` 的实跑输出为准。
 
 ## 部署形态
 
