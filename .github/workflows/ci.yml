@@ -10,8 +10,13 @@ on:
 permissions:
   contents: read
 
+# `github.ref` differs per event for the same commit: refs/heads/<branch> on
+# push and refs/pull/N/merge on pull_request. Grouping on it therefore never
+# cancelled anything and every commit ran two full CI passes. `head_ref` is the
+# branch name on pull_request and empty on push, so both runs of one commit
+# land in the same group and the older one is cancelled.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -34,22 +39,43 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Show resolved versions
+        # Printed explicitly: a drifting resolution is the failure mode that
+        # the exact pins in requirements.txt exist to prevent, and this is the
+        # evidence that it held.
         run: |
           python -V
-          python -m pip show lighter-sdk | sed -n '1,3p'
+          python -m pip list | grep -Ei '^(lighter-sdk|fastapi|starlette|uvicorn|httpx|httpx2|python-multipart|apscheduler|packaging|anyio) '
           python -c "import lighter, os; print('lighter from', lighter.__file__); print('signers:', sorted(os.listdir(os.path.join(os.path.dirname(lighter.__file__), 'signers'))))"
 
       - name: Run unit tests
-        run: python -m unittest discover -s tests -t . -v
+        # `set -o pipefail` is load-bearing: without it `tee` returns 0 and a
+        # failing suite would show up as a green step. The suite runs exactly
+        # once — the guard step below reads /tmp/test.log instead of re-running
+        # it (T3/T7 add real API and signing calls; a second pass doubles the
+        # network traffic and makes failures non-deterministic).
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -t . -v 2>&1 | tee /tmp/test.log
 
       - name: Assert tests were actually collected
-        # `unittest discover` exits 0 with zero tests; that is a silent-pass
-        # failure mode we explicitly guard against.
+        # Guards two silent-pass modes: `unittest discover` exits 0 with zero
+        # tests, and skips hide missing dependencies. Written as explicit `if`
+        # blocks so a failing grep reports itself instead of killing the step
+        # before it can print anything.
         run: |
-          out=$(python -m unittest discover -s tests -t . 2>&1)
-          echo "$out"
-          echo "$out" | grep -Eq 'Ran [1-9][0-9]* test' || { echo "::error::no tests were collected"; exit 1; }
-          echo "$out" | grep -Eq 'skipped' && { echo "::error::tests were skipped"; exit 1; } || true
+          if ! grep -Eq '^Ran ' /tmp/test.log; then
+            echo "::error::no tests were collected"; exit 1
+          fi
+          if ! grep -Eq 'Ran [1-9][0-9]* tests?' /tmp/test.log; then
+            echo "::error::no tests were collected"; exit 1
+          fi
+          if grep -Eq '^FAILED' /tmp/test.log; then
+            echo "::error::test suite reported failures"; exit 1
+          fi
+          if grep -Eq 'skipped=[1-9]' /tmp/test.log; then
+            echo "::error::tests were skipped"; exit 1
+          fi
+          grep -E '^Ran ' /tmp/test.log
 
   build:
     name: build
@@ -64,7 +90,38 @@ jobs:
       - name: Build image (linux/amd64)
         run: docker build --platform linux/amd64 -t lighter-ma-bot:ci .
 
-      - name: Verify the WASM signer binary is inside the image
+      - name: Verify the WASM signer is loadable inside the image
+        # Presence is not the property we depend on: dlopen() is what breaks on
+        # a musl/glibc or arch mismatch, and that would surface only at the
+        # first order. create_api_key() does the real load.
         run: |
           docker run --rm --entrypoint python lighter-ma-bot:ci -c \
-            "import lighter, os; d=os.path.join(os.path.dirname(lighter.__file__), 'signers'); f=os.path.join(d,'lighter-signer-linux-amd64.so'); assert os.path.isfile(f), 'signer missing: '+str(os.listdir(d)); print('signer ok', os.path.getsize(f), 'bytes')"
+            "import lighter; pk, pub, err = lighter.create_api_key(); assert err is None, err; assert len(pk) == 82 and len(pub) == 82, (len(pk), len(pub)); print('signer loadable', len(pk))"
+
+      - name: Smoke-run the image with its default CMD
+        # Every other check uses `--entrypoint python`, which is exactly why a
+        # CMD that cannot import its app once shipped green. This runs the
+        # image's real default command and probes /health.
+        run: |
+          set -euo pipefail
+          docker rm -f ci-smoke >/dev/null 2>&1 || true
+          docker run -d --name ci-smoke -p 8100:8100 lighter-ma-bot:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8100/health >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8100/health
+          echo
+          # HEALTHCHECK uses --interval=30s with a --start-period=20s, so the
+          # status is still "starting" right after the first successful curl.
+          # Poll for the reported status instead of inspecting it once.
+          status=starting
+          for i in $(seq 1 24); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' ci-smoke)
+            if [ "$status" = "healthy" ]; then break; fi
+            sleep 5
+          done
+          docker inspect -f 'health={{.State.Health.Status}}' ci-smoke
+          docker logs ci-smoke
+          docker rm -f ci-smoke >/dev/null 2>&1 || true
+          test "$status" = "healthy"
