@@ -43,6 +43,7 @@ T9 `dd.py` 对**全新账户**的一次性 bootstrap（空库、无持仓、无�
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from dataclasses import dataclass, field
@@ -50,6 +51,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from app.risk import RiskState, drawdown as risk_drawdown
 from app.store import StateStore, day_bounds, utc_day
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DD_SOURCE_ANCHOR", "DD_SOURCE_STATE", "DD_SOURCE_UNAVAILABLE",
@@ -233,7 +236,8 @@ class StateAssembler:
                  positions_provider: Optional[Callable[[], Any]] = None,
                  allow_stale_equity: bool = False,
                  dd_max_age_s: Optional[float] = 24 * 3600.0,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 owns_store: bool = False) -> None:
         if store is None:
             raise ValueError("StateAssembler requires a StateStore")
         self.store = store
@@ -243,6 +247,47 @@ class StateAssembler:
         self.allow_stale_equity = bool(allow_stale_equity)
         self.dd_max_age_s = None if dd_max_age_s is None else float(dd_max_age_s)
         self.clock = clock
+        #: 装配器**不建库**：`store` 永远是调用方给的。默认只借用、不关闭
+        #: （关掉别人的连接会让调用方后面的写入全部炸）。`owns_store=True` 表示
+        #: 「这个连接的生命周期交给你」，此时 :meth:`close` 才真的关它。
+        self._owns_store = bool(owns_store)
+        self._closed = False
+
+    def __repr__(self) -> str:
+        return (f"StateAssembler(owns_store={self._owns_store}, "
+                f"closed={self._closed})")
+
+    # ---------------------------------------------------------------- 关闭
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        """释放 store —— **只在 `owns_store=True` 时**真的关闭它。**幂等**、不抛。
+
+        默认（借用）路径下这是个纯粹的 no-op：装配器没有建过连接，也就没有连接可漏。
+        这条方法存在的意义是让持有方（比如把它装配进一个长驻服务的代码）有一个统一的
+        `close()` 可调，而不是为了关别人的库。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if not self._owns_store:
+            return
+        closer = getattr(self.store, "close", None)
+        if not callable(closer):
+            return
+        try:
+            closer()
+        except Exception as exc:                              # noqa: BLE001 - 关闭路径
+            logger.warning("could not close the assembler store: %s", exc)
+
+    def __enter__(self) -> "StateAssembler":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
 
     # ---------------------------------------------------------------- 主入口
 

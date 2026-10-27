@@ -150,6 +150,21 @@ docker run --rm -p 8100:8100 --env-file .env lighter-ma-bot:dev
 容器默认 CMD（`uvicorn app.main:app`）就能起并返回 `{"ok": true, ...}`，CI 会真跑默认 CMD
 并等 HEALTHCHECK 转 healthy；T10 用真面板替换同一个模块，`/health` 路径不变。
 
+## 监控面板
+
+`uvicorn app.main:app` 起的就是监控面板（T10）：`/` 是自包含 HTML（内联 CSS + 内联 SVG，
+无 CDN），其余是 JSON 端点：
+
+```
+GET  /health /status /positions /stops /pnl /symbols /events   ← 只读，永远 200
+POST /admin/kill     ?k=<ADMIN_TOKEN>&reason=...               ← 停开新仓（不挡离场）
+POST /admin/flatten  ?k=<ADMIN_TOKEN>&confirm=yes              ← 市价清仓 + 撤所有挂单
+POST /admin/dd/reset ?k=<ADMIN_TOKEN>&reason=...               ← 重置回撤峰值
+```
+
+6 个区块、鉴权权衡（token 进 URL 的代价）、降级策略、盈亏双口径与「面板永远不碰私钥路径」
+这条约束见 `docs/DASHBOARD.md`。
+
 ## 部署形态
 
 独立域名 + 1Panel 反代到 `127.0.0.1:8100`。面板以只读监控为主，只有三个写操作
