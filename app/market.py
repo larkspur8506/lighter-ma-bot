@@ -64,6 +64,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from app.proxy import http_get_with_proxy
 from app.strategy import Bar
 
 __all__ = [
@@ -97,6 +98,10 @@ REQUESTS_PER_MINUTE = 60            # Lighter 公开 API 限流
 FALLBACK_MARKET_IDS: Dict[str, int] = {"BTC": 1, "ETH": 0, "SOL": 2}
 
 USER_AGENT = "lighter-ma-bot/market"
+
+# 与 `_urllib_get_json` 里写死的头保持一致 —— 走代理的 getter 由 `app.proxy` 提供，
+# 头由这里传进去（`app.proxy` 反过来不依赖 `app.market`，依赖是单向的）。
+_JSON_HEADERS: Dict[str, str] = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 
 _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 
@@ -546,6 +551,10 @@ class MarketClient:
     所有 HTTP 都经过 `_get_json`（限流 + 退避重试）。`http_get` / `sleep` / `clock` /
     `now_ms` / `rng` 全部可注入，因此单测完全离线且不用真等。
 
+    `proxy_url`（`LIGHTER_PROXY_URL`，空 = 直连）只影响默认 getter：配了就把
+    `app.proxy.http_get_with_proxy` 装成默认 `http_get`（只对 Lighter 域名走代理）。
+    显式传 `http_get` 时它优先 —— 注入的 transport 永远盖过配置。
+
     用法::
 
         client = MarketClient()                      # mainnet
@@ -567,11 +576,19 @@ class MarketClient:
                  jitter: float = 0.5,
                  rng: Optional[random.Random] = None,
                  details_ttl: float = 300.0,
-                 market_ids: Optional[Mapping[str, int]] = None) -> None:
+                 market_ids: Optional[Mapping[str, int]] = None,
+                 proxy_url: Optional[str] = None) -> None:
         self.environment = (environment or DEFAULT_ENVIRONMENT).strip().lower()
         self.api_base = (api_base or base_url(self.environment)).rstrip("/")
         self.timeout = float(timeout)
-        self._http_get = http_get or _urllib_get_json
+        # `http_get` 显式注入优先（测试就是这么做的）；否则配了代理就用带代理的 getter，
+        # 没配就用默认的纯 urllib 直连。默认行为必须保持「直连」。
+        if http_get is not None:
+            self._http_get = http_get
+        elif proxy_url:
+            self._http_get = http_get_with_proxy(proxy_url, headers=_JSON_HEADERS)
+        else:
+            self._http_get = _urllib_get_json
         self._sleep = sleep
         self._clock = clock
         self._now_ms = now_ms or _now_ms_default

@@ -191,11 +191,16 @@ import asyncio
 import hashlib
 import json
 import os
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterator, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
+from app.proxy import (
+    ProxyConfigError, configuration_proxy_for, parse_proxy_url, redact_proxy_url,
+)
 from app.sizing import OrderPlan, to_int_price
 
 __all__ = [
@@ -1022,6 +1027,62 @@ class SdkBoundary:
         raise NotImplementedError
 
 
+_CONFIGURATION_LOCK = threading.RLock()
+
+
+@contextmanager
+def _inject_configuration_proxy(proxy_url: Optional[str]) -> Iterator[Optional[str]]:
+    """在 `SignerClient(...)` 构造期间给 SDK 的 `Configuration.proxy` 赋值。
+
+    为什么必须这么绕（实测 `lighter-sdk==1.1.8`，三条都是读源码 + 实跑确认的）：
+
+    * SDK 的 `SignerClient.__init__` 里写死了 `Configuration(host=url)`，没有入参可传；
+    * `Configuration.__init__` **不接受** `proxy=` 关键字参数 —— `self.proxy: Optional[str]
+      = None` 是构造完才赋的一个普通属性（`configuration.py:190`）。所以「传 proxy= 进去」
+      这条路不存在，只能构造完**立刻**赋值；
+    * 时机必须是**在 `ApiClient` 被建之前**：`RestClientObject.__init__`（`rest.py:76`）
+      把 `configuration.proxy` 抄进 `self.proxy`，`request()` 再把它塞进每次调用的
+      `proxy=` 参数（`rest.py:159-162`）。构造完（`rest_client.proxy` 已定）再改
+      `Configuration` 就没用了 —— 那正是「以为走代理其实直连」。
+
+    做法：把 `lighter.signer_client` 模块里的 `Configuration` 名字临时换成一个包装：
+    先按原样构造，再给 `proxy` 赋值（原本已有值就不覆盖），构造完在 `finally` 里还原。
+
+    * 不动 `lighter.configuration.Configuration` 本体，也不动任何环境变量；
+    * 加锁，因为替换的是模块级全局名字（同进程并发构造会互相踩）。
+    """
+    if not proxy_url:
+        yield None
+        return
+    import lighter.signer_client as signer_client            # 函数内 import：模块级不碰 lighter
+
+    with _CONFIGURATION_LOCK:
+        original = signer_client.Configuration
+
+        def _configuration_with_proxy(*args: Any, **kwargs: Any) -> Any:
+            configuration = original(*args, **kwargs)
+            if getattr(configuration, "proxy", None) in (None, ""):
+                configuration.proxy = proxy_url
+            return configuration
+
+        signer_client.Configuration = _configuration_with_proxy   # type: ignore[assignment]
+        try:
+            yield proxy_url
+        finally:
+            signer_client.Configuration = original                # type: ignore[assignment]
+
+
+def _sdk_rest_proxy(signer: Any) -> Optional[str]:
+    """读回 SDK **实际生效**的代理：`SignerClient.api_client.rest_client.proxy`。
+
+    `rest.py:76` 把 `Configuration.proxy` 抄进 `rest_client.proxy`，那个值就是每次请求
+    真正传给 aiohttp 的 `proxy=`。用它自证「代理确实用上了」—— 否则就是「以为走代理
+    其实直连」，最后以 20558（restricted jurisdiction）的形式在实盘里炸出来。
+    """
+    rest_client = getattr(getattr(signer, "api_client", None), "rest_client", None)
+    return getattr(rest_client, "proxy", None)
+
+
 class LighterSdk(SdkBoundary):
     """官方 `lighter.SignerClient` 的薄封装（**唯一** import lighter 的地方）。
 
@@ -1034,7 +1095,8 @@ class LighterSdk(SdkBoundary):
 
     def __init__(self, *, base_url: str, account_index: int, api_key_index: int,
                  api_private_key: str, environment: str,
-                 price_protection: Optional[bool] = None) -> None:
+                 price_protection: Optional[bool] = None,
+                 proxy_url: Optional[str] = None) -> None:
         try:
             import lighter                                   # 懒加载：只是 import 也要在 async 里
         except Exception as exc:                             # pragma: no cover - 环境问题
@@ -1065,16 +1127,42 @@ class LighterSdk(SdkBoundary):
         from lighter import nonce_manager as _nonce_manager
         from lighter.signer_client import SignerClient
 
+        # 代理：**只**在 base_url 的 host 属于 Lighter 时才注入（`should_proxy` 的判定），
+        # 并且走 `Configuration.proxy` 这个 SDK 原生字段，**不**设 `HTTPS_PROXY` ——
+        # `rest.py` 的 `aiohttp.ClientSession(trust_env=True)` 会读环境变量，一设就把同
+        # 进程里其它 aiohttp 用例也带偏了。SDK 里 `Configuration(host=url)` 是写死的
+        # (`signer_client.py:420`)，所以靠 `_inject_configuration_proxy` 在构造期间注入。
+        # 另外 `proxy_url` 为空 / URL 非法时这一层什么都不做（非法在 Config 那层已经拦下）。
+        effective_proxy = configuration_proxy_for(base_url, proxy_url)
+
         # 构造函数必须有 running loop（内部建 aiohttp connector）——调用方保证在 async 里。
         # `chain_id` **显式传入**：SDK 自己会按 URL 猜（mainnet→304 / testnet→300），
         # 猜错的后果是签了个「另一个网络」的交易，所以这里不给它猜的机会。
-        self._signer = SignerClient(
-            url=base_url,
-            account_index=int(account_index),
-            api_private_keys={int(api_key_index): str(api_private_key)},
-            nonce_management_type=_nonce_manager.NonceManagerType.NONE,
-            chain_id=int(expected_chain),
-        )
+        with _inject_configuration_proxy(effective_proxy):
+            self._signer = SignerClient(
+                url=base_url,
+                account_index=int(account_index),
+                api_private_keys={int(api_key_index): str(api_private_key)},
+                nonce_management_type=_nonce_manager.NonceManagerType.NONE,
+                chain_id=int(expected_chain),
+            )
+        if effective_proxy:
+            # 自证：`rest.py:76` 会把 `Configuration.proxy` 抄进 `rest_client.proxy`，而
+            # 那个值就是每次请求传给 aiohttp 的 `proxy=`。没抄到 = 以为走代理其实直连 =
+            # 实盘里以 20558 的形式炸出来。宁可在这里拒绝启动。
+            applied = _sdk_rest_proxy(self._signer)
+            if applied != effective_proxy:
+                applied_label = redact_proxy_url(applied) or "None"
+                # 签名器已经建好（它的 aiohttp session 没人接手）—— 这条路径只在 SDK 行为
+                # 变化时触发，进程随即拒绝启动，所以不做收尾关闭：宁可留下一句
+                # ResourceWarning，也不要让「代理没生效」悄悄跑下去。
+                raise NotConfigured(
+                    "the SDK did not apply the configured proxy "
+                    f"({redact_proxy_url(effective_proxy)}): rest_client.proxy is "
+                    f"{applied_label!r}. Refusing to run — a silently direct "
+                    "connection hits error 20558 (restricted jurisdiction) at the "
+                    "first sendTx, long after startup.")
+        self.proxy_url = effective_proxy
         self.account_index = int(account_index)
         self.api_key_index = int(api_key_index)
         self.chain_id = int(self._signer.chain_id)
@@ -1169,6 +1257,9 @@ class ExchangeClient:
         self.environment = str(getattr(config, "environment", "mainnet"))
         self.base_url = str(getattr(config, "base_url"))
         self._api_private_key = str(getattr(config, "api_private_key", ""))
+        # 代理同样走 `LIGHTER_PROXY_URL`（`Config.proxy_url`，空串 = 直连）。这里再校验一次
+        # 是因为 `ExchangeClient` 也接受任意 config 形状（测试/脚本），不能假设上游一定校验过。
+        self.proxy_url = parse_proxy_url(getattr(config, "proxy_url", "") or "") or ""
         self.dry_run = bool(dry_run)
         self.preview_signature = bool(preview_signature)
         self.live_gate = live_gate if live_gate is not None else LiveGate()
@@ -1196,9 +1287,11 @@ class ExchangeClient:
         return cls(config, sdk=sdk, dry_run=dry_run, live_gate=gate, **kwargs)
 
     def __repr__(self) -> str:
+        proxy_label = redact_proxy_url(self.proxy_url) or "<direct>"
         return (f"ExchangeClient(account_index={self.account_index}, "
                 f"api_key_index={self.api_key_index}, environment={self.environment!r}, "
-                f"dry_run={self.dry_run}, api_private_key='***')")
+                f"dry_run={self.dry_run}, proxy_url={proxy_label!r}, "
+                f"api_private_key='***')")
 
     __str__ = __repr__
 
@@ -1210,7 +1303,8 @@ class ExchangeClient:
             self._sdk = LighterSdk(
                 base_url=self.base_url, account_index=self.account_index,
                 api_key_index=self.api_key_index, api_private_key=self._api_private_key,
-                environment=self.environment, price_protection=self.price_protection)
+                environment=self.environment, price_protection=self.price_protection,
+                proxy_url=self.proxy_url)
         return self._sdk
 
     @property
