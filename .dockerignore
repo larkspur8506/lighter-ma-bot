@@ -1,0 +1,66 @@
+# Keep the build context small and free of secrets/runtime state.
+#
+# Matching semantics: Docker accepts `**/` as "any number of directories,
+# including zero", while a bare filepath.Match reading treats `*` as
+# not-crossing-`/`. Each entry is therefore written twice (bare + `**/`) so
+# the exclusion holds under either reading for every path we care about;
+# parent-directory matches also exclude whole subtrees.
+.git
+.gitignore
+.github
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+**/*.pyc
+*.db
+**/*.db
+*.sqlite
+**/*.sqlite
+*.sqlite3
+**/*.sqlite3
+*.log
+**/*.log
+.env
+.env.*
+.envrc
+**/.envrc
+
+# Secrets. From T7 this repo holds an L1 private key and a Lighter API private
+# key; an accidental `COPY . .` must not be able to ship them into an image.
+# The secret patterns get an extra depth level on purpose: Docker's matcher
+# already treats `**/` as any-depth, but a plain filepath.Match reading stops
+# at one level, and a leaked trading key is unrecoverable while the redundant
+# line costs nothing.
+*.key
+**/*.key
+**/**/*.key
+*.pem
+**/*.pem
+**/**/*.pem
+*.p12
+**/*.p12
+**/**/*.p12
+id_rsa*
+**/id_rsa*
+**/**/id_rsa*
+id_ed25519*
+**/id_ed25519*
+**/**/id_ed25519*
+secrets/
+**/secrets/
+
+# Runtime state written by the bot, never build input. Kept root-relative on
+# purpose: a recursive `**/data/` would also drop an `app/data/` fixture dir.
+data/
+logs/
+
+# Tests run in CI; docs are read on GitHub. Neither belongs in the image.
+tests
+docs
+
+# These describe the build rather than its content, and `COPY . .` would
+# otherwise bake them into the image.
+Dockerfile
+.dockerignore
