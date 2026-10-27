@@ -196,7 +196,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Dict, Iterator, Mapping, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from app.proxy import (
     ProxyConfigError, configuration_proxy_for, parse_proxy_url, redact_proxy_url,
@@ -234,6 +234,20 @@ API_HOSTS: Dict[str, str] = {
     "mainnet": "mainnet.zklighter.elliot.ai",
     "testnet": "testnet.zklighter.elliot.ai",
 }
+
+# SDK 的 `SignerClient(url=...)` 期望的是**站点根**（`https://<host>`），它自己会把
+# `resource_path='/api/v1/...'` 拼上去。而我们对外的 base_url 是**带 `/api/v1` 的**
+# （`app.market.BASE_URLS`，给 urllib 直连用）。
+#
+# 两者混用会得到重复路径 `/api/v1/api/v1/nextNonce` —— CloudFront 找不到资源，
+# 回 **403 Forbidden**，看起来像「被地域限制」，实际是路径拼错（实测）。
+def _sdk_api_root(base_url: str) -> str:
+    """把 base_url 归一成 SDK 要的站点根：`https://<host>`。"""
+    parts = urlsplit(base_url)
+    path = (parts.path or "").rstrip("/")
+    if path.endswith("/api/v1"):
+        path = path[: -len("/api/v1")]
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 CODE_OK = 200
 
@@ -1096,66 +1110,33 @@ def _sdk_rest_proxy(signer: Any) -> Optional[str]:
 SDK_USER_AGENT = "lighter-ma-bot/0.2.0"
 
 
-def _configure_sdk_http_identity(signer: Any, *, user_agent: str = SDK_USER_AGENT) -> None:
-    """给 SDK 的 HTTP 层补上两样缺的东西：User-Agent 与 Authorization。
+def _configure_sdk_user_agent(signer: Any, *, user_agent: str = SDK_USER_AGENT) -> None:
+    """给 SDK 的 HTTP 层补上 User-Agent。
 
-    两者都是**实测出来的必要条件**，不是洁癖：
+    **实测出来的必要条件**，不是洁癖：`rest.py` 建
+    `aiohttp.ClientSession(connector=..., trust_env=True)` 时不传 `headers=`，
+    aiohttp 于是用默认 UA。CloudFront 对着 Lighter 域名会把这种 UA 判成脚本
+    客户端，返回 **403 Forbidden**（响应头 `Server: CloudFront`）。换成
+    `lighter-ma-bot/0.2.0` 后同一请求返回 200。
 
-    * **User-Agent**：`rest.py` 建 `aiohttp.ClientSession(connector=..., trust_env=True)`
-      时不传 `headers=`，aiohttp 于是用默认 UA。CloudFront 对着 Lighter 域名会把这种
-      UA 判成脚本客户端，返回 **403 Forbidden**（响应头 `Server: CloudFront`）。
-      换成 `lighter-ma-bot/0.2.0` 后同一请求返回 200。
-    * **Authorization**：`Configuration.api_key` 是空的 ⇒ `auth_settings()` 返回空 dict
-      ⇒ SDK **不发** Authorization 头 ⇒ `/nextNonce`、`/account` 这类鉴权只读端点 403。
-      手工加头即可 200（实测 `{"code":200,"nonce":1}`）。
-
-    auth token 有 TTL（Lighter 上限 8 小时），所以不能只在构造时签一次：
-    这里挂 `Configuration.refresh_api_key_hook` —— SDK 在每次
-    `get_api_key_with_prefix()` 前都会调它（`configuration.py:361-362`），hook 里
-    按剩余有效期决定要不要重签。
-
-    失败**不静默**：hook 里拿不到 token 就让异常继续抛（403 会原样冒到调用方），
-    绝不退化成「不带 Authorization 头也试试」—— 那种失败模式在实盘里表现为
-    「偶发下单失败」，是最难查的一种。
+    Authorization **不在这里设**：SDK 的 `nextNonce` 端点在 OpenAPI spec 里
+    把 `auth_settings` 写成空列表（`api/transaction_api.py:_next_nonce_serialize`
+    里 `_auth_settings: List[str] = []`），所以 `Configuration.api_key` 根本
+    不会被读进请求头。鉴权只能**显式**传 `_headers={"Authorization": ...}`，
+    见 `LighterSdk.auth_headers()`。
     """
     api_client = getattr(signer, "api_client", None)
     rest_client = getattr(api_client, "rest_client", None)
-    configuration = getattr(api_client, "configuration", None)
-    if configuration is None:
+    if api_client is None:
         raise NotConfigured(
-            "the SDK did not expose a Configuration object; cannot configure "
-            "User-Agent / Authorization (refusing to run with unauthenticated "
-            "requests)")
-    # --- User-Agent（aiohttp session 的默认头）---
+            "the SDK did not expose an ApiClient object; cannot configure "
+            "User-Agent (refusing to run with a default aiohttp User-Agent, "
+            "which CloudFront rejects with 403)")
+    api_client.user_agent = user_agent
+    api_client.default_headers["User-Agent"] = user_agent
     session = getattr(rest_client, "pool_manager", None)
     if session is not None:
         session.headers["User-Agent"] = user_agent
-    if api_client is not None:
-        api_client.user_agent = user_agent
-        api_client.default_headers["User-Agent"] = user_agent
-
-    # --- Authorization（通过 refresh_api_key_hook 按需重签）---
-    signer_ref = signer
-
-    def _refresh(configuration_obj: Any) -> None:
-        api_key_index = int(getattr(signer_ref, "api_key_index", 0) or 0)
-        account_index = int(getattr(signer_ref, "account_index", 0) or 0)
-        if not api_key_index:
-            raise NotConfigured(
-                "cannot mint an auth token: the SDK signer does not expose "
-                "api_key_index (refusing to send unauthenticated requests)")
-        token, err = signer_ref.create_auth_token_with_expiry(
-            AUTH_TOKEN_TTL_S, api_key_index=api_key_index)
-        if err is not None:
-            raise NotConfigured(
-                f"failed to mint an auth token for api_key_index={api_key_index} "
-                f"(account_index={account_index}): {err}")
-        configuration_obj.api_key = {"apiKey": token}
-        configuration_obj.api_key_prefix = {}
-
-    configuration.refresh_api_key_hook = _refresh
-    # 先签一次，让「构造即可用」成立（否则第一个请求才失败）
-    _refresh(configuration)
 
 
 class LighterSdk(SdkBoundary):
@@ -1202,6 +1183,11 @@ class LighterSdk(SdkBoundary):
         from lighter import nonce_manager as _nonce_manager
         from lighter.signer_client import SignerClient
 
+        # SDK 的 url 必须是**站点根**：它自己会拼 `resource_path='/api/v1/...'`。
+        # 直接把我们对外的 base_url（含 `/api/v1`）传进去会得到
+        # `/api/v1/api/v1/nextNonce` ⇒ CloudFront 403（看起来像地域限制，其实是路径错）。
+        sdk_url = _sdk_api_root(base_url)
+
         # 代理：**只**在 base_url 的 host 属于 Lighter 时才注入（`should_proxy` 的判定），
         # 并且走 `Configuration.proxy` 这个 SDK 原生字段，**不**设 `HTTPS_PROXY` ——
         # `rest.py` 的 `aiohttp.ClientSession(trust_env=True)` 会读环境变量，一设就把同
@@ -1215,7 +1201,7 @@ class LighterSdk(SdkBoundary):
         # 猜错的后果是签了个「另一个网络」的交易，所以这里不给它猜的机会。
         with _inject_configuration_proxy(effective_proxy):
             self._signer = SignerClient(
-                url=base_url,
+                url=sdk_url,
                 account_index=int(account_index),
                 api_private_keys={int(api_key_index): str(api_private_key)},
                 nonce_management_type=_nonce_manager.NonceManagerType.NONE,
@@ -1247,19 +1233,16 @@ class LighterSdk(SdkBoundary):
                 f"signer chain_id {self.chain_id} != expected {expected_chain} for "
                 f"environment {environment!r} (refusing to sign on the wrong chain)")
 
-        # HTTP 身份（User-Agent + Authorization）：SDK 自带的 HTTP 层两样都没有，
-        # 缺任何一样都会让鉴权端点 403。必须在 signer 建好之后配置（Configuration
-        # 是 SDK 内部建的，没有入参可传）。
-        #
-        # 让 signer 反射出这两个属性：SDK 的 `SignerClient` 不保存它们，而 auth token
-        # 的签发需要 api_key_index。
-        try:
-            self._signer.api_key_index = int(api_key_index)
-            self._signer.account_index = int(account_index)
-        except Exception:                                       # pragma: no cover
-            # 只读属性之类。_configure_sdk_http_identity 会因为拿不到 index 而拒绝启动。
-            pass
-        _configure_sdk_http_identity(self._signer)
+        # HTTP 身份（User-Agent）：SDK 自带的 HTTP 层没有 UA，CloudFront 会按
+        # aiohttp 的默认 UA 把请求判成脚本客户端并回 403。必须在 signer 建好之后
+        # 配置（Configuration 是 SDK 内部建的，没有入参可传）。
+        _configure_sdk_user_agent(self._signer)
+
+        # auth token 缓存：token 有 TTL（上限 8 小时），每次请求现签太贵；
+        # 用失败才换又会把「中途失败」变成「这一轮 tick 白跑」。缓存按过期前
+        # `skew_s` 秒刷新，过期时间从 token 自己解析（不信本地时钟）。
+        self._auth_cache = AuthTokenCache(
+            self.mint_auth_token, ttl_s=AUTH_TOKEN_TTL_S, skew_s=AUTH_TOKEN_REFRESH_SKEW_S)
 
         del lighter                                          # 不在模块级留引用
 
@@ -1279,6 +1262,29 @@ class LighterSdk(SdkBoundary):
             deadline=int(ttl_s), api_key_index=self.api_key_index)
         return token, err
 
+    def auth_headers(self) -> Dict[str, str]:
+        """返回带 Authorization 的请求头。
+
+        为什么必须**显式**传，而不能靠 `Configuration.api_key`：SDK 的
+        `nextNonce` 端点在 OpenAPI spec 里把 `auth_settings` 写成空列表
+        （`api/transaction_api.py:_next_nonce_serialize` 里 `_auth_settings:
+        List[str] = []`），于是 `api_client.param_serialize` 的
+        `for auth in auth_settings:` 一次都不执行 —— **不管 `Configuration.api_key`
+        里有没有 token，请求都不会带上 Authorization 头**。
+
+        实测（mainnet，经日本代理）：手工加头 → `/nextNonce` 200
+        `{"code":200,"nonce":1}`；不加 → 403 CloudFront。
+
+        SDK 的 `*_with_http_info` 都接受 `_headers=` 入参，且
+        `_header_params = _headers or {}` 会原样带上 —— 所以走这条路。
+
+        失败**不静默**：签不出 token 就抛 `NotConfigured`，绝不退化成
+        「不带 Authorization 头也试试」—— 那种失败模式在实盘里表现为
+        「偶发下单失败」，是最难查的一种。
+        """
+        token = self._auth_cache.get()
+        return {"Authorization": token, "User-Agent": SDK_USER_AGENT}
+
     # ---------------------------------------------------------------- 网络
 
     async def send_tx(self, tx_type: int, tx_info: str) -> Any:
@@ -1290,8 +1296,12 @@ class LighterSdk(SdkBoundary):
             tx_type=tx_type, tx_info=tx_info, price_protection=self._price_protection)
 
     async def next_nonce(self) -> int:
+        # `_headers=` 是必须的：SDK 的 nextNonce 端点没声明鉴权
+        # （`_auth_settings: List[str] = []`），不显式给 Authorization 就 403。
+        # 细节见 `auth_headers()` 的 docstring。
         resp = await self._signer.tx_api.next_nonce(
-            account_index=self.account_index, api_key_index=self.api_key_index)
+            account_index=self.account_index, api_key_index=self.api_key_index,
+            _headers=self.auth_headers())
         return int(resp.nonce)
 
     async def tx_status(self, tx_hash: str) -> Optional[Mapping[str, Any]]:
