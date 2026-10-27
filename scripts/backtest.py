@@ -311,14 +311,6 @@ def _mean(values: Sequence[float]) -> float:
     return float(sum(values) / len(values)) if values else 0.0
 
 
-def _years(bars: Sequence[Bar]) -> float:
-    """回测区间的年数（首根开盘 → 末根收盘），365.25 天/年。"""
-    if len(bars) < 2:
-        return 0.0
-    span_ms = (bars[-1].open_ms + BAR_MS) - bars[0].open_ms
-    return span_ms / (365.25 * 86400 * 1000)
-
-
 def _fmt_ts(ms: int) -> str:
     return fmt_ms(int(ms))
 
