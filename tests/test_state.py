@@ -6,7 +6,10 @@
   * **回撤锚点丢失不得静默归零**：锚点被 30 天清理 → 用 `dd_state`；`dd_state` 也没了
     → `index=peak=None` → `drawdown` 闸拒单（绝不返回 0%）；
   * 权益/价格/持仓三个注入点的降级路径（provider 抛错、返回 NaN、返回垃圾）；
-  * `snapshot()` 只读（调用前后行数不变），唯一的写操作是显式的 `ensure_day_start()`。
+  * `snapshot()` 只读（调用前后行数不变），唯一的写操作是显式的 `ensure_day_start()`；
+  * **store 生命周期**：装配器不建库，默认只借用、`close()` 是 no-op；只有
+    `owns_store=True`（显式把连接交给它）才会真的关闭，且幂等 —— 否则「关装配器」
+    会顺手把调用方的库抽走（PR #11 验收发现的 close 路径缺失的反面）。
 
 期望值全部手算写死（见每个断言旁的算式）。
 """
@@ -14,8 +17,10 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import unittest
+from typing import Any
 
 from app.risk import GATE_DAILY_LOSS, GATE_DD, GATE_STATE, GATE_TOTAL_NOTIONAL, RiskLimits
 from app.state import (
@@ -484,6 +489,44 @@ class DDPrimitiveTests(unittest.TestCase):
 
     def test_utc_day_matches_store(self):
         self.assertEqual(utc_day(TS), DAY)
+
+
+class AssemblerLifecycleTests(StateTestCase):
+    """装配器**不建库** —— `close()` 默认 no-op，只有 `owns_store=True` 才真关。"""
+
+    def test_close_is_a_noop_for_a_borrowed_store(self):
+        assembler = self.assembler()
+        assembler.close()
+        assembler.close()                       # 幂等
+        self.assertTrue(assembler.closed)
+        self.store.conn.execute("select 1")     # 别人的库不许被关掉
+
+    def test_close_closes_an_owned_store(self):
+        owned = StateStore(os.path.join(self._tmp.name, "owned.db"))
+        assembler = StateAssembler(owned, clock=lambda: TS, owns_store=True)
+
+        assembler.close()
+        assembler.close()                       # 幂等
+
+        with self.assertRaises(sqlite3.ProgrammingError):
+            owned.conn.execute("select 1")
+
+    def test_close_survives_a_store_whose_close_raises(self):
+        class BadClose:
+            def close(self):
+                raise RuntimeError("cannot close")
+
+        bad: Any = BadClose()
+        assembler = StateAssembler(bad, clock=lambda: TS, owns_store=True)
+        assembler.close()                       # 关闭路径不抛
+        self.assertTrue(assembler.closed)
+
+    def test_context_manager_closes_an_owned_store(self):
+        owned = StateStore(os.path.join(self._tmp.name, "ctx.db"))
+        with StateAssembler(owned, clock=lambda: TS, owns_store=True) as assembler:
+            self.assertFalse(assembler.closed)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            owned.conn.execute("select 1")
 
 
 if __name__ == "__main__":                                    # pragma: no cover

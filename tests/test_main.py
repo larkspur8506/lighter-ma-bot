@@ -9,6 +9,9 @@
    `tick_failed` 落库、之后成功一轮能恢复正常。
 5. **skip 事件落库**（`record_tick_outcomes`）—— 面板才看得见「为什么没开单」。
 6. `MarketBarSource` 的 TTL 缓存（一轮 3 个标的别把限流烧在刷页面上）。
+7. **lifespan shutdown 收尾**：面板 / 调度器懒建的 `StateStore` 在应用关闭时被关闭
+   （`Panel.close()` / `TickScheduler.close()`）—— 不关就是 `sqlite3.Connection` 泄漏
+   （全量测试实测 5 条 `ResourceWarning: unclosed database`，修之后 0 条）。
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import asyncio
 import contextlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -560,7 +564,13 @@ class PanelWithoutCredentialsTests(unittest.TestCase):
                 for row in rows]
 
     def client(self, **kwargs: Any) -> TestClient:
-        """**不注入 panel**：走 `default_store_factory` + 默认 flatten 的真实装配。"""
+        """**不注入 panel**：走 `default_store_factory` + 默认 flatten 的真实装配。
+
+        用 `with self.client() as client:` 使用 —— 那样才会跑 FastAPI 的 lifespan
+        shutdown，把面板懒建的 `StateStore` 关掉（`app.main` 的 lifespan 负责收尾）。
+        裸 `TestClient(app)` 不进 lifespan，连接就没人关（这正是 `ResourceWarning:
+        unclosed database` 的来源）。
+        """
         app = main.create_app(limits=LIMITS, clock=lambda: T0 + BAR_S + 60, **kwargs)
         return TestClient(app)
 
@@ -568,10 +578,10 @@ class PanelWithoutCredentialsTests(unittest.TestCase):
 
     def test_read_endpoints_serve_real_rows_from_the_database(self) -> None:
         with clean_env(DB_PATH=self.db, ADMIN_TOKEN=self.TOKEN):
-            client = self.client()
-            status = client.get("/status").json()
-            positions = client.get("/positions").json()
-            events = client.get("/events").json()
+            with self.client() as client:
+                status = client.get("/status").json()
+                positions = client.get("/positions").json()
+                events = client.get("/events").json()
 
         self.assertEqual(status["equity"], 1030.0)          # 真 DB 里的权益，不是 0
         self.assertEqual(status["open_count"], 1)
@@ -583,7 +593,8 @@ class PanelWithoutCredentialsTests(unittest.TestCase):
 
     def test_status_blames_the_credentials_not_the_database(self) -> None:
         with clean_env(DB_PATH=self.db, ADMIN_TOKEN=self.TOKEN):
-            status = self.client().get("/status").json()
+            with self.client() as client:
+                status = client.get("/status").json()
 
         blob = json.dumps(status, ensure_ascii=False)
         self.assertNotIn("数据库不可用", blob, "库明明可用，不许报数据库不可用")
@@ -597,7 +608,8 @@ class PanelWithoutCredentialsTests(unittest.TestCase):
 
     def test_a_successful_kill_is_audited(self) -> None:
         with clean_env(DB_PATH=self.db, ADMIN_TOKEN=self.TOKEN):
-            response = self.client().post(f"/admin/kill?k={self.TOKEN}")
+            with self.client() as client:
+                response = client.post(f"/admin/kill?k={self.TOKEN}")
         self.assertEqual(response.status_code, 200)
         self.assertIs(response.json()["ok"], True)
         self.assertIsNotNone(response.json()["audit_event_id"])
@@ -612,7 +624,8 @@ class PanelWithoutCredentialsTests(unittest.TestCase):
 
     def test_a_rejected_kill_is_audited(self) -> None:
         with clean_env(DB_PATH=self.db, ADMIN_TOKEN=self.TOKEN):
-            response = self.client().post("/admin/kill")     # 没带 token
+            with self.client() as client:
+                response = client.post("/admin/kill")     # 没带 token
         self.assertEqual(response.status_code, 401)
 
         audits = self.events(views.ADMIN_EVENT_KIND)
@@ -623,8 +636,9 @@ class PanelWithoutCredentialsTests(unittest.TestCase):
     def test_a_flatten_that_cannot_reach_the_exchange_is_still_audited(self) -> None:
         """默认 flatten 在缺凭据时失败 —— 但它必须留下审计与原因，而不是静默。"""
         with clean_env(DB_PATH=self.db, ADMIN_TOKEN=self.TOKEN):
-            response = self.client().post(
-                f"/admin/flatten?k={self.TOKEN}&confirm=yes")
+            with self.client() as client:
+                response = client.post(
+                    f"/admin/flatten?k={self.TOKEN}&confirm=yes")
         body = response.json()
         self.assertEqual(response.status_code, 200)
         self.assertIs(body["ok"], False)
@@ -656,6 +670,154 @@ class NoDatabaseTests(unittest.TestCase):
         body = response.json()
         self.assertIs(body["ok"], False)
         self.assertIs(body["degraded"], True)
+
+
+# --------------------------------------------------------------------------- 10. store 生命周期
+
+
+class StoreLifecycleTests(unittest.TestCase):
+    """`create_app()` 的 lifespan shutdown 必须把懒建的 store 关掉。
+
+    缺陷（PR #11 验收发现）：`Panel` 懒建的 `StateStore` 从来没有 close 路径。面板是
+    7×24 常驻进程，`StateStore` 内部是一个长连接 `sqlite3.Connection` —— 于是每建一个
+    app 就漏一个连接（fd 泄漏 + `-wal`/`-shm` 一直被持有）。实测：修之前全量测试有
+    5 条 `ResourceWarning: unclosed database`，修之后 0 条。
+
+    `TestClient` 必须用 `with` 才有 lifespan；裸 `TestClient(app)` 既不启动也不关闭 ——
+    测试里如果没有 shutdown，连接自然没人关。下面两条既测 lifespan，也顺便钉住这一点。
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.made: List[StateStore] = []
+
+    # ---------------------------------------------------------------- 夹具
+
+    def factory(self) -> StateStore:
+        store = StateStore(os.path.join(self.tmp, f"db{len(self.made)}.db"))
+        self.made.append(store)
+        # 兜底：用例失败时不把泄漏带进下一个用例。
+        self.addCleanup(lambda: store.close() if not store._closed else None)
+        return store
+
+    def assert_closed(self, store: Any) -> None:
+        with self.assertRaises(sqlite3.ProgrammingError):
+            store.conn.execute("select 1")
+
+    def assert_open(self, store: Any) -> None:
+        store.conn.execute("select 1")           # 不抛 = 还活着
+
+    # ---------------------------------------------------------------- 面板
+
+    def test_lifespan_shutdown_closes_the_panel_store(self) -> None:
+        app = main.create_app(store_factory=self.factory, admin_token="tok",
+                              limits=LIMITS, clock=lambda: T0)
+        with TestClient(app) as client:
+            self.assertEqual(client.get("/status").status_code, 200)
+            self.assertEqual(len(self.made), 1, "第一个请求应该懒建一个连接")
+            store = self.made[0]
+            self.assert_open(store)              # 服务期间是活的
+
+        self.assert_closed(store)                # shutdown 之后已关
+        self.assertTrue(app.state.panel.closed)
+
+    def test_the_panel_does_not_reopen_after_shutdown(self) -> None:
+        app = main.create_app(store_factory=self.factory, admin_token="tok", limits=LIMITS)
+        with TestClient(app) as client:
+            client.get("/status")
+        panel = app.state.panel
+
+        self.assertIsNone(panel.store(), "shutdown 之后不许再建连接")
+        self.assertEqual(len(self.made), 1)
+        self.assertEqual(panel.status()["level"], "alert")     # 降级，不是 500
+
+    def test_shutdown_is_clean_when_the_store_was_never_built(self) -> None:
+        app = main.create_app(store_factory=self.factory, limits=LIMITS)
+        with TestClient(app) as client:
+            self.assertEqual(client.get("/health").status_code, 200)
+        self.assertEqual(self.made, [], "/health 不许碰 DB，退出时也就没有连接要关")
+
+    def test_shutdown_survives_a_store_whose_close_raises(self) -> None:
+        class BadClose:
+            def close(self) -> None:
+                raise RuntimeError("cannot close")
+
+            def events(self, **kwargs: Any) -> List[Any]:
+                return []
+
+            def open_positions(self) -> List[Any]:
+                return []
+
+            def equity_curve(self, limit: int = 0) -> List[Any]:
+                return []
+
+            def dd_state(self) -> Dict[str, Any]:
+                return {}
+
+            def last_equity(self) -> None:
+                return None
+
+        app = main.create_app(store_factory=BadClose, limits=LIMITS, clock=lambda: T0)
+        with TestClient(app) as client:
+            self.assertEqual(client.get("/status").status_code, 200)
+        # 退出不抛就够：关闭路径把异常降级成 WARNING
+
+    # ---------------------------------------------------------------- 调度器
+
+    def test_scheduler_close_closes_its_own_store(self) -> None:
+        scheduler = main.TickScheduler(lambda: "ok", store_factory=self.factory)
+        store = scheduler.store()
+        self.assertIsNotNone(store)
+
+        scheduler.close()
+        self.assert_closed(store)
+        scheduler.close()                          # 幂等
+        self.assertIsNone(scheduler.store(), "close 之后不许再建连接")
+
+    def test_scheduler_does_not_close_an_injected_store(self) -> None:
+        store = self.factory()
+        scheduler = main.TickScheduler(lambda: "ok", store=store)
+        scheduler.close()
+        self.assert_open(store)                    # 借用者不关调用方的库
+
+    def test_stop_releases_the_scheduler_store(self) -> None:
+        scheduler = main.TickScheduler(lambda: "ok", store_factory=self.factory)
+        store = scheduler.store()
+
+        asyncio.run(scheduler.stop())
+
+        self.assert_closed(store)
+
+    def test_scheduler_close_calls_the_runner_close_hook(self) -> None:
+        calls: List[int] = []
+
+        def runner() -> str:
+            return "ok"
+
+        def closer() -> None:
+            calls.append(1)
+
+        runner.close = closer                      # type: ignore[attr-defined]
+        scheduler = main.TickScheduler(runner, store_factory=self.factory)
+        scheduler.close()
+        scheduler.close()
+        self.assertEqual(calls, [1], "runner 的 store 也得收尾，且只收一次")
+
+    def test_lifespan_closes_a_scheduler_built_from_the_factory(self) -> None:
+        app = main.create_app(store_factory=self.factory, limits=LIMITS,
+                              runner=lambda: "ok", enable_scheduler=True)
+        with TestClient(app) as client:
+            self.assertEqual(client.get("/health").status_code, 200)
+            scheduler = app.state.scheduler_box["scheduler"]
+            self.assertIsInstance(scheduler, main.TickScheduler)
+            sched_store = scheduler.store()
+            self.assertIsNotNone(sched_store)
+            self.assertEqual(len(self.made), 1)
+
+        self.assert_closed(sched_store)             # 调度器的连接也在 shutdown 里收尾
+        self.assertTrue(app.state.panel.closed)
 
 
 class ImportBoundaryTests(unittest.TestCase):

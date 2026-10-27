@@ -16,6 +16,9 @@
    自己那一块。
 8. **三标的动态复用 `strategy.explain_entry`**（数值与直接调用一致）。
 9. **kill 状态落库可读**（`set_kill` / `kill_state` 走 `events`）。
+10. **懒建的 store 有 `close()` 且幂等**：`Panel.close()` 真的关掉
+    `sqlite3.Connection`、关后不复活、不关别人的连接（否则 7×24 面板每重启一次就漏
+    一个 fd）。这是 `ResourceWarning: unclosed database` 的根因。
 
 期望值全部手算写死，每个断言旁给算式。
 """
@@ -23,11 +26,14 @@
 from __future__ import annotations
 
 import ast
+import gc
 import os
 import pathlib
 import re
+import sqlite3
 import tempfile
 import unittest
+import weakref
 from typing import Any, Dict, List, Optional, Sequence
 
 from app import strategy, views
@@ -567,6 +573,159 @@ class KillSwitchTests(PanelFixture):
         self.assertEqual(block["kill_reason"], "我今天不想交易")
         self.assertIn(block["level"], ("warn", "alert"))
         self.assertTrue(any("kill" in reason for reason in block["reasons"]))
+
+
+# --------------------------------------------------------------------------- 8. store 生命周期
+#
+# 缺陷（PR #11 验收发现）：`Panel` 懒建的 store **没有任何 close() 路径**。面板是
+# 7×24 常驻进程，`StateStore` 内部是一个长连接 `sqlite3.Connection` —— 建了不关就是
+# fd 泄漏 + SQLite 的 `-wal`/`-shm` 一直被持有。实测证据：修之前全量测试有 5 条
+# `ResourceWarning: unclosed database`，修之后 0 条。
+
+
+class PanelStoreLifecycleTests(unittest.TestCase):
+    """`Panel.close()`：真的关、幂等、关后不复活、不关别人的连接。"""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.made: List[StateStore] = []
+
+    # ---------------------------------------------------------------- 夹具
+
+    def factory(self) -> StateStore:
+        store = StateStore(os.path.join(self.tmp, f"db{len(self.made)}.db"))
+        self.made.append(store)
+        return store
+
+    def assert_closed(self, store: Any) -> None:
+        """`sqlite3.Connection` 已关的判据：再执行一句就抛 `ProgrammingError`。"""
+        with self.assertRaises(sqlite3.ProgrammingError):
+            store.conn.execute("select 1")
+
+    # ---------------------------------------------------------------- 正常路径
+
+    def test_close_closes_the_lazily_created_store(self) -> None:
+        panel = views.Panel(self.factory)
+        store = panel.store()
+        self.assertIsNotNone(store)
+        self.assertEqual(panel.store_error, "")
+
+        panel.close()
+
+        self.assertTrue(panel.closed)
+        self.assert_closed(store)
+        self.assertEqual(len(self.made), 1, "close 不许顺手再建一个连接")
+
+    def test_close_drops_the_only_strong_reference(self) -> None:
+        # 刻意不走 `self.factory`：它会把 store 留在 `self.made` 里，那也是一条强引用
+        # （这里要验的恰恰是「Panel 不持有」）。
+        store = StateStore(os.path.join(self.tmp, "ref.db"))
+        panel = views.Panel(lambda: store)
+        panel.store()
+        ref = weakref.ref(store)
+
+        del store
+        panel.close()
+        gc.collect()
+
+        self.assertIsNone(ref(), "close() 之后 Panel 不许再持有 store 的强引用")
+
+    def test_context_manager_closes_too(self) -> None:
+        with views.Panel(self.factory) as panel:
+            store = panel.store()
+        self.assertTrue(panel.closed)
+        self.assert_closed(store)
+
+    def test_close_runs_a_duck_typed_close_exactly_once(self) -> None:
+        calls: List[int] = []
+
+        class Duck:
+            def close(self) -> None:
+                calls.append(1)
+
+        panel = views.Panel(Duck)
+        panel.store()
+        panel.close()
+        panel.close()
+        panel.close()
+        self.assertEqual(calls, [1], "幂等：底层的 close() 只许被调一次")
+
+    # ---------------------------------------------------------------- 幂等 / 边界
+
+    def test_close_is_idempotent(self) -> None:
+        panel = views.Panel(self.factory)
+        panel.store()
+        panel.close()
+        panel.close()                       # 不许抛
+        panel.close()
+        self.assertTrue(panel.closed)
+
+    def test_close_without_a_store_is_a_noop(self) -> None:
+        panel = views.Panel(self.factory)
+        panel.close()                       # 从没请求过 store
+        self.assertTrue(panel.closed)
+        self.assertEqual(self.made, [], "从没建过的 store 不该被「关」出一个来")
+
+    def test_store_after_close_returns_none_and_builds_nothing(self) -> None:
+        panel = views.Panel(self.factory)
+        panel.store()
+        panel.close()
+
+        self.assertIsNone(panel.store(), "关闭之后不许复活一个没人会再关的连接")
+        self.assertEqual(len(self.made), 1)
+        self.assertIn("closed", panel.store_error)
+        self.assertIn("closed", repr(panel))
+
+    def test_blocks_degrade_instead_of_raising_after_close(self) -> None:
+        panel = views.Panel(self.factory, now=lambda: T0)
+        panel.store()
+        panel.close()
+
+        status = panel.status()
+        self.assertEqual(status["level"], "alert")
+        self.assertTrue(any("closed" in str(w) for w in status["warnings"]))
+        self.assertEqual(panel.positions()["open_count"], 0)      # 0 值，不是 500
+        self.assertTrue(panel.snapshot()["degraded"])
+
+    def test_a_store_without_close_is_fine(self) -> None:
+        panel = views.Panel(lambda: object())
+        panel.store()
+        panel.close()                       # 没有 close() 也不许抛
+        self.assertTrue(panel.closed)
+
+    def test_a_broken_close_does_not_raise(self) -> None:
+        class Boom:
+            def close(self) -> None:
+                raise RuntimeError("cannot close")
+
+        panel = views.Panel(Boom)
+        panel.store()
+        panel.close()                       # 关闭路径只记 WARNING
+        self.assertTrue(panel.closed)
+
+    def test_a_factory_that_raises_still_closes_cleanly(self) -> None:
+        def boom() -> Any:
+            raise RuntimeError("database is locked")
+
+        panel = views.Panel(boom)
+        self.assertIsNone(panel.store())
+        panel.close()
+        self.assertTrue(panel.closed)
+
+    # ---------------------------------------------------------------- 所有权
+
+    def test_owns_store_false_leaves_someone_elses_store_open(self) -> None:
+        store = self.factory()
+        self.addCleanup(store.close)
+        panel = views.Panel(lambda: store, owns_store=False)
+        panel.store()
+
+        panel.close()
+
+        store.conn.execute("select 1")      # 借用者的 close() 不许关别人的库
+        self.assertFalse(store._closed)
 
 
 if __name__ == "__main__":

@@ -428,6 +428,15 @@ class Panel:
     "detail": str}`），只用于状态条。面板自己不读 env、不读配置：它连配置层的 import
     都不该有（见模块 docstring 的 import 边界）。`None` = 没人告诉我 ⇒ 状态条显示
     「凭据 未知」，不猜、不报警。
+
+    **`close()` 不是可选的礼貌**：`store_factory()` 建出来的 `StateStore` 内部是一个
+    长连接 `sqlite3.Connection`。面板服务是 7×24 常驻进程，一次 `create_app()` 建一个
+    Panel、第一个请求建一个连接 —— 没有 `close()` 就等于每重启/每建一个 app 漏一个
+    文件描述符，并让 SQLite 的 `-wal`/`-shm` 一直被持有。所以 Panel **拥有**它懒建的
+    store：:meth:`close` 关掉它（幂等），`app.main` 的 lifespan 在应用关闭时调它。
+
+    `owns_store=False` 是给「工厂返回的是别人（例如测试夹具 / 共享进程）的 store」用的：
+    那时 Panel 只丢弃引用，不关别人的连接。
     """
 
     def __init__(self, store_factory: Callable[[], Any], *,
@@ -440,12 +449,15 @@ class Panel:
                  max_events: int = MAX_EVENTS,
                  max_curve_points: int = MAX_CURVE_POINTS,
                  stale_after_s: float = STALE_AFTER_S,
-                 heartbeat_max_age_s: float = HEARTBEAT_MAX_AGE_S) -> None:
+                 heartbeat_max_age_s: float = HEARTBEAT_MAX_AGE_S,
+                 owns_store: bool = True) -> None:
         if store_factory is None:
             raise ValueError("Panel requires a store factory")
         self._factory = store_factory
         self._store: Optional[Any] = None
         self._store_error: str = ""
+        self._closed: bool = False
+        self._owns_store: bool = bool(owns_store)
         self._credentials_probe = credentials
         self.sources = sources if sources is not None else Sources()
         self.limits = limits if limits is not None else RiskLimits()
@@ -459,8 +471,9 @@ class Panel:
         self.heartbeat_max_age_s = float(heartbeat_max_age_s)
 
     def __repr__(self) -> str:
-        return (f"Panel(symbols={self.symbols}, mode={self.mode!r}, "
-                f"store={'ok' if self._store is not None else 'pending'})")
+        state = ("closed" if self._closed
+                 else ("ok" if self._store is not None else "pending"))
+        return f"Panel(symbols={self.symbols}, mode={self.mode!r}, store={state})"
 
     # ---------------------------------------------------------------- 基础设施
 
@@ -468,10 +481,55 @@ class Panel:
         value = _finite(self.clock())
         return value if value is not None else time.time()
 
+    @property
+    def closed(self) -> bool:
+        """已调用过 :meth:`close`（**之后不会再建新连接**）。"""
+        return self._closed
+
+    def close(self) -> None:
+        """关掉懒建的 store。**幂等**；store 未建 / 无 `close()` / 关失败都不抛。
+
+        为什么必须存在：`StateStore` 内部是长连接 `sqlite3.Connection`。面板进程 7×24
+        常驻，`create_app()` 每次建一个 Panel、第一个请求建一个连接 —— 没有这条路径
+        连接永不释放（fd 泄漏 + SQLite 的 `-wal`/`-shm` 一直被持有），进程被反复创建
+        时（测试、重启、多 worker）会累积。实测证据：修之前全量测试有 5 条
+        `ResourceWarning: unclosed database`，修之后 0 条。
+
+        关失败只记 WARNING，不抛：这发生在**关闭路径**上，抛出去只会把一次干净的退出
+        变成崩溃，而泄漏本身已经被"至少试过"了。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        store, self._store = self._store, None
+        if store is None or not self._owns_store:
+            return
+        closer = getattr(store, "close", None)
+        if not callable(closer):
+            return
+        try:
+            closer()
+        except Exception as exc:                              # noqa: BLE001 - 关闭路径
+            logger.warning("could not close the panel store: %s", exc)
+
+    def __enter__(self) -> "Panel":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
     def store(self) -> Optional[Any]:
-        """拿 store（首次成功即缓存；失败不抛，返回 `None` 让区块降级）。"""
+        """拿 store（首次成功即缓存；失败不抛，返回 `None` 让区块降级）。
+
+        **关闭之后一律返回 `None`**，不再建新连接：shutdown 期间或之后的一次请求
+        不该复活一个没人会再关掉的 `sqlite3.Connection` —— 那正是这次修掉的泄漏。
+        降级载荷里会带 `panel is closed` 的理由，而不是一个看起来正常的空面板。
+        """
         if self._store is not None:
             return self._store
+        if self._closed:
+            self._store_error = self._store_error or "panel is closed"
+            return None
         try:
             self._store = self._factory()
             self._store_error = ""

@@ -348,6 +348,9 @@ class TickScheduler:
         self.runner = runner
         self._store = store
         self._store_factory = store_factory
+        #: 只关**自己建的** store：`store=` 注入的是别人的连接（测试夹具 / 共享进程），
+        #: 关闭它会把别人的库抽走。`store_factory=` 建出来的才是本对象的。
+        self._store_owned = False
         self.minutes = tuple(int(m) % 60 for m in minutes)
         self.clock = clock
         self._sleep = sleep or asyncio.sleep
@@ -359,6 +362,7 @@ class TickScheduler:
         self.last_status: str = "never"
         self._task: Optional[asyncio.Task] = None
         self._stopping = False
+        self._closed = False
 
     def __repr__(self) -> str:
         return (f"TickScheduler(runs={self.runs}, failures={self.failures}, "
@@ -369,14 +373,46 @@ class TickScheduler:
     def store(self) -> Optional[Any]:
         if self._store is not None:
             return self._store
-        if self._store_factory is None:
+        if self._store_factory is None or self._closed:
             return None
         try:
             self._store = self._store_factory()
+            self._store_owned = True
         except Exception as exc:                              # noqa: BLE001
             logger.warning("scheduler store unavailable: %s", exc)
             return None
         return self._store
+
+    def close(self) -> None:
+        """关掉调度器**自己建的** store（+ runner 自己的 store）。**幂等**。
+
+        为什么需要：`create_app(enable_scheduler=True)` 会让调度器按同一个
+        `store_factory` 建**自己**的连接（与面板是两条连接，落在同一个 SQLite 文件上）。
+        面板那边由 `Panel.close()` 收尾，这里必须对称，否则只要开了调度器，每次进程
+        退出就漏一个 `sqlite3.Connection`。
+
+        `store=` 注入进来的连接**不关**（那是调用方的）。同理 `default_tick_runner`
+        在 tick 里自建的第三个 store 挂在自己的 `close` 上，这里一并调用。
+        关失败只记 WARNING —— 关闭路径不该抛。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        store, self._store = self._store, None
+        owned, self._store_owned = self._store_owned, False
+        if store is not None and owned:
+            closer = getattr(store, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception as exc:                      # noqa: BLE001 - 关闭路径
+                    logger.warning("could not close the scheduler store: %s", exc)
+        runner_closer = getattr(self.runner, "close", None)
+        if callable(runner_closer):
+            try:
+                runner_closer()
+            except Exception as exc:                          # noqa: BLE001 - 关闭路径
+                logger.warning("could not close the tick runner: %s", exc)
 
     # ---------------------------------------------------------------- 一轮
 
@@ -452,10 +488,17 @@ class TickScheduler:
         if self._task is not None and not self._task.done():
             return
         self._stopping = False
+        self._closed = False                  # 重新起来：允许再建一次连接（stop 里关过）
         self._task = asyncio.get_event_loop().create_task(self.run_forever())
         self.started = True
 
     async def stop(self) -> None:
+        """停下循环，**并释放调度器自己的 store**（`close()` 幂等，可重复调）。
+
+        关闭顺序有讲究：先 cancel + await 任务，再关库 —— 反过来会让正在跑的一轮 tick
+        往一个已经关掉的连接里写（`ProgrammingError: Cannot operate on a closed
+        database`），而那一轮的 `finally` 还要写心跳。
+        """
         self._stopping = True
         task = self._task
         self._task = None
@@ -466,6 +509,7 @@ class TickScheduler:
             except (asyncio.CancelledError, Exception):       # noqa: BLE001 - 关闭路径
                 pass
         self.started = False
+        self.close()
 
 
 # ================================================================== 事件记录
@@ -732,9 +776,24 @@ def create_app(*, panel: Optional[views.Panel] = None,
         try:
             yield
         finally:
+            # 关闭顺序：先停调度器（它会关掉自己建的连接），再关面板的懒建连接。
+            # 反过来关会让正在跑的一轮 tick 往已关闭的库写。
             current = sched_box.get("scheduler")
             if isinstance(current, TickScheduler):
-                await current.stop()
+                try:
+                    await current.stop()          # stop() 内部调 close()（幂等）
+                except Exception:                 # noqa: BLE001 - 关闭路径不许抛
+                    logger.exception("could not stop the tick scheduler")
+                current.close()
+            elif current is not None:
+                closer = getattr(current, "close", None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except Exception:             # noqa: BLE001 - 关闭路径不许抛
+                        logger.warning("could not close the injected scheduler", exc_info=True)
+            # 面板最后关：所有只读端点都读它，它的 store 是懒建的、没人替它收尾。
+            panel.close()
 
     # No docs/openapi routes: the panel is the only intended surface. Fewer default
     # routes = less to accidentally expose.
@@ -1030,6 +1089,23 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
                          ts=time.time(),
                          error=str(getattr(account, "orders_error", "") or ""))
         return report
+
+    def _close() -> None:
+        """关掉 tick 里自建的 store（**第三个**连接）。
+
+        runner 是它唯一的持有者：`TickScheduler.close()` 发现 runner 上有 `close` 就调它。
+        不关的话，只要调度器跑过至少一轮，进程退出就再多漏一个 `sqlite3.Connection`。
+        """
+        store, box["store"] = box["store"], None
+        closer = getattr(store, "close", None)
+        if not callable(closer):
+            return
+        try:
+            closer()
+        except Exception as exc:                              # noqa: BLE001 - 关闭路径
+            logger.warning("could not close the tick runner store: %s", exc)
+
+    _tick.close = _close                                     # type: ignore[attr-defined]
 
     sources_getter()                                          # 保持接口对称（见 docstring）
     return _tick
