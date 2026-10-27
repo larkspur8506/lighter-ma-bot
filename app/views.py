@@ -423,6 +423,11 @@ class Panel:
     `store_factory` 而不是 `store`：DB 打不开必须**每次请求都重试**（数据库可能只是
     正在迁移/短暂锁住），而不是启动时失败一次就永远 500 —— 那是 T1 的 `/health` 之外
     唯一还被允许"永远可用"的东西。首次成功后缓存连接。
+
+    `credentials` 是**注入的探针**（`() -> {"configured": bool, "missing": [...],
+    "detail": str}`），只用于状态条。面板自己不读 env、不读配置：它连配置层的 import
+    都不该有（见模块 docstring 的 import 边界）。`None` = 没人告诉我 ⇒ 状态条显示
+    「凭据 未知」，不猜、不报警。
     """
 
     def __init__(self, store_factory: Callable[[], Any], *,
@@ -431,6 +436,7 @@ class Panel:
                  mode: str = "live",
                  now: Callable[[], float] = time.time,
                  symbols: Sequence[str] = DEFAULT_SYMBOLS,
+                 credentials: Optional[Callable[[], Any]] = None,
                  max_events: int = MAX_EVENTS,
                  max_curve_points: int = MAX_CURVE_POINTS,
                  stale_after_s: float = STALE_AFTER_S,
@@ -440,6 +446,7 @@ class Panel:
         self._factory = store_factory
         self._store: Optional[Any] = None
         self._store_error: str = ""
+        self._credentials_probe = credentials
         self.sources = sources if sources is not None else Sources()
         self.limits = limits if limits is not None else RiskLimits()
         self.mode = str(mode or "live").lower()
@@ -479,6 +486,29 @@ class Panel:
     def store_error(self) -> str:
         return self._store_error
 
+    def _credential_status(self) -> Dict[str, Any]:
+        """交易凭据状态（来自注入的探针；**绝不**自己读 env / 配置）。
+
+        `known=False` = 没人告诉我（例如测试里直接注入的 Panel）⇒ 不猜、不报警。
+        这条信息存在的唯一理由是让状态条能把「没有数据库」和「没有私钥」分开说 ——
+        前者是面板瞎了，后者只是不能下单。
+        """
+        unknown: Dict[str, Any] = {"known": False, "configured": None, "missing": [],
+                                   "detail": ""}
+        if self._credentials_probe is None:
+            return unknown
+        try:
+            payload = dict(self._credentials_probe() or {})
+        except Exception as exc:                              # noqa: BLE001 - 降级不崩
+            logger.warning("credential probe failed: %s", exc)
+            return dict(unknown, detail=f"{type(exc).__name__}: {exc}")
+        missing = [str(key) for key in payload.get("missing") or ()]
+        payload["known"] = True
+        payload["configured"] = bool(payload.get("configured", not missing))
+        payload["missing"] = missing
+        payload.setdefault("detail", "")
+        return payload
+
     def _guard(self, name: str, builder: Callable[[], Dict[str, Any]],
                fallback: Callable[[str], Dict[str, Any]]) -> Dict[str, Any]:
         """区块级隔离：一个区块的任何异常都只降级它自己。"""
@@ -500,10 +530,14 @@ class Panel:
     def _status(self) -> Dict[str, Any]:
         now = self._now()
         warnings: List[str] = []
+        credentials = self._credential_status()
         store = self.store()
         if store is None:
-            return _status_fallback(f"数据库不可用: {self.store_error or 'unknown'}",
-                                    as_of=now)
+            # 只有真的拿不到 DB 才说「数据库不可用」。
+            payload = _status_fallback(f"数据库不可用: {self.store_error or 'unknown'}",
+                                       as_of=now)
+            payload["credentials"] = credentials
+            return payload
 
         equity = None
         equity_source = "unavailable"
@@ -549,6 +583,11 @@ class Panel:
         # 没有行情 provider 时退回「最后一个权益点」的年龄（那是 tick 活着的证据）。
         data_source = self._data_source(store, now, warnings)
 
+        # 缺凭据 ≠ 缺数据库：句子必须分开写（缺凭据不影响读库，只影响下单/调度器）。
+        if credentials["known"] and credentials["configured"] is False:
+            warnings.append(str(credentials.get("detail") or
+                                "交易凭据未配置（只读面板不受影响；下单 / 调度器不可用）"))
+
         # 等级聚合：任何一条「需要人立刻看」的理由 → alert；其余提示 → warn。
         # 顺序固定（alert 优先于 warn），避免「后面一条 warn 把前面的 alert 降级」这种
         # 只有特定数据组合才出现的静默降级。
@@ -593,6 +632,7 @@ class Panel:
             "last_tick_age_s": last_tick_age,
             "last_tick_text": _dur(last_tick_age) if last_tick_age is not None else "从未 tick",
             "data_source": data_source,
+            "credentials": credentials,
             "dd": dd_payload,
             "warnings": warnings,
             "degraded": bool(warnings),
@@ -1020,6 +1060,7 @@ def _status_fallback(warning: str, *, as_of: Optional[float] = None) -> Dict[str
         "last_tick_ts": None, "last_tick_age_s": None, "last_tick_text": "未知",
         "data_source": {"ok": False, "name": "unavailable", "age_s": None,
                         "last_ts": None, "detail": warning},
+        "credentials": {"known": False, "configured": None, "missing": [], "detail": ""},
         "dd": {"index": None, "peak": None, "drawdown": None,
                "action": dd_module.DD_ACTION_KILL, "warn": None, "kill": None,
                "source": "unavailable", "available": False, "degraded": True},
@@ -1215,6 +1256,11 @@ def _warn_html(warnings: Sequence[Any]) -> str:
 def _status_html(block: Mapping[str, Any], mode: str) -> str:
     level = str(block.get("level") or "warn")
     dd = block.get("dd") or {}
+    credentials = block.get("credentials") or {}
+    if not credentials.get("known"):
+        credentials_text = "未知"
+    else:
+        credentials_text = "已配置" if credentials.get("configured") else "未配置"
     parts = [
         f'<section id="block-status" class="bar {html.escape(level)}">',
         f'<span class="dot {html.escape(level)}"></span>',
@@ -1227,6 +1273,7 @@ def _status_html(block: Mapping[str, Any], mode: str) -> str:
         f'<span class="kv">回撤 <b>{_pct(dd.get("drawdown"))}</b>'
         f' <span class="dim">({html.escape(str(dd.get("action") or "?"))})</span></span>',
         f'<span class="kv">模式 <b>{html.escape(mode)}</b></span>',
+        f'<span class="kv">凭据 <b>{credentials_text}</b></span>',
         f'<span class="kv">上次 tick <b>{html.escape(str(block.get("last_tick_text")))}</b></span>',
         f'<span class="kv">数据源 <b>{"ok" if (block.get("data_source") or {}).get("ok") else "异常"}</b>'
         f' <span class="dim">{html.escape(str((block.get("data_source") or {}).get("name")))}</span></span>',

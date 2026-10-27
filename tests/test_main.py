@@ -14,14 +14,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
+from app import config as app_config
 from app import main, views, watchdog
 from app.risk import RiskLimits
 from app.store import StateStore
@@ -431,6 +437,247 @@ class MarketBarSourceTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             source("BTC")
         self.assertEqual(source("BTC"), ["ok"])              # 失败不写缓存，下一次能好
+
+
+# --------------------------------------------------------------------------- 9. 运行依赖
+#
+# 缺陷（PR #11 验收发现）：`default_store_factory()` 曾走 `Config.from_env()`，
+# 于是「没配 Lighter 凭据」= 「没有数据库」：6 个区块全降级、admin 操作不落审计、
+# 状态条还报「数据库不可用」。下面这些用例钉住修好之后的分工：
+# **建库只看 DB_URL / DB_PATH；凭据只影响下单**。
+
+
+@contextlib.contextmanager
+def clean_env(**overrides: Any) -> Any:
+    """完全受控的环境：先清掉所有凭据 / DB 变量，再按需覆盖（退出时还原）。"""
+    base = {key: value for key, value in os.environ.items()
+            if not key.startswith("LIGHTER_")}
+    for key in ("ADMIN_TOKEN", "DB_URL", "DB_PATH"):
+        base.pop(key, None)
+    base.update({key: str(value) for key, value in overrides.items()})
+    with mock.patch.dict(os.environ, base, clear=True):
+        yield
+
+
+class StorePathTests(unittest.TestCase):
+    """store 的建立只依赖 DB 位置 —— 一个凭据都不需要。"""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+
+    def test_only_db_path_is_enough(self) -> None:
+        db = os.path.join(self.tmp, "nested", "state.db")      # 目录还不存在
+        with clean_env(DB_PATH=db):
+            store = main.default_store_factory()
+            self.addCleanup(store.close)
+            self.assertEqual(os.path.abspath(store.path), os.path.abspath(db))
+            self.assertTrue(os.path.exists(db))
+            # 反证：同一份 env 下 `Config.from_env()` 一定会抛（缺凭据）——
+            # 也就是说「旧实现建不出库」的原因是凭据，而不是数据库。
+            with self.assertRaises(app_config.ConfigError):
+                app_config.Config.from_env()
+
+    def test_db_url_wins_over_db_path(self) -> None:
+        url_db = os.path.join(self.tmp, "from_url.db")
+        path_db = os.path.join(self.tmp, "from_path.db")
+        with clean_env(DB_URL=f"sqlite:///{url_db}", DB_PATH=path_db):
+            store = main.default_store_factory()
+            self.addCleanup(store.close)
+            self.assertEqual(os.path.abspath(store.path), os.path.abspath(url_db))
+        self.assertFalse(os.path.exists(path_db), "DB_URL 优先时不许同时建 DB_PATH")
+
+    def test_non_sqlite_db_url_fails_closed(self) -> None:
+        path_db = os.path.join(self.tmp, "state.db")
+        with clean_env(DB_URL="postgresql://bot@db:5432/state", DB_PATH=path_db):
+            with self.assertRaises(main.StorePathError) as ctx:
+                main.default_store_factory()
+        self.assertIn("sqlite", str(ctx.exception))
+        self.assertFalse(os.path.exists(path_db),
+                         "非 sqlite 的 DB_URL 不许悄悄退回 DB_PATH")
+
+    def test_a_missing_db_location_names_the_env_vars(self) -> None:
+        with clean_env():
+            with self.assertRaises(main.StorePathError) as ctx:
+                main.default_store_factory()
+        message = str(ctx.exception)
+        self.assertIn("DB_URL", message)
+        self.assertIn("DB_PATH", message)
+
+    def test_empty_sqlite_url_is_rejected(self) -> None:
+        with clean_env(DB_URL="sqlite:///"):
+            with self.assertRaises(main.StorePathError):
+                main.default_store_factory()
+
+    def test_credential_key_list_mirrors_app_config(self) -> None:
+        self.assertEqual(set(main.CREDENTIAL_ENV_KEYS), set(app_config.REQUIRED_KEYS))
+        self.assertEqual(main.ADMIN_TOKEN_ENV, app_config.ADMIN_TOKEN_KEY)
+
+
+class PanelWithoutCredentialsTests(unittest.TestCase):
+    """只配 DB_PATH（+ admin token）、一个 Lighter 凭据都没有。
+
+    验收项：store 建成 → admin 操作落 events（含失败/被拒）→ 只读端点吃真 DB 数据
+    → 状态条**不**把「缺凭据」说成「数据库不可用」。
+    """
+
+    TOKEN = "testtoken123"
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.db = os.path.join(self.tmp, "state.db")
+        self.seed()
+
+    # ---------------------------------------------------------------- 夹具
+
+    def seed(self) -> None:
+        store = StateStore(self.db)
+        try:
+            store.record_equity(1000.0, ts=T0, twr_index=1.0, cum_flow=0.0, source="dd")
+            store.record_equity(1030.0, ts=T0 + BAR_S, twr_index=1.03, cum_flow=0.0,
+                                source="dd")
+            store.save_dd_state(twr_index=1.03, twr_peak=1.03, anchor_ts=T0,
+                                anchor_equity=1000.0, anchor_cum_flow=0.0, ts=T0 + BAR_S)
+            store.record_entry("BTC", 1, qty_int=100_000, size_decimals=5,
+                               entry_price_int=650_000, price_decimals=2,
+                               stop_price_int=630_000, bar_ms=int(T0 * 1000),
+                               market_id=1, stop_order_id="stop-1")
+            store.log_event("skip", "BTC skip: 未过密集门槛", symbol="BTC", ts=T0 + BAR_S)
+            watchdog.record_heartbeat(store, ts=T0 + BAR_S, source="scheduler")
+        finally:
+            store.close()
+
+    def events(self, kind: str) -> List[Dict[str, Any]]:
+        store = StateStore(self.db)
+        try:
+            rows = store.events(kind=kind, limit=50)
+        finally:
+            store.close()
+        return [{"message": row["message"], "data": json.loads(row["data"] or "{}")}
+                for row in rows]
+
+    def client(self, **kwargs: Any) -> TestClient:
+        """**不注入 panel**：走 `default_store_factory` + 默认 flatten 的真实装配。"""
+        app = main.create_app(limits=LIMITS, clock=lambda: T0 + BAR_S + 60, **kwargs)
+        return TestClient(app)
+
+    # ---------------------------------------------------------------- 只读
+
+    def test_read_endpoints_serve_real_rows_from_the_database(self) -> None:
+        with clean_env(DB_PATH=self.db, ADMIN_TOKEN=self.TOKEN):
+            client = self.client()
+            status = client.get("/status").json()
+            positions = client.get("/positions").json()
+            events = client.get("/events").json()
+
+        self.assertEqual(status["equity"], 1030.0)          # 真 DB 里的权益，不是 0
+        self.assertEqual(status["open_count"], 1)
+        self.assertEqual(status["last_tick_ts"], T0 + BAR_S)  # 真心跳
+        self.assertEqual(positions["open_count"], 1)
+        self.assertEqual(events["degraded"], False)
+        self.assertTrue(any("未过密集门槛" in str(row.get("message"))
+                            for row in events["events"]))
+
+    def test_status_blames_the_credentials_not_the_database(self) -> None:
+        with clean_env(DB_PATH=self.db, ADMIN_TOKEN=self.TOKEN):
+            status = self.client().get("/status").json()
+
+        blob = json.dumps(status, ensure_ascii=False)
+        self.assertNotIn("数据库不可用", blob, "库明明可用，不许报数据库不可用")
+        self.assertEqual(status["credentials"]["known"], True)
+        self.assertIs(status["credentials"]["configured"], False)
+        self.assertIn("LIGHTER_ACCOUNT_INDEX", status["credentials"]["missing"])
+        self.assertTrue(any("凭据" in warning for warning in status["warnings"]))
+        self.assertNotEqual(status["level"], "alert", "缺凭据不是「面板瞎了」级别的告警")
+
+    # ---------------------------------------------------------------- 审计
+
+    def test_a_successful_kill_is_audited(self) -> None:
+        with clean_env(DB_PATH=self.db, ADMIN_TOKEN=self.TOKEN):
+            response = self.client().post(f"/admin/kill?k={self.TOKEN}")
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.json()["ok"], True)
+        self.assertIsNotNone(response.json()["audit_event_id"])
+
+        audits = self.events(views.ADMIN_EVENT_KIND)
+        self.assertTrue(audits, "admin 写操作必须落 events（审计的全部意义）")
+        kill_rows = [row for row in audits if row["data"].get("endpoint") == "kill"]
+        self.assertEqual(len(kill_rows), 1)
+        self.assertEqual(kill_rows[0]["data"]["result"], "ok")
+        # token 绝不进库
+        self.assertNotIn(self.TOKEN, json.dumps(audits, ensure_ascii=False))
+
+    def test_a_rejected_kill_is_audited(self) -> None:
+        with clean_env(DB_PATH=self.db, ADMIN_TOKEN=self.TOKEN):
+            response = self.client().post("/admin/kill")     # 没带 token
+        self.assertEqual(response.status_code, 401)
+
+        audits = self.events(views.ADMIN_EVENT_KIND)
+        rejected = [row for row in audits if row["data"].get("result") == "rejected"]
+        self.assertTrue(rejected, "被拒绝的操作同样要留痕（谁试过什么）")
+        self.assertEqual(rejected[0]["data"]["endpoint"], "kill")
+
+    def test_a_flatten_that_cannot_reach_the_exchange_is_still_audited(self) -> None:
+        """默认 flatten 在缺凭据时失败 —— 但它必须留下审计与原因，而不是静默。"""
+        with clean_env(DB_PATH=self.db, ADMIN_TOKEN=self.TOKEN):
+            response = self.client().post(
+                f"/admin/flatten?k={self.TOKEN}&confirm=yes")
+        body = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(body["ok"], False)
+        self.assertIn("凭据", body["error"])
+
+        audits = self.events(views.ADMIN_EVENT_KIND)
+        failed = [row for row in audits
+                  if row["data"].get("endpoint") == "flatten"
+                  and row["data"].get("result") == "failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertIn("凭据", failed[0]["data"].get("error", ""))
+
+
+class NoDatabaseTests(unittest.TestCase):
+    """真的没有 DB 位置时才说「数据库不可用」，并且说清要设哪个变量。"""
+
+    def test_status_says_database_unavailable_only_without_a_db_path(self) -> None:
+        with clean_env(ADMIN_TOKEN="tok"):
+            status = TestClient(main.create_app(limits=LIMITS)).get("/status").json()
+        self.assertEqual(status["level"], "alert")
+        self.assertIn("数据库不可用", " ".join(status["warnings"]))
+        self.assertIn("DB_PATH", " ".join(status["warnings"]))
+
+    def test_write_operations_degrade_without_a_database(self) -> None:
+        with clean_env(ADMIN_TOKEN="tok"):
+            response = TestClient(main.create_app(limits=LIMITS)).post(
+                "/admin/kill?k=tok")
+        self.assertEqual(response.status_code, 200)           # 降级，不是 500
+        body = response.json()
+        self.assertIs(body["ok"], False)
+        self.assertIs(body["degraded"], True)
+
+
+class ImportBoundaryTests(unittest.TestCase):
+    """只读面板的 import 图里**没有**私钥模块（改动后也不许被破坏）。
+
+    用子进程而不是 `sys.modules`：同一个 test run 里别的用例会 import
+    `app.exchange`，进程内断言会被污染（假阴性/假阳性都可能）。
+    """
+
+    def test_importing_main_does_not_load_exchange_or_the_sdk(self) -> None:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        code = (
+            "import sys, app.views, app.main\n"
+            "print(sorted(m for m in ('app.exchange', 'app.executor', 'lighter')\n"
+            "             if m in sys.modules))\n")
+        env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": root,
+               "PYTHONDONTWRITEBYTECODE": "1"}
+        result = subprocess.run([sys.executable, "-c", code], cwd=root, env=env,
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "[]",
+                         f"面板的 import 图里出现了私钥路径: {result.stdout}")
 
 
 if __name__ == "__main__":

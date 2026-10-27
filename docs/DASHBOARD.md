@@ -32,7 +32,7 @@
 
 ## 1. 六个区块
 
-顺序 = 页面顺序，也是 `views.BLOCKS` 的顺序。每块都独立降级（见 §4）。
+顺序 = 页面顺序，也是 `views.BLOCKS` 的顺序。每块都独立降级（见 §5）。
 
 ### ① 状态条 `id="block-status"`
 
@@ -44,7 +44,7 @@
 | `reasons` | 变红/变黄的原因（人能读的一句话，逐条） |
 | `equity` / `equity_source` | 权益与来源（`provider` = 交易所读数，`store` = 库里最后一个点，`unavailable`） |
 | `open_count` / `max_positions` | 持仓数 / 上限（`RiskLimits.max_positions`） |
-| `kill` / `kill_reason` / `kill_known` | 人工停手开关（见 §5） |
+| `kill` / `kill_reason` / `kill_known` | 人工停手开关（见 §6） |
 | `dd` | 回撤读数：`index` / `peak` / `drawdown` / `action` / `warn` / `kill` / `source` |
 | `last_tick_ts` / `last_tick_text` | 最近一次 tick 心跳（T9 watchdog 读同一张表） |
 | `data_source` | `{ok, name, age_s, last_ts, detail}`：K 线源新鲜度（无行情源时退回权益点年龄） |
@@ -122,7 +122,57 @@ symbol ｜ 当前价 ｜ 6MA 带宽% ｜ 密集门槛% ｜ 距门槛 ｜ 连续�
 
 ---
 
-## 2. 端点表
+## 2. 面板的运行依赖：只读面板 vs 下单
+
+**建库与配凭据是两件事。** 这条曾经被实现混在一起（`default_store_factory()` 走
+`Config.from_env()`），后果是：**没配 Lighter 凭据 ⇒ 没有数据库** —— 6 个区块全部降级、
+admin 写操作一条审计都落不了库、状态条还报「数据库不可用」。现在这两件事分开：
+
+| 需要什么 | 谁能用 | 缺了会怎样 |
+|---|---|---|
+| **DB 位置**：`DB_URL=sqlite:///<path>` 或 `DB_PATH=<path>` | 只读面板（6 区块）+ admin 审计（`events`） | 没有 DB 位置 ⇒ `StorePathError`，状态条 `alert` +「数据库不可用: 没有数据库位置：必须设置 DB_URL… / DB_PATH…」 |
+| **Lighter 凭据**：`LIGHTER_ACCOUNT_INDEX` / `LIGHTER_API_KEY_INDEX` / `LIGHTER_API_PRIVATE_KEY` / `LIGHTER_L1_ADDRESS` | 下单、调度器 tick、`POST /admin/flatten` 的默认实现、交易所私有读数 | 只读面板与审计**照常**；状态条 `warn` +「交易凭据未配置（只读面板不受影响；下单 / 调度器不可用）：缺 …」，HTML 状态条显示「凭据 未配置」 |
+| `ADMIN_TOKEN` | 三个写操作的鉴权 | 所有写操作 **401**（fail-closed） |
+
+解析规则（`app.main.resolve_store_path()`）：
+
+1. `DB_URL` 优先，且**必须**是 `sqlite:///<path>`；
+2. 否则用 `DB_PATH`；
+3. 两者都没有 ⇒ 抛 `StorePathError`，消息里点名要设哪个变量。**刻意没有**
+   `./data/state.db` 之类的默认值：容器里 cwd 不对时库会落在没人备份的角落，而面板看起来
+   一切正常。
+4. `DB_URL` 指向非 sqlite（`postgresql://…`）⇒ 同样抛错，**不会**悄悄退回 `DB_PATH` ——
+   否则「以为数据在 postgres」的部署会把审计写进一个本地文件，等要查「谁在什么时候清过
+   仓」才发现库是空的。
+
+缺凭据时各端点的表现（都**不是** 500）：
+
+| 端点 | 缺凭据时的表现 |
+|---|---|
+| `GET /` `/status` `/positions` `/stops` `/pnl` `/symbols` `/events` | 200；DB 里的数据照常显示；交易所侧私有读数（权益/挂单）显示「未知」并带 WARNING |
+| `POST /admin/kill` | 200 `ok=true` —— 停开新仓是**本地状态**，不需要交易所凭据；审计照写 |
+| `POST /admin/dd/reset` | 200 `ok=true`（同上，DB 内的回撤峰值） |
+| `POST /admin/flatten` | 200 `ok=false` + `error="凭据不可用，无法清仓: …"`；**审计照写**（`result="failed"` + 原因）—— 「谁试过清仓」是审计存在的意义 |
+| 调度器 | 不启动，记一条 `admin_action endpoint=scheduler result=disabled` 审计；面板照常提供 |
+
+验证方式（**不需要任何 Lighter 凭据**）:
+
+```bash
+PANEL_SCHEDULER=0 ADMIN_TOKEN=testtoken123 DB_PATH=/tmp/x/state.db \
+  python -m uvicorn app.main:app --host 127.0.0.1 --port 8199
+curl -X POST "http://127.0.0.1:8199/admin/kill?k=testtoken123"   # 200 ok=true
+sqlite3 /tmp/x/state.db "select kind, message from events order by id desc limit 3"
+# admin_action | admin /admin/kill -> ok
+# admin_kill   | kill switch ON by admin     ← token 绝不入库
+```
+
+`import app.views` / `import app.main` 的 import 图里**没有** `app.exchange` / `lighter`
+（`tests/test_main.py::ImportBoundaryTests` 用子进程钉住）—— 所以「只读面板不需要凭据」
+不是靠约定，而是代码里没有那条路径。
+
+---
+
+## 3. 端点表
 
 ### 只读（**永远 200**，永不 500）
 
@@ -166,7 +216,7 @@ HTML 是**自包含**的：样式内联在 `<style>`、曲线是内联 `<svg>`�
 
 ---
 
-## 3. 鉴权：`?k=<token>` 的权衡
+## 4. 鉴权：`?k=<token>` 的权衡
 
 PLAN 规定 query 参数。**照做，但必须写明代价**：
 
@@ -189,7 +239,7 @@ PLAN 规定 query 参数。**照做，但必须写明代价**：
 
 ---
 
-## 4. 降级策略（验收项：绝不 500）
+## 5. 降级策略（验收项：绝不 500）
 
 `Panel._guard()` 把**每个区块**单独包起来。任何异常 → 该块变成「0 值 + WARNING +
 `degraded: true`」，其余区块照常出，页面照常渲染。
@@ -211,7 +261,7 @@ PLAN 规定 query 参数。**照做，但必须写明代价**：
 
 ---
 
-## 5. kill 的语义（与 `app/dd.py` 一致）
+## 6. kill 的语义（与 `app/dd.py` 一致）
 
 * **kill 只挡开新仓**：唯一消费点是 `app.risk._gate_kill()` → `RiskLimits.kill`；
   `check_entry()` 会返回 `GATE_KILL`。
@@ -235,7 +285,7 @@ PLAN 规定 query 参数。**照做，但必须写明代价**：
 
 ---
 
-## 6. 调度与心跳
+## 7. 调度与心跳
 
 * 周期：**UTC `:03` / `:33`**，即每小时第 3、33 分钟（`app.main.TICK_MINUTES`）。
   `:03` 是 4h 收盘 + 3 分钟（等交易所把 bar 落定）；`:33` 是同一根 bar 的复检 ——
@@ -256,7 +306,7 @@ PLAN 规定 query 参数。**照做，但必须写明代价**：
 
 ---
 
-## 7. 已知边界 / 留给阶段二
+## 8. 已知边界 / 留给阶段二
 
 | 项 | 现状 |
 |---|---|

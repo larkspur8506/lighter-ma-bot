@@ -23,6 +23,23 @@ import 边界（评审会看这一条）
 `POST /admin/flatten` 的默认实现（:func:`_default_flatten`）与调度器的 tick runner
 （:func:`default_tick_runner`）。这是刻意的：**读面板永远不加载私钥模块**。
 
+========================================================================
+运行依赖：只读面板 vs 下单
+========================================================================
+
+两件事，两个前置条件，**不许混为一谈**：
+
+* **只读面板 + admin 审计** 只需要 **DB 位置**（`DB_URL=sqlite:///<path>` 或
+  `DB_PATH=<path>`）。:func:`default_store_factory` 只看这两项 —— 它不调
+  `app.config.Config.from_env()`，因为 `StateStore.from_config()` 只鸭子类型读
+  `db_url` / `db_path`，从来不需要凭据。
+* **下单 / 调度器** 才需要 Lighter 凭据（`LIGHTER_ACCOUNT_INDEX` 等）+ `ADMIN_TOKEN`。
+  缺它们时：`/admin/flatten` 返回 `ok=false` + 原因（但**仍然落审计**），调度器不启动；
+  只读端点与 admin 审计照常工作。
+
+状态条把这两件事分开报：拿不到 DB 才说「数据库不可用」；缺凭据说的是
+「交易凭据未配置（只读面板不受影响）」。混成一句话会让运维去查库，而真正缺的是私钥。
+
 面板的私有读数（权益 / 挂单 / 现价）由**注入的 provider**提供（:class:`PanelCache`，
 由 tick 填充），`app.views` 只拿到已经取好的普通 dict —— 它自己没有能力调用交易所。
 
@@ -70,9 +87,10 @@ from app.risk import RiskLimits
 from app.store import StateStore
 
 __all__ = [
-    "ADMIN_TOKEN_ENV", "CONFIRM_VALUES", "PanelCache", "TICK_MINUTES", "TickScheduler",
-    "VERSION", "create_app", "default_store_factory", "default_tick_runner",
-    "next_tick_at", "record_tick_outcomes",
+    "ADMIN_TOKEN_ENV", "CONFIRM_VALUES", "CREDENTIAL_ENV_KEYS", "DB_PATH_ENV", "DB_URL_ENV",
+    "PanelCache", "SQLITE_URL_PREFIX", "StorePathError", "TICK_MINUTES", "TickScheduler",
+    "VERSION", "create_app", "credential_status", "default_store_factory",
+    "default_tick_runner", "next_tick_at", "record_tick_outcomes", "resolve_store_path",
 ]
 
 logger = logging.getLogger(__name__)
@@ -97,19 +115,110 @@ TICK_MINUTES: Tuple[int, ...] = (3, 33)
 HEARTBEAT_KIND = watchdog.HEARTBEAT_KIND
 
 
-# ================================================================== 契约：store
+# ================================================================== 契约：DB 路径
+#
+# 这里刻意**只**看 DB 位置，不看交易凭据。曾经的实现是
+# `default_store_factory()` → `Config.from_env()` → `StateStore.from_config()`，
+# 于是「没配私钥」被当成了「没有数据库」：面板 6 个区块全部降级、admin 写操作不落
+# 审计、状态条报「数据库不可用」。而 `StateStore.from_config()` 本身只鸭子类型读
+# `db_url` / `db_path` 两个属性 —— 它从来不需要凭据。建库与配凭据是两件事。
+
+DB_URL_ENV = "DB_URL"
+DB_PATH_ENV = "DB_PATH"
+SQLITE_URL_PREFIX = "sqlite:///"
+
+#: 交易凭据的 env 键（`app.config.REQUIRED_KEYS` 的**镜像**；`tests/test_main.py`
+#: 有一条断言钉住两者相等，所以这里不会悄悄漂移）。刻意**不** import `app.config`：
+#: 面板的 import 图里连配置层都不需要 —— 这里只是几个字符串，读的是 `os.environ`。
+CREDENTIAL_ENV_KEYS: Tuple[str, ...] = (
+    "LIGHTER_ACCOUNT_INDEX", "LIGHTER_API_KEY_INDEX", "LIGHTER_API_PRIVATE_KEY",
+    "LIGHTER_L1_ADDRESS", ADMIN_TOKEN_ENV,
+)
+
+
+class StorePathError(RuntimeError):
+    """DB 位置缺失或形式不对。**与交易凭据无关** —— 建库只看 `DB_URL` / `DB_PATH`。"""
+
+
+def _env_text(source: Mapping[str, str], key: str) -> str:
+    return str(source.get(key) or "").strip()
+
+
+class _StorePathConfig:
+    """递给 `StateStore.from_config()` 的鸭子类型配置（只有它读的两个属性）。
+
+    为什么不直接把 `app.config.Config` 递进去：`Config.from_env()` 要求**全部交易
+    凭据**，而建库只需要一个路径。把这两件事耦合起来，代价是「没配私钥 ⇒ 没有数据库」，
+    即一个只想读库（面板 / 审计 / 演练）的部署连一条 event 都写不进去。
+    """
+
+    __slots__ = ("db_url", "db_path")
+
+    def __init__(self, *, db_url: str = "", db_path: str = "") -> None:
+        self.db_url = db_url
+        self.db_path = db_path
+
+
+def resolve_store_path(env: Optional[Mapping[str, str]] = None) -> _StorePathConfig:
+    """按 env 解析 DB 位置。优先级：**`DB_URL` > `DB_PATH`**；两者都没有 ⇒ 抛错。
+
+    * `DB_URL` 必须是 `sqlite:///<path>`。别的 scheme（`postgresql://` 等）
+      **fail-closed 抛错**，绝不悄悄退回 `DB_PATH` —— 那会让「以为数据在 postgres」
+      的部署把审计写进一个本地文件，等到要查「谁在什么时候清过仓」才发现库是空的。
+    * 两者都没有 ⇒ 抛 :class:`StorePathError`，消息里**点名**要设哪个变量。
+      刻意不用 `./data/state.db` 之类默认值兜底：容器里 cwd 不对时库会落在没人备份的
+      角落，而面板看起来一切正常 —— 这正是最贵的一种「正常」。
+    """
+    source = os.environ if env is None else env
+    db_url = _env_text(source, DB_URL_ENV)
+    db_path = _env_text(source, DB_PATH_ENV)
+
+    if db_url:
+        if not db_url.startswith(SQLITE_URL_PREFIX):
+            scheme = db_url.split("://", 1)[0] if "://" in db_url else db_url
+            raise StorePathError(
+                f"{DB_URL_ENV} 只支持 {SQLITE_URL_PREFIX}<path>（fail-closed，"
+                f"不会退回 {DB_PATH_ENV}）；拿到的是 {scheme}://")
+        if not db_url[len(SQLITE_URL_PREFIX):].strip():
+            raise StorePathError(
+                f"{DB_URL_ENV} 缺少路径：应为 {SQLITE_URL_PREFIX}<path> 或改用 {DB_PATH_ENV}")
+        return _StorePathConfig(db_url=db_url, db_path=db_path)
+
+    if db_path:
+        return _StorePathConfig(db_url="", db_path=db_path)
+
+    raise StorePathError(
+        f"没有数据库位置：必须设置 {DB_URL_ENV}={SQLITE_URL_PREFIX}<path> 或 "
+        f"{DB_PATH_ENV}=<path>（只读面板只需要这一项，不需要 Lighter 凭据）")
+
+
+def credential_status(env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
+    """交易凭据的状态（**给状态条用**，不用于任何鉴权决定）。
+
+    与「数据库不可用」分开表达的理由：两者的后果完全不同。没有 DB = 面板本身瞎了；
+    没有凭据 = 面板看得见、但下单/调度器起不来。混成一句话会让运维去查库，而真正
+    缺的是私钥。
+    """
+    source = os.environ if env is None else env
+    missing = [key for key in CREDENTIAL_ENV_KEYS if not _env_text(source, key)]
+    return {
+        "known": True,
+        "configured": not missing,
+        "missing": missing,
+        "admin_token_set": bool(_env_text(source, ADMIN_TOKEN_ENV)),
+        "detail": "" if not missing else
+                  ("交易凭据未配置（只读面板不受影响；下单 / 调度器不可用）：缺 "
+                   + ", ".join(missing)),
+    }
 
 
 def default_store_factory() -> StateStore:
-    """按环境变量建 store（`app.config.Config` → `StateStore.from_config`）。
+    """按 `DB_URL` / `DB_PATH` 建 store。**不读任何交易凭据**。
 
     **懒调用**：store 不可用时面板每个请求都会重试一次 —— 数据库可能正在迁移或者被
     短锁占住，启动时失败一次不该让面板永久 500。
     """
-    from app.config import Config
-
-    config = Config.from_env()
-    return StateStore.from_config(config)
+    return StateStore.from_config(resolve_store_path())
 
 
 def _limits_from_env() -> RiskLimits:
@@ -420,8 +529,14 @@ def _audit(store: Optional[Any], *, endpoint: str, result: str, by: str = "admin
 
     审计要能回答三个问题：谁（`by`）、做了什么（`endpoint`）、结果如何（`result`）。
     **刻意不记 request line / query string** —— 那里面可能带着 `?k=<token>`。
+
+    「结果如何」包含**失败与被拒**：一次因为缺凭据而失败的 `flatten` 也必须留痕，
+    否则审计只能证明「成功过什么」，而它存在的意义恰恰是「谁试过什么」。
     """
     if store is None:
+        # 写不进审计本身就是一条要喊出来的事（DB 真的拿不到时才可能走到这里）。
+        logger.warning("admin audit for %s=%s could not be recorded: no store",
+                       endpoint, result)
         return None
     data: Dict[str, Any] = {"endpoint": endpoint, "result": str(result),
                             "by": str(by or "admin"), "reason": str(reason or "")}
@@ -543,14 +658,21 @@ def create_app(*, panel: Optional[views.Panel] = None,
                runner: Optional[Callable[[], Any]] = None,
                scheduler: Optional[TickScheduler] = None,
                enable_scheduler: bool = False,
+               credentials: Optional[Callable[[], Any]] = None,
                cache: Optional[PanelCache] = None) -> FastAPI:
     """建 app。所有依赖都可注入 —— 测试用 `create_app(panel=..., admin_token=...)`
-    就能全离线跑完 6 个只读端点与 3 个写操作。"""
+    就能全离线跑完 6 个只读端点与 3 个写操作。
+
+    `credentials`：交易凭据状态的探针（默认 :func:`credential_status`，读
+    `os.environ`）。它只进**状态条**，不参与鉴权 —— 用途是让状态条能区分
+    「没有数据库」与「没有私钥」这两件后果完全不同的事。
+    """
     resolved_limit = limits if limits is not None else _limits_from_env()
     factory = store_factory or default_store_factory
     panel = panel if panel is not None else views.Panel(
         factory, sources=sources, limits=resolved_limit, mode=mode, now=clock,
-        symbols=symbols)
+        symbols=symbols,
+        credentials=credentials if credentials is not None else credential_status)
     flatten_impl = flatten or _default_flatten
     cache = cache if cache is not None else PanelCache()
     token = (_configured_token() if admin_token is None else str(admin_token).strip())
@@ -830,9 +952,10 @@ def _build_scheduler(store_factory: Callable[[], Any], *,
                      clock: Callable[[], float]) -> Any:
     """按环境装配真实调度器；装配不出来就返回**原因字符串**（不抛）。
 
-    阶段一没有凭据 ⇒ `Config.from_env()` 抛 `ConfigError` ⇒ 返回原因字符串 ⇒ 调用方
-    记一条 `scheduler disabled` 审计并继续提供只读面板。这是刻意的：**面板能在没有任何
-    凭据的环境里跑起来**，而调度器不会假装自己在交易。
+    调度器**才**需要交易凭据（`Config.from_env()` 在 `default_tick_runner()` 里调用）。
+    没凭据 ⇒ 返回原因字符串 ⇒ 调用方记一条 `scheduler disabled` 审计并继续提供只读面板。
+    这是刻意的：**面板 + 审计只需要 DB**（见 :func:`default_store_factory`），而调度器
+    不会假装自己在交易。
     """
     if runner is None:
         try:
