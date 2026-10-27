@@ -1,0 +1,73 @@
+name: Publish image
+
+# 只在 main 上推镜像：分支上的镜像没有回滚价值，反而会占满 registry。
+# tag 用 commit sha（不可变、可回滚）+ latest（滚动指针）。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# 同一分支的并发发布只保留最新一次，避免半推状态。
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  publish:
+    name: build & push
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # The token must be the GitHub token (packages: write above) — a
+        # PAT would also work but is not needed and is one more secret to leak.
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # The lighter-sdk wheel ships amd64 WASM signer binaries only, so the
+          # image is amd64-only. The platform comes from the caller, not from a
+          # constant flag on FROM (buildx rejects those).
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify the published image loads the WASM signer
+        # The pushed artifact must be the one that was verified: pull it back
+        # and run the real dlopen probe, not a locally built one.
+        run: |
+          set -euo pipefail
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker run --rm --entrypoint python \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} -c \
+            "import lighter; pk, pub, err = lighter.create_api_key(); assert err is None, err; assert len(pk) == 82; print('published image signer loadable', len(pk))"
