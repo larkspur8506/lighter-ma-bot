@@ -84,7 +84,7 @@ from decimal import Decimal, InvalidOperation
 from typing import (Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional,
                     Sequence, Tuple)
 
-from app import strategy
+from app import strategy, symbol_registry
 from app.exchange import OrderResult, _site_root, client_order_index
 from app.lifecycle import (ACTION_ENTRY, ACTION_EXIT, ACTION_SKIP, ACTION_STOP,
                            IDLE, OPEN, Decision, Lifecycle, Rejection)
@@ -189,6 +189,10 @@ class ExchangeOrder:
     symbol: str = ""
     reduce_only: bool = False
     trigger_price_int: Optional[int] = None
+    #: 交易所原样返回的触发价（**小数串**，如 "99.057"）。`trigger_price_int` 只能表达
+    #: 「本来就是整数 tick」的情形，小数串要按标的的 price_decimals 才能换算成 tick，
+    #: 而解析层拿不到 decimals ⇒ 原样留着，由 `match_stop_order` 按标的精度比。
+    trigger_price_raw: Optional[str] = None
     price_int: Optional[int] = None
     qty_int: Optional[int] = None
     status: str = ""
@@ -389,6 +393,7 @@ def orders_from_payload(payload: Mapping[str, Any]) -> Tuple[ExchangeOrder, ...]
             reduce_only=bool(row.get("reduce_only")),
             trigger_price_int=(_opt_int(trigger) if str(trigger or "").strip().isdigit()
                                else None),
+            trigger_price_raw=(str(trigger).strip() if trigger not in (None, "") else None),
             price_int=_opt_int(row.get("base_price")),
             qty_int=_opt_int(row.get("base_size")),
             status=str(row.get("status") or ""),
@@ -667,6 +672,42 @@ def expected_stop_index(row: Mapping[str, Any]) -> Optional[int]:
     return None
 
 
+def _price_decimals_for(symbol: Any) -> Optional[int]:
+    """标的的 price_decimals（用于把交易所返回的小数价格串换算成整数 tick）。
+
+    只在注册表里有该标的时返回；未知标的返回 None ⇒ 调用方**放弃**这条兜底匹配
+    （fail-open 会把别人的单当成自己的止损，宁可不匹配）。
+    """
+    try:
+        spec = symbol_registry.spec(str(symbol or "").strip().upper())
+    except Exception:                                          # noqa: BLE001 - 未知标的
+        return None
+    return None if spec is None else int(spec.price_decimals)
+
+
+def _trigger_ticks(order: ExchangeOrder, price_decimals: Optional[int]) -> Optional[int]:
+    """止损单的触发价 → 整数 tick。
+
+    交易所字段 `trigger_price` 是**小数串**（`Order.trigger_price: str`，如 "99.057"），
+    而 `base_price` / `base_size` 是整数 tick。旧解析用 `str.isdigit()` 判空 ⇒ 所有小数
+    触发价都被当成 None，面板的「止损覆盖」与 ±1 tick 兜底匹配对小数的 STOP 永远失效
+    （2026-10-28 实测：我们自己的止损单 coi 匹配没问题，`trigger_price_int` 恒为 null）。
+    整数串原样可用（历史/测试数据）；小数串按标的精度换算。
+    """
+    if order.trigger_price_int is not None:
+        return int(order.trigger_price_int)
+    raw = order.trigger_price_raw
+    if not raw or price_decimals is None:
+        return None
+    try:
+        value = Decimal(str(raw).strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not value.is_finite() or value <= 0:
+        return None
+    return int((value * (10 ** int(price_decimals))).to_integral_value())
+
+
 def match_stop_order(row: Mapping[str, Any], orders: Sequence[ExchangeOrder], *,
                      tolerance_ticks: int = DEFAULT_STOP_TOLERANCE_TICKS
                      ) -> Tuple[Optional[ExchangeOrder], str]:
@@ -689,13 +730,15 @@ def match_stop_order(row: Mapping[str, Any], orders: Sequence[ExchangeOrder], *,
                     continue
                 return order, "client_order_index"
     if stop_int:
+        pdec = _price_decimals_for(row.get("symbol"))
         for order in candidates:
             if market is not None and order.market_id is not None \
                     and int(order.market_id) != int(market):
                 continue
-            if order.trigger_price_int is None:
+            ticks = _trigger_ticks(order, pdec)
+            if ticks is None:
                 continue
-            if abs(int(order.trigger_price_int) - int(stop_int)) <= int(tolerance_ticks):
+            if abs(int(ticks) - int(stop_int)) <= int(tolerance_ticks):
                 return order, "trigger_price"
     return None, ""
 
@@ -1098,7 +1141,7 @@ class Executor:
         # ④ 取数 + 信号（先全部取完，任何一个标的取数失败 → 本轮停手）
         feeds: Dict[str, Dict[str, Any]] = {}
         for symbol in self.symbols:
-            feeds[symbol] = self._load_symbol(symbol, stamp_ms)
+            feeds[symbol] = await self._load_symbol(symbol, stamp_ms)
 
         # ⑤ 装配 RiskState（库里持仓 ∪ 交易所持仓；并集 = 更严）
         if self.assembler.equity_provider is None:
@@ -1117,7 +1160,7 @@ class Executor:
         outcomes: List[SymbolOutcome] = []
         for symbol in self.symbols:
             feed = feeds[symbol]
-            decision = self._decide(symbol, feed, risk_state)
+            decision = await self._decide(symbol, feed, risk_state)
             decision, block_code = self._apply_entry_guard(decision, blocks=tuple(blocks))
             if block_code:
                 blocked_entries.append(symbol)
@@ -1150,9 +1193,14 @@ class Executor:
 
     # ---------------------------------------------------------------- 取数
 
-    def _load_symbol(self, symbol: str, stamp_ms: int) -> Dict[str, Any]:
-        """拉一个标的的 K 线 + 指标 + 信号。**只认已收盘 bar**（`market.bars()` 已剔除）。"""
-        result = self.market.bars(symbol, now_ms=stamp_ms)
+    async def _load_symbol(self, symbol: str, stamp_ms: int) -> Dict[str, Any]:
+        """拉一个标的的 K 线 + 指标 + 信号。**只认已收盘 bar**（`market.bars()` 已剔除）。
+
+        **必须 off-loop**：`market.bars()` 是同步 urllib + 分页，三标的合计几十秒；
+        直接在事件循环里调会把 uvicorn 的只读端点一起卡住（2026-10-28 实测：tick 期间
+        `/status` 偶发十几秒无响应/空 body）。⇒ 一律 `asyncio.to_thread`。
+        """
+        result = await asyncio.to_thread(self.market.bars, symbol, now_ms=stamp_ms)
         bars = list(getattr(result, "bars", ()) or ())
         if not bars:
             raise ExecutorError(f"{symbol}: no closed bars returned")
@@ -1177,7 +1225,8 @@ class Executor:
 
     # ---------------------------------------------------------------- 决策
 
-    def _decide(self, symbol: str, feed: Mapping[str, Any], risk_state: RiskState) -> Decision:
+    async def _decide(self, symbol: str, feed: Mapping[str, Any],
+                      risk_state: RiskState) -> Decision:
         if not feed.get("warm"):
             return Decision(symbol=symbol, action=ACTION_SKIP, from_state=IDLE,
                             to_state=IDLE, bar_ms=feed.get("bar_ms"),
@@ -1185,7 +1234,9 @@ class Executor:
                                                   message=str(feed.get("reason") or ""),
                                                   detail={"bars": len(feed.get("bars") or ())}),),
                             reason=str(feed.get("reason") or ""))
-        info = self.market.market_details().get(symbol)
+        # `market_details()` 也是 HTTP（orderBookDetails）→ 同样 off-loop。
+        details = await asyncio.to_thread(self.market.market_details)
+        info = details.get(symbol)
         return self.lifecycle.decide(
             symbol, feed["bars"], ind=feed["ind"], i=len(feed["bars"]) - 1,
             signal=feed["signal"], equity=self._equity, market_info=info,

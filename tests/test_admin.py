@@ -441,6 +441,33 @@ class AdminStateTests(AdminFixture):
 # 所以这里钉住三件事：body 生效、query 生效、**缺 on 必须 400 且不改状态**。
 
 
+class AdminEntryRedirectTests(AdminFixture):
+    """`/admin` 是旧系统（HL 面板）的路径 —— 粘过来必须能打开，而不是 404。
+
+    2026-10-28 实测：把 `https://.../admin?k=<token>` 给用户，页面直接
+    `{"detail":"Not Found"}`（本应用的面板在根路径，token 由页面 JS 从 `?k=` 收进
+    localStorage）。这条路由把两种链接都接住。
+    """
+
+    def test_admin_redirects_to_the_root_preserving_the_token(self) -> None:
+        client = self.build()
+        response = client.get(f"/admin?k={TOKEN}", follow_redirects=False)
+        self.assertEqual(response.status_code, 307)
+        self.assertEqual(response.headers["location"], f"/?k={TOKEN}")
+
+    def test_admin_without_a_query_still_lands_on_the_panel(self) -> None:
+        client = self.build()
+        response = client.get("/admin", follow_redirects=False)
+        self.assertEqual(response.status_code, 307)
+        self.assertEqual(response.headers["location"], "/")
+
+    def test_following_the_redirect_renders_the_panel(self) -> None:
+        client = self.build()
+        response = client.get(f"/admin?k={TOKEN}")          # follow_redirects 默认 True
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("btn-kill-on", response.text)
+
+
 class ParamSourceTests(AdminFixture):
     def test_kill_accepts_a_form_body_and_really_turns_it_off(self) -> None:
         client = self.build()
