@@ -1,14 +1,21 @@
 # 部署（oracle1）
 
 部署目标：`oracle1`（64.181.225.174，Ubuntu，美国圣何塞）。
-面板入口：<https://lt.222677.xyz>（Basic Auth 保护）。
+面板入口：<https://lt.222677.xyz>（**免密可看只读面板**，2026-10-28 移除 Basic Auth；
+admin 写操作走应用层 `?k=<ADMIN_TOKEN>` 链接）。
 
 ------------------------------------------------------------------------
 ## 0. 一句话现状
 
 镜像 `ghcr.io/larkspur8506/lighter-ma-bot:latest` 由 CI 构建推送，
-oracle1 上以容器运行；nginx（1Panel openresty）反代到 `127.0.0.1:8110`，
-前面挂 Basic Auth；容器走宿主上的 sing-box 代理访问 Lighter。
+oracle1 上以容器运行；nginx（1Panel openresty）反代到 `127.0.0.1:8110`（无 Basic
+Auth）；容器走宿主上的 sing-box 代理访问 Lighter。
+
+**重部署一律用 `/opt/lighter-ma-bot/deploy.py`**（从运行中的容器重建 docker run，
+env/挂载全继承、旧容器留作回滚点、health 轮询失败自动回滚）——
+**不要用本仓库的 `scripts/deploy_oracle1.sh`**：它硬写 `PANEL_SCHEDULER=0` +
+`LIGHTER_LIVE_TRADING=0`，照它跑会把真钱模式**静默降级成纯面板**（该脚本已加硬警告，
+执行即退出）。
 
 ------------------------------------------------------------------------
 ## 1. 端口与路径
@@ -17,12 +24,13 @@ oracle1 上以容器运行；nginx（1Panel openresty）反代到 `127.0.0.1:811
 |---|---|---|
 | 公网 | `https://lt.222677.xyz` (443) | 证书 CN=lt.222677.xyz，至 2027-01-25 |
 | nginx | → `http://127.0.0.1:8110` | `/opt/1panel/www/sites/lt.222677.xyz/proxy/root.conf` |
-| 宿主机 | `127.0.0.1:8110` → 容器 `8100` | docker-proxy；容器 `--network host` |
-| 容器内 | `8100` | uvicorn，`--host 127.0.0.1`（不直接暴露公网） |
+| 宿主机 | `127.0.0.1:8110` | 容器 `--network host`，进程直接 listen 8110 |
+| 容器内 | `8110` | uvicorn，`--host 127.0.0.1`（不直接暴露公网） |
 | 代理 | `127.0.0.1:8118` | sing-box HTTP inbound，**只在宿主上** listen |
 
 **为什么是 8110 不是 8100**：8100 已被旧的 `crypto-ma-alert` 容器占用
-（`127.0.0.1:8100->8000`）。
+（`127.0.0.1:8100->8000`）。镜像默认 CMD 是 8100，重建容器**必须带 CMD 覆盖**
+`--port 8110 --no-access-log`（deploy.py 会继承运行中容器的 CMD，不用手写）。
 
 **为什么用 `--network host`**：容器内要访问宿主 sing-box 的
 `127.0.0.1:8118`。sing-box 只 listen `127.0.0.1`，容器用 bridge 网络时
@@ -37,7 +45,7 @@ oracle1 上以容器运行；nginx（1Panel openresty）反代到 `127.0.0.1:811
 | `/opt/lighter-ma-bot/.env` | `600 root:root` | API 私钥、`ADMIN_TOKEN`、`DB_PATH` 等 |
 | `/opt/lighter-ma-bot/data/` | `750 10001:10001` | `state.db`（SQLite） |
 | `/opt/lighter-ma-bot/logs/` | `750 10001:10001` | 容器日志落盘 |
-| `/opt/1panel/www/sites/lt.222677.xyz/htpasswd.txt` | `640 root:root` | Basic Auth 账号 |
+| `/opt/lighter-ma-bot/backups/` | `700 root:root` | state.db 每日快照（保留 30 天，Hermes 侧 cron 拉回归档） |
 
 **目录权限的坑**：容器以 `uid 10001(bot)` 运行。
 `/opt/lighter-ma-bot` 若是 `750 root:root`，bot **进不去**（不是 root 也不在
@@ -49,29 +57,21 @@ root 组）⇒ 报 `PermissionError: '/opt/lighter-ma-bot'`。
 `/opt/lighter-ma-bot/...` 在容器里不存在 ⇒ 又一个 `PermissionError`。
 
 ------------------------------------------------------------------------
-## 3. 部署步骤
+## 3. 部署步骤（2026-10-28 起，deploy.py 是唯一权威路径）
 
 ```bash
-# 1) 镜像
-sudo docker pull ghcr.io/larkspur8506/lighter-ma-bot:latest
+# 在 oracle1 上：
+sudo python3 /opt/lighter-ma-bot/deploy.py --expect-rev <目标 sha 前 7 位>
+```
 
-# 2) 停旧容器
-sudo docker rm -f lighter-ma-bot 2>/dev/null || true
+deploy.py 的动作：pull → 校验镜像 revision label → 从**运行中容器** docker inspect
+重建 `docker run`（env/mounts/network/user/workdir/CMD/healthcheck 全继承，私钥不过
+文件）→ 停旧容器并改名 `lighter-ma-bot-prev` 留作回滚 → 启动 → 轮询 `127.0.0.1:8110/health`
+→ 失败自动回滚。
 
-# 3) 起容器
-sudo docker run -d --name lighter-ma-bot --restart unless-stopped \
-  --network host \
-  --env-file /opt/lighter-ma-bot/.env \
-  -e PANEL_SCHEDULER=0 \
-  -e LIGHTER_LIVE_TRADING=0 \
-  -v /opt/lighter-ma-bot/data:/srv/data \
-  -v /opt/lighter-ma-bot/logs:/srv/logs \
-  ghcr.io/larkspur8506/lighter-ma-bot:latest \
-  uvicorn app.main:app --host 127.0.0.1 --port 8110 --no-access-log
-
-# 4) nginx
-sudo docker exec 1Panel-openresty-MKvt openresty -t
-sudo docker exec 1Panel-openresty-MKvt openresty -s reload
+```bash
+# 回滚一行：
+sudo docker rm -f lighter-ma-bot && sudo docker rename lighter-ma-bot-prev lighter-ma-bot && sudo docker start lighter-ma-bot
 ```
 
 **`--env-file` 只在 `docker run` 时读一次** —— 改了 `.env` 必须重建容器，
@@ -105,14 +105,11 @@ sudo docker exec -i -u bot lighter-ma-bot python /srv/scripts/smoke_live_order.p
 
 | 开关 | 值 | 含义 |
 |---|---|---|
-| `PANEL_SCHEDULER` | `0` | 不跑 tick —— 只有面板，不产生任何交易动作 |
-| `LIGHTER_LIVE_TRADING` | `0` | 真实下单三道门的第一道闭合 |
-| Basic Auth | 开 | nginx 层，保护**只读**端点 |
-| `ADMIN_TOKEN` | 设 | 应用层，保护**写**端点（`/admin/*`） |
-
-**上线前**需要改的只有 `PANEL_SCHEDULER=1`（和真实下单的三道门）。
-改法：改 `.env` 不够（那是 `--env-file` 读的），要在 `docker run` 的
-`-e` 里改，或者改完重建容器。
+| `PANEL_SCHEDULER` | `1` | tick 每 30 分钟一轮（UTC :03/:33），真钱调度在跑 |
+| `LIGHTER_LIVE_TRADING` | `1` | 真实下单三道门的第一道**已开**（实盘） |
+| Basic Auth | **已移除**（2026-10-28） | 只读面板免密；admin 写操作靠 `ADMIN_TOKEN` |
+| `ADMIN_TOKEN` | 设 | 应用层，保护**写**端点（`/admin/*`），`?k=` 注入 localStorage |
+| state.db 备份 | 每日 07:00 UTC | 容器内 backup API 快照 → Hermes 侧拉回本机归档，各留 30 天 |
 
 ------------------------------------------------------------------------
 ## 5. 代理（sing-box）
@@ -165,7 +162,8 @@ health        200  {"ok":true,"service":"lighter-ma-bot","version":"0.2.0"}
 ------------------------------------------------------------------------
 ## 8. 未做（阶段二）
 
-* 调度器上线（`PANEL_SCHEDULER=1`）
-* 真实下单演练（dry-run → 小额 → 正式）
 * `stop_max` / `stop_min` 等旧系统参数的迁移确认
 * 面板 token 与 1Panel 站点的自动化联动
+
+（调度器与真实下单已于 2026-10-28 上线：`PANEL_SCHEDULER=1`、`LIGHTER_LIVE_TRADING=1`，
+smoke 真钱往返多轮 10/10。）
