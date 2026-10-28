@@ -406,6 +406,10 @@ class Sources:
     orders: Optional[Callable[[], Any]] = None
     bars: Optional[Callable[[str], Any]] = None
     prices: Optional[Callable[[], Any]] = None
+    #: `(symbol) -> [strategy.Bar]`，**只读缓存、绝不发网络请求**。
+    #: `/status` 用它算「数据源新鲜度」：没有它时状态条会为了一个时间戳去拉 3 标的 × 8 页
+    #: K 线 —— 实测重启后第一次 `/status` 要 24s（之后才快，因为缓存被顺手暖了）。
+    cached_bars: Optional[Callable[[str], Any]] = None
 
 
 # ------------------------------------------------------------------ 面板
@@ -714,13 +718,25 @@ class Panel:
         best: Optional[float] = None                  # 最后一根已收盘 bar 的收盘时刻
         name = "bar"
         errors: List[str] = []
-        if self.sources.bars is not None:
+        # 有 `cached_bars` 就只用缓存：**状态条不许为了一个时间戳去发网络请求**
+        # （实测：冷启动后第一次 /status 因为拉 K 线要 24s）。
+        probe = self.sources.cached_bars if self.sources.cached_bars is not None \
+            else self.sources.bars
+        cache_only = self.sources.cached_bars is not None
+        rows: Dict[str, List[Any]] = {}
+        if probe is not None:
             for symbol in self.symbols:
                 try:
-                    bars = list(self.sources.bars(symbol) or [])
+                    rows[symbol] = list(probe(symbol) or [])
                 except Exception as exc:                  # noqa: BLE001
+                    rows[symbol] = []
                     errors.append(f"{symbol}: {type(exc).__name__}: {exc}")
-                    continue
+            if cache_only and any(not bars for bars in rows.values()):
+                rows = {}                                  # 缓存没铺满 → 走权益点口径
+                errors = []
+        if rows:
+            for symbol in self.symbols:
+                bars = rows.get(symbol) or []
                 if not bars:
                     errors.append(f"{symbol}: 没有 K 线")
                     continue
