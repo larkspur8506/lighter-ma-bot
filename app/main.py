@@ -273,8 +273,30 @@ class PanelCache:
         self.prices_value: Dict[str, float] = {}
         self.updated_at: Optional[float] = None
         self.error: str = ""
+        # tick 已经拉过的 K 线（symbol → (ts, bars)）。面板直接复用，别再自己去交易所
+        # 拉一遍：一次冷拉 3 标的 × 8 页 ≈27s（实测），而且会和 tick 用**不同的起点**
+        # 算出略微不同的 EMA（EMA 用首根收盘播种）—— 那正是「两个面板不一致」的来源。
+        self.bars_value: Dict[str, Tuple[float, Any]] = {}
 
     # ---------------------------------------------------------------- 写
+
+    def set_bars(self, symbol: str, bars: Any, *, ts: Optional[float] = None) -> None:
+        """记下 tick 本轮用的 K 线（面板只读，不产生新的取数）。"""
+        if bars is None:
+            return
+        self.bars_value[str(symbol).upper()] = (
+            float(ts) if ts is not None else time.time(), tuple(bars))
+
+    def bars(self, symbol: str, *, max_age_s: float = 3600.0,
+             clock: Optional[Callable[[], float]] = None) -> Optional[Any]:
+        """最近一轮 tick 的 K 线；过期/没有就返回 None（调用方自己去取或降级）。"""
+        hit = self.bars_value.get(str(symbol).upper())
+        if hit is None:
+            return None
+        stamp, bars = hit
+        if ((clock or time.time)() - stamp) > float(max_age_s):
+            return None
+        return list(bars)
 
     def update(self, *, equity: Any = None, orders: Optional[Sequence[Any]] = None,
                prices: Optional[Mapping[str, Any]] = None,
@@ -724,6 +746,12 @@ def _default_panel_sources(cache: "PanelCache",
     bars: Optional[Callable[[str], Any]] = None
     if market_source:
         def bars(symbol: str) -> Any:                         # noqa: F811 - 闭包赋值
+            # ① 优先用最近一轮 tick 拉过的 K 线：同一份数据、同一个起点 ⇒ 面板与
+            #    交易决策口径完全一致，也省掉一次 3 标的 × 8 页的冷拉（实测 ≈27s）。
+            cached = cache.bars(symbol)
+            if cached:
+                return cached
+            # ② 缓存空/过期（还没跑过 tick、或 tick 停了）→ 自己去公开接口取。
             from app.market import DEFAULT_ENVIRONMENT, MarketClient
             source = getattr(bars, "_source", None)
             if source is None:
@@ -1199,6 +1227,9 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
                             symbols=symbols, limits=_limits(), alert=None)
         report = await executor.run_once()
         record_tick_outcomes(store, report, ts=time.time())
+        # 面板复用本轮取到的 K 线：不额外取数、且与决策用同一份序列（含同一个起点）
+        for symbol, bars in (getattr(executor, "_bars", {}) or {}).items():
+            cache.set_bars(symbol, bars, ts=time.time())
         account = getattr(executor, "last_account", None)
         if account is not None:
             cache.update(equity=getattr(account, "equity", None),

@@ -32,6 +32,7 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from app import config as app_config
+from app import executor as executor_mod
 from app import main, views, watchdog
 from app.risk import RiskLimits
 from app.store import StateStore
@@ -840,6 +841,47 @@ class ImportBoundaryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "[]",
                          f"面板的 import 图里出现了私钥路径: {result.stdout}")
+
+
+class BarsCacheTests(unittest.TestCase):
+    """面板复用 tick 的 K 线：同一份序列、同一个起点，且不再现场取数。
+
+    实测（2026-10-28）：面板冷拉 3 标的 × 8 页 ≈27s；而 tick 明明已经拿到同一批 K 线。
+    更隐蔽的问题是**起点不同会算出略微不同的 EMA**（EMA 用首根收盘播种）→ 面板显示的
+    带宽/密集与 bot 的决策口径不完全一致。缓存共享一次解决两个问题。
+    """
+
+    def test_cache_returns_fresh_bars_and_drops_stale(self) -> None:
+        cache = main.PanelCache()
+        now = 1_000_000.0
+        cache.set_bars("btc", [1, 2, 3], ts=now)
+        self.assertEqual(cache.bars("BTC", clock=lambda: now + 10), [1, 2, 3])
+        self.assertIsNone(cache.bars("BTC", clock=lambda: now + 4000))   # 过期
+        self.assertIsNone(cache.bars("ETH"))                             # 没采过
+
+    def test_panel_sources_prefer_the_ticks_bars(self) -> None:
+        cache = main.PanelCache()
+        cached = [object(), object()]
+        cache.set_bars("BTC", cached)
+        sources = main._default_panel_sources(cache, market_source=True)
+        self.assertEqual(sources.bars("BTC"), cached)     # 命中缓存 → 不发任何网络请求
+
+    def test_load_symbol_keeps_the_bars_for_the_panel(self) -> None:
+        from types import SimpleNamespace
+
+        from app.strategy import Bar, MIN_BARS_REQUIRED
+
+        bars = [Bar(open_ms=i * 4 * 3600 * 1000, open=100.0, high=100.5, low=99.5,
+                    close=100.0, volume=1.0) for i in range(MIN_BARS_REQUIRED + 20)]
+
+        class Market:
+            def bars(self, symbol, **kwargs):
+                return SimpleNamespace(bars=tuple(bars), dropped_unclosed=())
+
+        fake = SimpleNamespace(market=Market(), _prices={}, _bars={},
+                               sides=(1, -1), short_regime_ma=200)
+        asyncio.run(executor_mod.Executor._load_symbol(fake, "BTC", 0))
+        self.assertEqual(len(fake._bars["BTC"]), len(bars))
 
 
 class LiveGateStatusTests(unittest.TestCase):
