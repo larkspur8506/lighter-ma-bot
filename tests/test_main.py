@@ -609,7 +609,7 @@ class PanelWithoutCredentialsTests(unittest.TestCase):
     def test_a_successful_kill_is_audited(self) -> None:
         with clean_env(DB_PATH=self.db, ADMIN_TOKEN=self.TOKEN):
             with self.client() as client:
-                response = client.post(f"/admin/kill?k={self.TOKEN}")
+                response = client.post(f"/admin/kill?k={self.TOKEN}&on=1")
         self.assertEqual(response.status_code, 200)
         self.assertIs(response.json()["ok"], True)
         self.assertIsNotNone(response.json()["audit_event_id"])
@@ -665,7 +665,7 @@ class NoDatabaseTests(unittest.TestCase):
     def test_write_operations_degrade_without_a_database(self) -> None:
         with clean_env(ADMIN_TOKEN="tok"):
             response = TestClient(main.create_app(limits=LIMITS)).post(
-                "/admin/kill?k=tok")
+                "/admin/kill?k=tok&on=1")
         self.assertEqual(response.status_code, 200)           # 降级，不是 500
         body = response.json()
         self.assertIs(body["ok"], False)
