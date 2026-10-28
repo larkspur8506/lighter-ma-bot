@@ -467,6 +467,7 @@ class Panel:
                  max_curve_points: int = MAX_CURVE_POINTS,
                  stale_after_s: float = STALE_AFTER_S,
                  heartbeat_max_age_s: float = HEARTBEAT_MAX_AGE_S,
+                 sides: Sequence[int] = (1, -1),
                  owns_store: bool = True) -> None:
         if store_factory is None:
             raise ValueError("Panel requires a store factory")
@@ -486,6 +487,9 @@ class Panel:
         self.max_curve_points = max(2, int(max_curve_points))
         self.stale_after_s = float(stale_after_s)
         self.heartbeat_max_age_s = float(heartbeat_max_age_s)
+        # 方向开关与执行器同源（`Executor(sides=...)`）。今天两侧都开；面板必须拿同一份，
+        # 否则关掉某个方向后面板还会说「可开多」——那种假阳性比没有这一列更糟。
+        self.sides: Tuple[int, ...] = tuple(int(s) for s in sides if int(s) in (1, -1)) or (1, -1)
 
     def __repr__(self) -> str:
         state = ("closed" if self._closed
@@ -1018,9 +1022,17 @@ class Panel:
                 warnings.append(f"现价 provider 失败: {type(exc).__name__}: {exc}")
 
         out: List[Dict[str, Any]] = []
+        held: Dict[str, Mapping[str, Any]] = {}
+        try:
+            store = self.store()
+            if store is not None:
+                for prow in store.open_positions():
+                    held[str(_row_get(prow, "symbol") or "").upper()] = prow
+        except Exception as exc:                              # noqa: BLE001 - 读不到就当没持仓
+            warnings.append(f"持仓读取失败: {type(exc).__name__}: {exc}")
         for symbol in self.symbols:
             try:
-                out.append(self._symbol_row(symbol, prices, now))
+                out.append(self._symbol_row(symbol, prices, now, held=held.get(symbol)))
             except Exception as exc:                          # noqa: BLE001 - 单标的不崩全表
                 warnings.append(f"{symbol}: {type(exc).__name__}: {exc}")
                 out.append(_symbol_empty(symbol, reason=f"计算失败: {exc}"))
@@ -1031,7 +1043,7 @@ class Panel:
                 "warnings": warnings, "degraded": bool(warnings)}
 
     def _symbol_row(self, symbol: str, prices: Mapping[str, float],
-                    now: float) -> Dict[str, Any]:
+                    now: float, held: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         bars = list(self.sources.bars(symbol) or [])          # type: ignore[misc]
         if not bars:
             return _symbol_empty(symbol, reason="没有 K 线")
@@ -1042,12 +1054,39 @@ class Panel:
         if price is None:
             price = _finite(_row_get(bars[i], "close"))
         why = strategy.explain_entry(symbol, bars, ind, squeeze, i,
-                                     entry_price=price if price else None)
+                                     entry_price=price if price else None,
+                                     allow_long=(1 in self.sides),
+                                     allow_short=(-1 in self.sides))
         values = why.get("values") or {}
         band = _finite(values.get("band_prev"))
         thr = _finite(values.get("band_thr"))
         next_close_ms = int(_row_get(bars[i], "open_ms") or 0) + BAR_MS
-        return {
+        # ---- 距触发线（入场判据用的是 **上一根** 的均线带上下沿）与破线后止损（用 **本根**）----
+        # 这几个数只是「还差多远」的预览：判定永远来自 explain_entry / evaluate_entry，
+        # 这里算出来的距离不参与任何开仓决策。
+        ma_max = _finite(values.get("ma_max_prev"))
+        ma_min = _finite(values.get("ma_min_prev"))
+        ma_max_now = _finite((ind.get("ma_max") or [None])[i])
+        ma_min_now = _finite((ind.get("ma_min") or [None])[i])
+        sma200 = _finite((ind.get("sma200") or [None])[i])
+
+        def _gap(num: Optional[float], ref: Optional[float]) -> Optional[float]:
+            """现价离参考线的比例（正 = 现价在参考线下方，需要上涨才碰到）。"""
+            if num is None or not ref:
+                return None
+            return (ref - num) / num
+
+        dist_long = _gap(price, ma_max)        # 正=还需上涨多少才破上轨
+        dist_short = _gap(ma_min, price)       # 正=还需下跌多少才破下轨
+        stop_long = None if not (price and ma_min_now) else (price - ma_min_now) / price
+        stop_short = None if not (price and ma_max_now) else (ma_max_now - price) / price
+
+        def stop_ok(dist: Optional[float]) -> Optional[bool]:
+            if dist is None:
+                return None
+            return bool(strategy.STOP_MIN <= dist <= strategy.STOP_MAX)
+
+        row: Dict[str, Any] = {
             "symbol": symbol,
             "price": price,
             "band_pct": band,
@@ -1056,9 +1095,26 @@ class Panel:
             "dense_bars": int(values.get("dense_cnt") or 0),
             "min_dense_bars": strategy.MIN_SQUEEZE_BARS,
             "sma20": _finite((ind.get("sma20") or [None])[i]),
-            "sma200": _finite((ind.get("sma200") or [None])[i]),
-            "ma_max": _finite(values.get("ma_max_prev")),
-            "ma_min": _finite(values.get("ma_min_prev")),
+            "sma200": sma200,
+            "ma_max": ma_max,
+            "ma_min": ma_min,
+            # 距触发线：>0 表示还要朝那个方向走多少才破线；<0 表示现价已经越过去了（等收盘确认）
+            "dist_long_pct": dist_long,
+            "dist_short_pct": dist_short,
+            "above_upper": bool(price and ma_max and price > ma_max),
+            "below_lower": bool(price and ma_min and price < ma_min),
+            # 做空趋势过滤（只有做空才对它提要求）
+            "ma200_gap_pct": _gap(price, sma200),
+            "below_ma200": bool(price and sma200 and price < sma200),
+            # 破线后止损距离（按当前价与本根均线带估算，仅展示）
+            "stop_long_pct": stop_long,
+            "stop_short_pct": stop_short,
+            "stop_long_ok": stop_ok(stop_long),
+            "stop_short_ok": stop_ok(stop_short),
+            # 方向开关（与执行器同源；今天两侧都开，见 Panel.sides）
+            "long_enabled": 1 in self.sides,
+            "short_enabled": -1 in self.sides,
+            "held_side": int(held.get("side") or 0) if held else 0,
             "next_bar_close_ms": next_close_ms,
             "next_bar_close_ts": next_close_ms / 1000.0,
             "blocked_by": why.get("blocked_by"),
@@ -1069,6 +1125,8 @@ class Panel:
             "as_of": now,
             "warnings": ["K 线不足，指标为 0 值"] if len(bars) < strategy.MIN_BARS_REQUIRED else [],
         }
+        row["verdict"] = _symbol_verdict(row)
+        return row
 
     # ---------------------------------------------------------------- ⑥ 事件流
 
@@ -1271,14 +1329,79 @@ def _symbols_fallback(warning: str, *, symbols: Sequence[str] = DEFAULT_SYMBOLS,
             "warnings": [warning], "degraded": True}
 
 
+def _symbol_verdict(row: Mapping[str, Any]) -> str:
+    """三标的动态的「结论」列：**只说还差什么，不复述任何数字**。
+
+    数字都在前面的列里（密集 3/6✔、距上/下轨 ±x%、MA200、止损距离），这里再念一遍就是噪音。
+    优先级 = 引擎自己的六步顺序（根数 → 密集 → 破线 → MA200 → 止损），所以「第一个卡点」
+    与实盘拒单原因永远一致；`fired` 直接来自 evaluate_entry，不是这里推的。
+    """
+    if int(row.get("held_side") or 0):
+        return "持仓中"
+    long_on = bool(row.get("long_enabled", True))
+    short_on = bool(row.get("short_enabled", True))
+    if not long_on and not short_on:
+        return "多空双向都已关闭"
+    blocked = str(row.get("blocked_by") or "")
+    if row.get("fired"):
+        side = int(row.get("side") or 0)
+        return "可开多" if side == 1 else ("可开空" if side == -1 else "可开仓")
+    if blocked == "no_data":
+        return "无数据"
+    if blocked == "bars":
+        return "K 线不足"
+    if blocked == "squeeze":
+        gap = _finite(row.get("gap_pct"))
+        dense = int(row.get("dense_bars") or 0)
+        need = int(row.get("min_dense_bars") or 0)
+        if gap is not None and gap > 0:
+            return "等密集（带宽未进门槛）"
+        if dense < need:
+            return "等密集根数"
+        return "等密集"
+    if blocked == "breakout":
+        # 说方向而不是说数字：哪一边更近、且那一边的前置条件（方向开关/MA200/止损）成立。
+        long_ok = long_on and row.get("stop_long_ok") is not False
+        short_ok = (short_on and row.get("stop_short_ok") is not False
+                    and bool(row.get("below_ma200")))
+        if long_ok and short_ok:
+            dl = _finite(row.get("dist_long_pct"))
+            ds = _finite(row.get("dist_short_pct"))
+            if dl is not None and ds is not None:
+                return "等破上轨" if abs(dl) <= abs(ds) else "等破下轨"
+            return "等破线"
+        if long_ok:
+            return "等破上轨"
+        if short_ok:
+            return "等破下轨"
+        return "等破线（另一侧前置条件未满足）"
+    if blocked == "regime":
+        return "空单需先跌破 MA200"
+    if blocked == "stop":
+        return "止损距离不合格"
+    if blocked == "unknown":
+        return "条件未明"
+    return "等条件"
+
+
 def _symbol_empty(symbol: str, *, reason: str = "") -> Dict[str, Any]:
-    return {"symbol": symbol, "price": 0.0, "band_pct": None, "threshold_pct": None,
-            "gap_pct": None, "dense_bars": 0, "min_dense_bars": strategy.MIN_SQUEEZE_BARS,
-            "sma20": None, "sma200": None, "ma_max": None, "ma_min": None,
-            "next_bar_close_ms": None, "next_bar_close_ts": None,
-            "blocked_by": "no_data", "reason": reason or "无数据", "fired": False,
-            "side": 0, "bars": 0, "as_of": 0.0,
-            "warnings": [reason or "无数据"]}
+    row: Dict[str, Any] = {
+        "symbol": symbol, "price": 0.0, "band_pct": None, "threshold_pct": None,
+        "gap_pct": None, "dense_bars": 0, "min_dense_bars": strategy.MIN_SQUEEZE_BARS,
+        "sma20": None, "sma200": None, "ma_max": None, "ma_min": None,
+        "dist_long_pct": None, "dist_short_pct": None,
+        "above_upper": False, "below_lower": False,
+        "ma200_gap_pct": None, "below_ma200": False,
+        "stop_long_pct": None, "stop_short_pct": None,
+        "stop_long_ok": None, "stop_short_ok": None,
+        "long_enabled": True, "short_enabled": True, "held_side": 0,
+        "next_bar_close_ms": None, "next_bar_close_ts": None,
+        "blocked_by": "no_data", "reason": reason or "无数据", "fired": False,
+        "side": 0, "bars": 0, "as_of": 0.0,
+        "warnings": [reason or "无数据"],
+    }
+    row["verdict"] = _symbol_verdict(row)
+    return row
 
 
 def _events_fallback(warning: str) -> Dict[str, Any]:
@@ -1361,6 +1484,23 @@ code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
 .tag.kill { background: var(--bad-bg); color: var(--bad-fg); }
 svg { display: block; width: 100%; height: auto; }
 footer { color: var(--dim); font-size: 11px; padding: 4px 2px 20px; }
+/* ⑤ 三标的动态：宽屏一行网格；窄屏 = 数字行（可折行）+ 结论行（2026-10-28） */
+.dyn { width: 100%; font-size: 12.5px; }
+.dyn-row { display: grid; align-items: baseline; gap: 3px 10px; padding: 6px 2px;
+           border-bottom: 1px solid var(--line);
+           grid-template-columns: 46px 92px 104px 1.25fr 1.25fr 1fr 1.35fr 60px 1.1fr; }
+.dyn-row.head { color: var(--muted); font-size: 11px; font-weight: 600; }
+.dyn-row .nm { font-weight: 600; }
+.dyn-row .verdict { font-weight: 600; }
+.warn { color: var(--warn); }
+@media (max-width: 640px) {
+  .dyn-row.head { display: none; }
+  .dyn-row { display: flex; flex-wrap: wrap; gap: 2px 10px; }
+  .dyn-row > span { white-space: nowrap; }
+  .dyn-row .next { display: none; }
+  .dyn-row .verdict { flex: 1 0 100%; margin-top: 4px; padding-top: 4px;
+                      border-top: 1px dashed var(--line2); }
+}
 @media (max-width: 640px) { body { padding: 8px; } th, td { padding: 4px 5px; } }
 """
 
@@ -1557,30 +1697,92 @@ def _pnl_html(block: Mapping[str, Any]) -> str:
 
 
 def _symbols_html(block: Mapping[str, Any]) -> str:
-    head = ("<tr><th>标的</th><th>当前价</th><th>6MA 带宽%</th><th>密集门槛%</th>"
-            "<th>距门槛</th><th>连续密集根数</th><th>SMA20</th><th>SMA200</th>"
-            "<th>下一根收盘(UTC)</th><th>结论</th></tr>")
+    """三标的动态：一行数字 + 一行结论（窄屏两行，宽屏合并成一行网格）。
+
+    设计取舍（2026-10-28 用户拍板）：
+    - 回答「还差什么才开单」：距上轨/距下轨（含触发价）、MA200 上下、破线后止损距离；
+    - 不再重复：带宽/门槛/距门槛 三列合并进「密集」一格（数值进 title），结论列只说差什么；
+    - SMA20（离场线）从这张表移走，持仓时显示在结论里。
+    """
+    head = ("<div class='dyn-row head'><span>标的</span><span>当前价</span><span>密集</span>"
+            "<span>距上轨（开多）</span><span>距下轨（开空）</span><span>MA200（做空）</span>"
+            "<span>破线后止损</span><span>收盘(UTC)</span><span>结论</span></div>")
+
+    def _mark(flag: Any) -> str:
+        return "" if flag is None else ("✔" if flag else "✘")
+
+    def _dist(value: Any) -> tuple:
+        """距触发线的显示：正 = 还差这么多才破线；负 = 现价已越过（等收盘确认）。"""
+        out = _finite(value)
+        if out is None:
+            return "—", "dim"
+        if out < 0:
+            return f"已越过 {abs(out) * 100:.2f}%（等收盘）", "warn"
+        return f"{out * 100:.2f}%", ("warn" if out <= 0.005 else "dim")
+
+    def _stops(row: Mapping[str, Any]) -> tuple:
+        parts = []
+        for label, key, ok_key in (("多", "stop_long_pct", "stop_long_ok"),
+                                   ("空", "stop_short_pct", "stop_short_ok")):
+            dist = _finite(row.get(key))
+            if dist is None:
+                parts.append(f"{label} —")
+            elif dist < 0:
+                parts.append(f"{label} 方向不符")     # 止损参考线跑到入场价同侧，该方向不可用
+            else:
+                parts.append(f"{label} {dist * 100:.2f}%{_mark(row.get(ok_key))}")
+        ok = bool(row.get("stop_long_ok")) or bool(row.get("stop_short_ok"))
+        return " · ".join(parts), ("pos" if ok else "neg")
+
     rows = []
     for row in block.get("symbols") or ():
         gap = _finite(row.get("gap_pct"))
-        gap_text = "—" if gap is None else f"{gap * 100:+.2f}%"
-        gap_css = "dim" if gap is None else ("pos" if gap <= 0 else "neg")
+        dense = int(row.get("dense_bars") or 0)
+        need = int(row.get("min_dense_bars") or 0)
+        band = _finite(row.get("band_pct"))
+        thr = _finite(row.get("threshold_pct"))
+        dense_ok = gap is not None and gap <= 0
+        if dense_ok:
+            dense_txt = f"{dense}/{need} ✔"
+        elif gap is None:
+            dense_txt = f"{dense}/{need} ✘"
+        else:
+            dense_txt = f"{dense}/{need} ✘{gap * 100:+.2f}pp"
+        dense_title = (f"带宽 {band * 100:.2f}% vs 门槛 {thr * 100:.2f}%"
+                       if band is not None and thr is not None else "带宽/门槛未知")
+        d_long, css_long = _dist(row.get("dist_long_pct"))
+        d_short, css_short = _dist(row.get("dist_short_pct"))
+        m200 = _finite(row.get("ma200_gap_pct"))
+        if m200 is None:
+            m200_txt, m200_css = "—", "dim"
+        else:
+            # _gap 的符号约定：正 = 均线在现价上方 ⇒ 现价在均线「下方」
+            m200_txt = f"{'下方' if m200 > 0 else '上方'} {abs(m200) * 100:.2f}% {_mark(row.get('below_ma200'))}"
+            m200_css = "pos" if row.get("below_ma200") else "neg"
+        stop_txt, stop_css = _stops(row)
         nxt = _finite(row.get("next_bar_close_ts"))
+        held = int(row.get("held_side") or 0)
+        if held:
+            verdict = f"持仓中（{'多' if held == 1 else '空'}）· 离场线 SMA20 {_money(row.get('sma20'))}"
+            verdict_css = "dim"
+        else:
+            verdict = str(row.get("verdict") or "—")
+            verdict_css = "pos" if verdict in ("可开多", "可开空") else ""
         rows.append(
-            "<tr>"
-            f"<td>{html.escape(str(row.get('symbol')))}</td>"
-            f"<td>{_money(row.get('price'))}</td>"
-            f"<td>{_pct(row.get('band_pct'))}</td>"
-            f"<td>{_pct(row.get('threshold_pct'))}</td>"
-            f"<td class=\"{gap_css}\">{gap_text}</td>"
-            f"<td>{int(row.get('dense_bars') or 0)}/{int(row.get('min_dense_bars') or 0)}</td>"
-            f"<td>{_money(row.get('sma20'))}</td>"
-            f"<td>{_money(row.get('sma200'))}</td>"
-            f"<td>{html.escape(time.strftime('%m-%d %H:%M', time.gmtime(nxt)) if nxt else '—')}</td>"
-            f"<td>{html.escape(str(row.get('reason') or '—'))}</td>"
-            "</tr>")
-    return ('<section id="block-symbols"><h2>⑤ 三标的动态（为什么没开单）</h2>'
-            f"<table>{head}{''.join(rows)}</table>"
+            "<div class='dyn-row'>"
+            f"<span class='nm'>{html.escape(str(row.get('symbol')))}</span>"
+            f"<span>{_money(row.get('price'))}</span>"
+            f"<span class=\"{'pos' if dense_ok else 'neg'}\" title=\"{html.escape(dense_title)}\">"
+            f"{dense_txt}</span>"
+            f"<span class=\"{css_long}\"><span class=\"dim\">↑{_money(row.get('ma_max'))}</span> {d_long}</span>"
+            f"<span class=\"{css_short}\"><span class=\"dim\">↓{_money(row.get('ma_min'))}</span> {d_short}</span>"
+            f"<span class=\"{m200_css}\">{m200_txt}</span>"
+            f"<span class=\"{stop_css}\">{stop_txt}</span>"
+            f"<span class=\"dim next\">{html.escape(time.strftime('%m-%d %H:%M', time.gmtime(nxt)) if nxt else '—')}</span>"
+            f"<span class=\"verdict {verdict_css}\">{html.escape(verdict)}</span>"
+            "</div>")
+    return ('<section id="block-symbols"><h2>⑤ 三标的动态（还差什么才开单）</h2>'
+            f"<div class='dyn'>{head}{''.join(rows)}</div>"
             f"{_warn_html(block.get('warnings'))}</section>")
 
 

@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import ast
+import html
 import gc
 import os
 import pathlib
@@ -677,6 +678,108 @@ class SymbolsBlockTests(unittest.TestCase):
         eth = [row for row in block["symbols"] if row["symbol"] == "ETH"][0]
         self.assertEqual(eth["blocked_by"], "no_data")
         self.assertTrue(any("ETH" in w for w in block["warnings"]))
+
+    # ---- 2026-10-28：距触发线 / 破线后止损 / 结论去重（用户拍板）
+    def test_row_exposes_distances_and_stop_preview(self) -> None:
+        """距上/下轨与破线后止损必须是可复算的派生值（不参与判定，只喂展示）。"""
+        bars = flat_bars(1_740_000_000_000, 420, 100.0)
+        panel = views.Panel(lambda: self.store,
+                            sources=views.Sources(bars=lambda s: bars,
+                                                  prices=lambda: {"BTC": 100.0}),
+                            now=lambda: T0)
+        row = panel.symbols_block()["symbols"][0]
+        for key in ("dist_long_pct", "dist_short_pct", "ma200_gap_pct",
+                    "stop_long_pct", "stop_short_pct", "verdict",
+                    "long_enabled", "short_enabled", "held_side"):
+            self.assertIn(key, row)
+        self.assertAlmostEqual(row["dist_long_pct"],
+                               (row["ma_max"] - row["price"]) / row["price"], places=12)
+        self.assertAlmostEqual(row["stop_long_pct"],
+                               (row["price"] - row["ma_min"]) / row["price"], places=12)
+        self.assertTrue(row["long_enabled"] and row["short_enabled"])
+
+    def test_direction_switch_reaches_explain_entry(self) -> None:
+        """关掉做多后，面板不得再判「可开多」（与执行器同一份 sides）。"""
+        bars = flat_bars(1_740_000_000_000, 420, 100.0)
+        panel = views.Panel(lambda: self.store,
+                            sources=views.Sources(bars=lambda s: bars),
+                            sides=(1,), now=lambda: T0)
+        row = panel.symbols_block()["symbols"][0]
+        self.assertFalse(row["short_enabled"])
+        self.assertTrue(row["long_enabled"])
+
+    def test_html_carries_the_new_columns_and_no_duplicate_numbers(self) -> None:
+        bars = flat_bars(1_740_000_000_000, 420, 100.0)
+        panel = views.Panel(lambda: self.store,
+                            sources=views.Sources(bars=lambda s: bars,
+                                                  prices=lambda: {"BTC": 100.0}),
+                            now=lambda: T0)
+        block = panel.symbols_block()
+        page = views._symbols_html(block)
+        for head in ("距上轨（开多）", "距下轨（开空）", "MA200（做空）", "破线后止损", "结论"):
+            self.assertIn(head, page)
+        self.assertNotIn("6MA 带宽%", page)          # 三列合并进「密集」一格
+        self.assertNotIn("连续密集根数", page)        # 根数在「密集」里，不再单列
+        row = block["symbols"][0]
+        self.assertIn(html.escape(row["verdict"]), page)
+
+
+class SymbolVerdictTests(unittest.TestCase):
+    """结论列：只说还差什么，不许复述数字（用户明确要求）。"""
+
+    def _row(self, **kw: Any) -> dict:
+        base = {"held_side": 0, "long_enabled": True, "short_enabled": True,
+                "fired": False, "side": 0, "blocked_by": "squeeze",
+                "gap_pct": 0.004, "dense_bars": 0, "min_dense_bars": 6,
+                "dist_long_pct": 0.01, "dist_short_pct": 0.03,
+                "stop_long_ok": True, "stop_short_ok": True, "below_ma200": True}
+        base.update(kw)
+        return base
+
+    def _verdict(self, **kw: Any) -> str:
+        return views._symbol_verdict(self._row(**kw))
+
+    def test_squeeze_states(self) -> None:
+        self.assertEqual(self._verdict(gap_pct=0.004), "等密集（带宽未进门槛）")
+        self.assertEqual(self._verdict(gap_pct=-0.002, dense_bars=3), "等密集根数")
+        self.assertEqual(self._verdict(gap_pct=-0.002, dense_bars=6), "等密集")
+
+    def test_breakout_picks_the_nearer_viable_side(self) -> None:
+        self.assertEqual(self._verdict(blocked_by="breakout", gap_pct=-0.002, dense_bars=6),
+                         "等破上轨")                       # 0.01 < 0.03
+        self.assertEqual(self._verdict(blocked_by="breakout", gap_pct=-0.002, dense_bars=6,
+                                       dist_long_pct=0.05, dist_short_pct=0.01), "等破下轨")
+
+    def test_breakout_respects_ma200_and_stop(self) -> None:
+        # 空单止损不合格 → 只剩上轨这一个方向可等
+        self.assertEqual(self._verdict(blocked_by="breakout", stop_short_ok=False), "等破上轨")
+        # 空单在 MA200 上方也不行
+        self.assertEqual(self._verdict(blocked_by="breakout", below_ma200=False), "等破上轨")
+        # 多空都不合格 → 说明白
+        self.assertEqual(self._verdict(blocked_by="breakout", stop_long_ok=False,
+                                       stop_short_ok=False),
+                         "等破线（另一侧前置条件未满足）")
+
+    def test_fired_and_held_and_disabled(self) -> None:
+        self.assertEqual(self._verdict(fired=True, side=1), "可开多")
+        self.assertEqual(self._verdict(fired=True, side=-1), "可开空")
+        self.assertEqual(self._verdict(held_side=1), "持仓中")
+        self.assertEqual(self._verdict(long_enabled=False, short_enabled=False),
+                         "多空双向都已关闭")
+
+    def test_never_repeats_column_numbers(self) -> None:
+        """结论里不允许出现数字：带宽/根数/百分比都在前面的列里。"""
+        cases = [
+            self._verdict(gap_pct=0.004),
+            self._verdict(gap_pct=-0.002, dense_bars=3),
+            self._verdict(blocked_by="breakout"),
+            self._verdict(blocked_by="regime"),
+            self._verdict(blocked_by="stop"),
+            self._verdict(fired=True, side=1),
+        ]
+        for text in cases:
+            # MA200 是线名不是「被复述的数字」，先剔掉再查
+            self.assertFalse(any(ch.isdigit() for ch in text.replace("MA200", "")), text)
 
 
 # --------------------------------------------------------------------------- 7. kill 开关
