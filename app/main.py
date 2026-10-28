@@ -252,6 +252,82 @@ def _limits_from_env() -> RiskLimits:
         return RiskLimits()
 
 
+async def _warm_panel_state(cache: "PanelCache", symbols: Sequence[str], *,
+                            reader: Any = None, prices: Any = None) -> None:
+    """启动时把账户读数与现价塞进面板缓存（**只读，绝不下单**）。
+
+    为什么需要：面板的现价/挂单/权益都来自 `PanelCache`，而它只由 tick 填。重启后到下一轮
+    tick 之间（最长 30 分钟）面板会显示「没有现价」「挂单读数尚未采集」两条 —— 看起来像
+    故障，其实只是冷的。这里在启动后立刻读一次（只读接口 + 公开盘口），把窗口压到几秒。
+
+    `reader` / `prices` 可注入（测试用）；凭据缺失或网络失败只记日志，不影响只读面板。
+    """
+    try:
+        if reader is None:
+            from app.config import Config
+            from app.executor import LighterAccountReader
+            from app.exchange import ExchangeClient
+
+            cfg = Config.from_env()
+            # dry_run=True：这个客户端**只用来签 auth token 读挂单**，任何下单都会被 LiveGate 拦。
+            exchange = ExchangeClient.from_config(cfg, env=os.environ, dry_run=True)
+            reader = LighterAccountReader(base_url=cfg.base_url,
+                                          account_index=cfg.account_index,
+                                          auth_provider=lambda: exchange.auth.get())
+    except Exception:                                     # noqa: BLE001 - 没凭据就不预热
+        logger.info("panel state warm-up skipped: credentials not configured")
+        return
+
+    equity = None
+    orders = None
+    error = ""
+    try:
+        account = await asyncio.to_thread(_read_account_sync, reader)
+        equity = getattr(account, "equity", None)
+        orders = [o.as_dict() for o in (getattr(account, "orders", ()) or ())]
+        error = str(getattr(account, "orders_error", "") or "")
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning("panel state warm-up (account) failed", exc_info=True)
+        error = f"{type(exc).__name__}: {exc}"
+
+    mid: Dict[str, float] = {}
+    try:
+        if prices is not None:
+            mid = {str(k).upper(): float(v) for k, v in dict(prices() or {}).items()}
+        else:
+            from app.market import DEFAULT_ENVIRONMENT, MarketClient
+
+            client = MarketClient((os.environ.get("LIGHTER_ENVIRONMENT") or "").strip()
+                                  or DEFAULT_ENVIRONMENT)
+            for symbol in symbols:
+                try:
+                    value = await asyncio.to_thread(
+                        lambda s=symbol: client.order_book(s, depth=5).mid)
+                except Exception:                         # noqa: BLE001 - 单个标的失败不影响其它
+                    logger.warning("panel state warm-up: no mid for %s", symbol, exc_info=True)
+                    continue
+                if value:
+                    mid[str(symbol).upper()] = float(value)
+    except Exception:                                     # noqa: BLE001
+        logger.warning("panel state warm-up (prices) failed", exc_info=True)
+
+    if equity is None and not mid and orders is None:
+        return
+    cache.update(equity=equity, orders=orders, prices=mid or None,
+                 ts=time.time(), error=error)
+    logger.info("panel state warmed: equity=%s orders=%s prices=%s",
+                equity, None if orders is None else len(orders), len(mid))
+
+
+def _read_account_sync(reader: Any) -> Any:
+    """在**没有事件循环**的线程里调 `reader.read()`（协程）。
+
+    `LighterAccountReader.read()` 是 async 的（内部已经 `to_thread` 做网络），这里在预热线程
+    里用 `asyncio.run` 跑它 —— 预热本来就在 `to_thread` 里，互不干扰。
+    """
+    return asyncio.run(reader.read())
+
+
 async def _warm_panel_bars(cache: "PanelCache", symbols: Sequence[str],
                            fetch: Optional[Callable[[str], Any]] = None) -> None:
     """启动时预热面板的 K 线缓存（后台任务，失败只记日志）。
@@ -346,8 +422,11 @@ class PanelCache:
 
     def orders(self) -> List[Dict[str, Any]]:
         if self.orders_value is None:
-            raise RuntimeError("交易所挂单读数尚未采集（调度器还没跑过一轮 tick，"
-                               "或本进程没有配置凭据）")
+            # 冷启动（刚重启、还没跑过 tick）和「本进程没有凭据」都会走到这里，但两者的
+            # 处置完全不同：前者等下一轮 tick 或启动预热即可，后者要去看配置。
+            # 文案里把「会自动恢复」写出来，免得被当成故障。
+            raise RuntimeError("交易所挂单读数尚未采集（冷启动窗口：等启动预热或下一轮 "
+                               "tick 后自动出现；若长期如此，检查本进程的凭据配置）")
         return list(self.orders_value)
 
     def prices(self) -> Dict[str, float]:
@@ -913,9 +992,11 @@ def create_app(*, panel: Optional[views.Panel] = None,
         # 启动时预热面板的 K 线缓存（后台任务）：把「首屏 25s」挪出用户请求路径。
         # 关掉用 PANEL_WARM_BARS=0（离线测试/不装行情源的部署）。
         if market_source and os.environ.get("PANEL_WARM_BARS", "1") != "0":
-            warm = asyncio.create_task(_warm_panel_bars(cache, symbols))
-            app.state.warm_task = warm
-            logger.info("panel bar warm-up scheduled")
+            app.state.warm_task = asyncio.create_task(_warm_panel_bars(cache, symbols))
+            # 账户/现价也预热一次：否则重启后到下一轮 tick 之间面板会显示
+            # 「没有现价」「挂单读数尚未采集」两条（看起来像故障，其实只是冷的）。
+            app.state.warm_state_task = asyncio.create_task(_warm_panel_state(cache, symbols))
+            logger.info("panel warm-up scheduled (bars + account/prices)")
         try:
             yield
         finally:
