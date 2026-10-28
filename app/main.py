@@ -979,6 +979,16 @@ def create_app(*, panel: Optional[views.Panel] = None,
     def events() -> JSONResponse:
         return JSONResponse(content=panel.events())
 
+    @app.get("/records", response_class=HTMLResponse)
+    def records_page() -> HTMLResponse:
+        """记录页：资金概览 + 订单明细 + 执行器事件流（首页不再渲染事件流）。"""
+        return HTMLResponse(content=panel.records_page())
+
+    @app.get("/api/records")
+    def records_json() -> JSONResponse:
+        """记录页的 JSON 形态（只读，排查/脚本用）。"""
+        return JSONResponse(content=panel.records())
+
     @app.get("/", response_class=HTMLResponse)
     def index() -> HTMLResponse:
         """自包含 HTML（内联 CSS + 内联 SVG，无 CDN、无外部 JS）。"""

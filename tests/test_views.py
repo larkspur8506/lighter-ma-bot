@@ -394,11 +394,24 @@ class HtmlTests(PanelFixture):
     def _html(self) -> str:
         return self.seeded_panel().page()
 
-    def test_html_contains_the_six_block_ids(self) -> None:
+    def test_homepage_contains_its_blocks_only(self) -> None:
+        """首页 ①–⑤（+人工操作）；事件流与订单明细在记录页。"""
         html = self._html()
-        for name in views.BLOCKS:
+        for name in views.HOMEPAGE_BLOCKS:
             with self.subTest(block=name):
                 self.assertIn(f'id="block-{name}"', html)
+        self.assertNotIn('id="block-events"', html)
+        self.assertNotIn('id="block-records"', html)
+        self.assertIn('href="/records"', html)                    # 首页有入口
+
+    def test_records_page_has_its_blocks(self) -> None:
+        html = self.seeded_panel().records_page()
+        for name in views.RECORDS_BLOCKS:
+            with self.subTest(block=name):
+                self.assertIn(f'id="block-{name}"', html)
+        self.assertIn('id="funds"', html)                         # 资金概览
+        self.assertIn("成交后余额", html)                          # 用户要的那一列
+        self.assertIn('href="/"', html)                           # 返回概览
 
     def test_html_is_self_contained(self) -> None:
         """自包含 = 没有外链（运行环境可能没外网；CDN 挂了就是空白页）。
@@ -444,8 +457,9 @@ class HtmlTests(PanelFixture):
 
     def test_html_escapes_database_text(self) -> None:
         self.store.log_event("skip", "<script>alert('x')</script> 未过密集门槛")
-        html = self._html()
+        html = self.seeded_panel().records_page()                 # 事件流在记录页
         self.assertNotIn("<script>alert", html)
+        self.assertIn("&lt;script&gt;", html)
         self.assertIn("&lt;script&gt;", html)
 
     def test_html_shows_key_numbers(self) -> None:
@@ -457,10 +471,66 @@ class HtmlTests(PanelFixture):
 
     def test_html_renders_with_no_data(self) -> None:
         """空库（0 值）也得出页面 —— 降级路径必须被渲染过。"""
-        html = self.panel().page()
-        for name in views.BLOCKS:
+        panel = self.panel()
+        html = panel.page()
+        for name in views.HOMEPAGE_BLOCKS:
             self.assertIn(f'id="block-{name}"', html)
         self.assertIn("数据不足", html)                  # 曲线占位文案
+        records = panel.records_page()                   # 记录页空库也要能开
+        self.assertIn('id="block-records"', records)
+        self.assertIn("还没有成交记录", records)
+
+
+class RecordsTests(PanelFixture):
+    """记录页：订单明细 + 「成交后余额」+ 资金概览（数据全部来自库，零网络）。"""
+
+    def _seed_trades(self):
+        store = self.store
+        # 两个权益点：T0+1h 1450，T0+2h 1500
+        store.record_equity(1450.0, ts=T0 + 3600, source="exchange")
+        store.record_equity(1500.0, ts=T0 + 7200, source="exchange")
+        # 开仓成交（在第一个权益点之前）→ 余额应取 1450（滞后 30 分钟）
+        store.record_trade(symbol="BTC", side=1, price=6500.0, qty=1.0, kind="entry",
+                           fee=0.5, fill_id="f1", ts=T0 + 1800)
+        store.record_trade(symbol="BTC", side=1, price=6600.0, qty=1.0, kind="exit",
+                           fee=0.6, realized_pnl=99.0, fill_id="f2", ts=T0 + 5400)
+
+    def test_records_block_has_rows_kinds_and_equity_after(self) -> None:
+        self._seed_trades()
+        block = self.panel().records()
+        self.assertEqual(block["count"], 2)
+        newest, oldest = block["trades"][0], block["trades"][1]     # 新→旧
+        self.assertEqual(newest["kind_text"], "离场")
+        self.assertEqual(oldest["kind_text"], "开仓")
+        self.assertEqual((oldest["side_text"], newest["side_text"]), ("多", "多"))
+        self.assertAlmostEqual(oldest["notional"], 6500.0, places=6)
+        # 「成交后余额」= 该笔之后最近的权益快照，并带上滞后
+        self.assertAlmostEqual(newest["equity_after"], 1500.0, places=6)
+        self.assertAlmostEqual(newest["equity_after_lag_s"], 1800.0, places=3)
+        self.assertAlmostEqual(oldest["equity_after"], 1450.0, places=6)
+
+    def test_equity_after_is_none_when_no_later_snapshot(self) -> None:
+        self.store.record_equity(1000.0, ts=T0, source="exchange")
+        self.store.record_trade(symbol="ETH", side=-1, price=2500.0, qty=0.5, kind="entry",
+                                fill_id="f3", ts=T0 + 60)
+        row = self.panel().records()["trades"][0]
+        self.assertIsNone(row["equity_after"])                     # 不许拿更早的权益冒充
+        self.assertEqual(row["side_text"], "空")
+
+    def test_funds_summary_matches_the_store(self) -> None:
+        self._seed_trades()
+        funds = self.panel().records()["funds"]
+        self.assertAlmostEqual(funds["equity"], 1500.0, places=6)
+        self.assertEqual(funds["trade_count"], 2)
+        self.assertAlmostEqual(funds["fee_total"], 1.1, places=6)
+        self.assertAlmostEqual(funds["realized_total"], 99.0, places=6)
+
+    def test_records_page_shows_the_balance_column(self) -> None:
+        self._seed_trades()
+        html = self.panel().records_page()
+        self.assertIn("成交后余额", html)
+        self.assertIn("1,500.00", html)
+        self.assertIn("离场", html)
 
 
 # --------------------------------------------------------------------------- 5. 降级
@@ -507,9 +577,12 @@ class DegradedTests(unittest.TestCase):
         self.assertTrue(all(row["price"] == 0.0 for row in symbols["symbols"]))
 
     def test_degraded_page_still_renders(self) -> None:
-        html = self._broken().page()
-        for name in views.BLOCKS:
+        panel = self._broken()
+        html = panel.page()
+        for name in views.HOMEPAGE_BLOCKS:
             self.assertIn(f'id="block-{name}"', html)
+        records = panel.records_page()                   # 记录页降级不崩
+        self.assertIn('id="block-records"', records)
         self.assertIn("⚠", html)                        # WARNING 有地方显示
 
     def test_a_broken_provider_only_degrades_its_own_block(self) -> None:

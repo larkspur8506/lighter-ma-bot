@@ -71,11 +71,15 @@ from app.risk import RiskLimits, drawdown as risk_drawdown
 from app.store import StateStore
 
 __all__ = [
-    "BLOCK_EVENTS", "BLOCK_PNL", "BLOCK_POSITIONS", "BLOCK_STATUS", "BLOCK_STOPS",
-    "BLOCK_SYMBOLS", "BLOCKS", "DEFAULT_SYMBOLS", "KILL_EVENT_KIND", "LEVERAGE",
-    "MAX_CURVE_POINTS", "MAX_EVENTS", "Panel", "Sources", "event_action", "kill_state",
-    "pnl_curve", "render_html", "set_kill",
+    "BLOCK_EVENTS", "BLOCK_PNL", "BLOCK_POSITIONS", "BLOCK_RECORDS", "BLOCK_STATUS",
+    "BLOCK_STOPS", "BLOCK_SYMBOLS", "BLOCKS", "DEFAULT_SYMBOLS", "HOMEPAGE_BLOCKS",
+    "KILL_EVENT_KIND", "LEVERAGE", "MAX_CURVE_POINTS", "MAX_EVENTS", "MAX_RECORD_ROWS",
+    "Panel", "RECORDS_BLOCKS", "Sources", "event_action", "kill_state", "pnl_curve",
+    "render_html", "render_records_html", "set_kill",
 ]
+
+#: 成交类型的展示文案（`trades.kind` 只有这三个取值，见 app/store 的 CHECK）
+_TRADE_KIND_TEXT = {"entry": "开仓", "exit": "离场", "stop": "止损"}
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +98,15 @@ BLOCK_EVENTS = "events"
 #: 六个区块（顺序 = 页面顺序；`render_html` 与测试都吃这个元组）
 BLOCKS: Tuple[str, ...] = (BLOCK_STATUS, BLOCK_POSITIONS, BLOCK_STOPS,
                            BLOCK_PNL, BLOCK_SYMBOLS, BLOCK_EVENTS)
+
+#: 记录页的两个区块（订单明细 + 执行器事件流）。事件流从首页挪到记录页：首页只回答
+#: 「现在怎么样」，历史与流水放记录页，两者职责不再混在一屏里。
+BLOCK_RECORDS = "records"
+HOMEPAGE_BLOCKS: Tuple[str, ...] = (BLOCK_STATUS, BLOCK_POSITIONS, BLOCK_STOPS,
+                                    BLOCK_PNL, BLOCK_SYMBOLS)
+RECORDS_BLOCKS: Tuple[str, ...] = (BLOCK_RECORDS, BLOCK_EVENTS)
+MAX_RECORD_ROWS = 200          # 记录页默认展示的成交笔数（一屏够用，翻页留到以后）
+EQUITY_AFTER_MAX_LAG_S = 6 * 3600.0   # 「成交后余额」最多回看这么久内的权益快照
 
 #: 事件流的条数（PLAN 第 5.5 节：最近 20 条）
 MAX_EVENTS = 20
@@ -1089,6 +1102,87 @@ class Panel:
                 "skipped_count": len(skipped), "limit": self.max_events,
                 "warnings": [], "degraded": False}
 
+    # ---------------------------------------------------------------- 记录页
+
+    def records(self) -> Dict[str, Any]:
+        """订单明细 + 资金概览（记录页）。数据全部来自库，不发任何网络请求。"""
+        return self._guard(BLOCK_RECORDS, self._records, _records_fallback)
+
+    def _records(self) -> Dict[str, Any]:
+        store = self.store()
+        if store is None:
+            return _records_fallback(f"数据库不可用: {self.store_error or 'unknown'}")
+        now = self._now()
+        warnings: List[str] = []
+        try:
+            trades = store.trades(limit=MAX_RECORD_ROWS)
+        except Exception as exc:                              # noqa: BLE001 - 单区块降级
+            return _records_fallback(f"读成交失败: {type(exc).__name__}: {exc}")
+        try:
+            points = store.equity_curve(limit=500)
+        except Exception as exc:                              # noqa: BLE001
+            points = []
+            warnings.append(f"读权益曲线失败: {type(exc).__name__}: {exc}")
+
+        stamps = [(_finite(_row_get(p, "ts")) or 0.0, _finite(_row_get(p, "equity")))
+                  for p in points]
+
+        rows: List[Dict[str, Any]] = []
+        fee_total = 0.0
+        for trade in trades:
+            ts = _finite(_row_get(trade, "ts")) or 0.0
+            qty = _finite(_row_get(trade, "qty")) or 0.0
+            price = _finite(_row_get(trade, "price")) or 0.0
+            fee = _finite(_row_get(trade, "fee")) or 0.0
+            fee_total += fee
+            side = int(_row_get(trade, "side") or 0)
+            kind = str(_row_get(trade, "kind") or "")
+            equity_after, lag = _equity_after(stamps, ts)
+            rows.append({
+                "id": int(_row_get(trade, "id") or 0),
+                "ts": ts,
+                "symbol": str(_row_get(trade, "symbol") or ""),
+                "side": side,
+                "side_text": "多" if side > 0 else ("空" if side < 0 else "—"),
+                "kind": kind,
+                "kind_text": _TRADE_KIND_TEXT.get(kind, kind or "—"),
+                "qty": qty, "price": price, "notional": qty * price,
+                "fee": fee, "fee_token": str(_row_get(trade, "fee_token") or ""),
+                "realized_pnl": _finite(_row_get(trade, "realized_pnl")),
+                "equity_after": equity_after, "equity_after_lag_s": lag,
+                "position_id": _row_get(trade, "position_id"),
+            })
+
+        last = points[-1] if points else None
+        first = points[0] if points else None
+        state = {}
+        try:
+            state = store.dd_state() or {}
+        except Exception as exc:                              # noqa: BLE001
+            warnings.append(f"读回撤状态失败: {type(exc).__name__}: {exc}")
+        funds = {
+            "equity": _finite(_row_get(last, "equity")),
+            "equity_ts": _finite(_row_get(last, "ts")),
+            "net_flow": _finite(_row_get(last, "cum_flow")),
+            "twr_index": _finite(_row_get(state, "twr_index")),
+            "twr_peak": _finite(_row_get(state, "twr_peak")),
+            "anchor_ts": _finite(_row_get(first, "ts")),
+            "anchor_equity": _finite(_row_get(first, "equity")),
+            "trade_count": int(store.trade_count() or 0),
+            "fee_total": fee_total,
+            "realized_total": float(store.realized_pnl() or 0.0),
+            "shown": len(rows),
+            "limit": MAX_RECORD_ROWS,
+        }
+        return {"as_of": now, "funds": funds, "trades": rows,
+                "count": len(rows), "warnings": warnings,
+                "degraded": bool(warnings), "block": BLOCK_RECORDS}
+
+    def records_page(self) -> str:
+        """记录页：资金概览 + 订单明细 + 执行器事件流（首页不再渲染事件流）。"""
+        return render_records_html(self.status(), self.records(), self.events(),
+                                   mode=self.mode, title="lighter-ma-bot 记录")
+
     # ---------------------------------------------------------------- 汇总 / HTML
 
     def snapshot(self) -> Dict[str, Any]:
@@ -1255,6 +1349,7 @@ tr:last-child td { border-bottom: none; }
             background: var(--warn-bg); border: 1px solid var(--warn-bd); color: var(--warn-fg);
             font-size: 12px; }
 .adminbar { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.navlink { font-size: 12px; font-weight: 400; margin-left: 8px; letter-spacing: 0; }
 button { padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
          background: var(--panel-2); color: var(--text); cursor: pointer; font: inherit; }
 button:hover { border-color: var(--btn-hover-bd); }
@@ -1489,7 +1584,32 @@ def _symbols_html(block: Mapping[str, Any]) -> str:
             f"{_warn_html(block.get('warnings'))}</section>")
 
 
-def _events_html(block: Mapping[str, Any]) -> str:
+def _equity_after(points: Sequence[Tuple[float, Optional[float]]], ts: float,
+                  *, max_lag_s: float = EQUITY_AFTER_MAX_LAG_S
+                  ) -> Tuple[Optional[float], Optional[float]]:
+    """某一笔成交之后的账户权益（「下单后的余额」那一列）。
+
+    权益点由每轮 tick 写（约 30 分钟一个），成交发生在两个点之间 ⇒ 取**该笔之后最近的
+    一个快照**，并把它滞后了多久一起返回（面板上标出来，别让人误以为那是成交瞬间的余额）。
+    超出 `max_lag_s`（默认 6h）或根本没有更晚的点 → `(None, None)`：宁可显示「—」，
+    也不要拿一笔更早的权益冒充「成交后」。
+    """
+    if not points or ts <= 0:
+        return None, None
+    best: Optional[Tuple[float, Optional[float]]] = None
+    for stamp, equity in points:                     # points 按 ts 升序，先命中就是最近的一个
+        if stamp >= ts:
+            best = (stamp, equity)
+            break
+    if best is None:
+        return None, None
+    lag = max(0.0, best[0] - ts)
+    if lag > max_lag_s:
+        return None, None
+    return best[1], lag
+
+
+def _events_html(block: Mapping[str, Any], *, heading: str = "") -> str:
     head = ("<tr><th>时间(UTC)</th><th>标的</th><th>动作</th><th>事件</th>"
             "<th>内容</th></tr>")
     rows = []
@@ -1506,10 +1626,124 @@ def _events_html(block: Mapping[str, Any]) -> str:
             f"<td style=\"text-align:left\">{html.escape(str(item.get('message') or ''))}</td>"
             "</tr>")
     empty = "" if rows else ('<tr><td colspan="5" class="dim">还没有事件</td></tr>')
-    return ('<section id="block-events"><h2>⑥ 执行器事件流（最近 '
-            f'{int(block.get("limit") or MAX_EVENTS)} 条）</h2>'
+    title = heading or f'⑥ 执行器事件流（最近 {int(block.get("limit") or MAX_EVENTS)} 条）'
+    return ('<section id="block-events"><h2>' + html.escape(title) + '</h2>'
             f"<table>{head}{''.join(rows)}{empty}</table>"
             f"{_warn_html(block.get('warnings'))}</section>")
+
+
+def _records_fallback(warning: str, *, as_of: Optional[float] = None) -> Dict[str, Any]:
+    """记录页的降级载荷（字段与正常载荷完全一致，0 值 + WARNING）。"""
+    return {
+        "as_of": _zero(as_of), "block": BLOCK_RECORDS,
+        "funds": {"equity": 0.0, "equity_ts": None, "net_flow": 0.0, "twr_index": None,
+                  "twr_peak": None, "anchor_ts": None, "anchor_equity": None,
+                  "trade_count": 0, "fee_total": 0.0, "realized_total": 0.0,
+                  "shown": 0, "limit": MAX_RECORD_ROWS},
+        "trades": [], "count": 0, "warnings": [warning], "degraded": True,
+    }
+
+
+def _funds_html(block: Mapping[str, Any]) -> str:
+    """① 资金概览：库里的权益/流水口径（与盈亏区块同源，不另算一套）。"""
+    funds = block.get("funds") or {}
+    equity = _finite(funds.get("equity"))
+    twr = _finite(funds.get("twr_index"))
+    peak = _finite(funds.get("twr_peak"))
+    drawdown = None
+    if twr is not None and peak:
+        drawdown = max(0.0, 1.0 - twr / peak)
+    equity_ts = _finite(funds.get("equity_ts"))
+    return ('<section id="funds"><h2>① 资金概览（库内权益与流水口径）</h2>'
+            '<div class="kv">'
+            f'最新权益 <b>{_money(equity)} U</b>'
+            f'{"（" + time.strftime("%m-%d %H:%M", time.gmtime(equity_ts)) + " UTC）" if equity_ts else ""}'
+            f' ｜ 净入金 {_money(funds.get("net_flow"))} U'
+            f' ｜ TWR <b>{_pct(twr)}</b>'
+            f' ｜ 峰值 {_pct(peak)} ｜ 当前回撤 {_pct(drawdown)}'
+            '</div>'
+            '<div class="kv">'
+            f'成交 {int(funds.get("trade_count") or 0)} 笔（本页展示最近 '
+            f'{int(funds.get("shown") or 0)} 笔）'
+            f' ｜ 已实现盈亏合计 <b class="{_cls(funds.get("realized_total"))}">'
+            f'{_money(funds.get("realized_total"))} U</b>'
+            f' ｜ 手续费合计 {_money(funds.get("fee_total"))} U'
+            '</div>'
+            '<div class="dim" style="margin-top:6px;font-size:11px">'
+            '口径：权益/净入金取自 equity_curve（每轮 tick 写一次）；已实现盈亏只算平仓/止损腿。'
+            '「成交后余额」= 该笔之后最近一次权益快照，括号内是滞后的时长。'
+            '</div>'
+            f'{_warn_html(block.get("warnings"))}</section>')
+
+
+def _records_html(block: Mapping[str, Any]) -> str:
+    """② 订单明细：标的 / 方向 / 数量 / 成交价 / 名义 / 手续费 / 成交后余额。"""
+    head = ("<tr><th>时间(UTC)</th><th>标的</th><th>方向</th><th>类型</th>"
+            "<th>数量</th><th>成交价</th><th>名义 (U)</th><th>手续费 (U)</th>"
+            "<th>已实现 (U)</th><th>成交后余额 (U)</th></tr>")
+    rows = []
+    for trade in block.get("trades") or ():
+        ts = _finite(trade.get("ts"))
+        side = int(trade.get("side") or 0)
+        side_css = "pos" if side > 0 else ("neg" if side < 0 else "dim")
+        after = _finite(trade.get("equity_after"))
+        lag = _finite(trade.get("equity_after_lag_s"))
+        after_text = ("—" if after is None else
+                      f"{after:,.2f}" + (f" <span class=\"dim\">+{_dur(lag)}</span>"
+                                         if lag else ""))
+        realized = _finite(trade.get("realized_pnl"))
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(time.strftime('%m-%d %H:%M:%S', time.gmtime(ts)) if ts else '—')}</td>"
+            f"<td>{html.escape(str(trade.get('symbol') or '—'))}</td>"
+            f"<td class=\"{side_css}\">{html.escape(str(trade.get('side_text') or '—'))}</td>"
+            f"<td>{html.escape(str(trade.get('kind_text') or '—'))}</td>"
+            f"<td>{_qty_text(trade.get('qty'))}</td>"
+            f"<td>{_money(trade.get('price'))}</td>"
+            f"<td>{_money(trade.get('notional'))}</td>"
+            f"<td>{_money(trade.get('fee'))}</td>"
+            f"<td class=\"{_cls(realized)}\">{'—' if realized is None else _money(realized)}</td>"
+            f"<td>{after_text}</td>"
+            "</tr>")
+    empty = "" if rows else ('<tr><td colspan="10" class="dim">还没有成交记录'
+                             '（信号 → 下单 → 成交后这里才会有行）</td></tr>')
+    return ('<section id="block-records"><h2>② 订单明细（最近 '
+            f'{int(block.get("limit") or MAX_RECORD_ROWS)} 笔，新→旧）</h2>'
+            f"<table>{head}{''.join(rows)}{empty}</table>"
+            f"{_warn_html(block.get('warnings'))}</section>")
+
+
+def render_records_html(status: Mapping[str, Any], records: Mapping[str, Any],
+                        events: Mapping[str, Any], *, mode: str = "live",
+                        title: str = "lighter-ma-bot 记录") -> str:
+    """记录页（自包含 HTML）：资金概览 + 订单明细 + 执行器事件流。
+
+    为什么单独一页：首页回答「现在怎么样」，记录页回答「发生过什么、钱怎么变的」。
+    两边共用同一份 `_CSS` 与内联脚本，没有外链。
+    """
+    generated = _finite(records.get("as_of")) or time.time()
+    body = [
+        _status_html(status, mode),
+        _funds_html(records),
+        _records_html(records),
+        _events_html(events, heading="③ 执行器事件流（最近 "
+                     f"{int((events or {}).get('limit') or MAX_EVENTS)} 条）"),
+    ]
+    return f"""<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)}</title>
+<style>{_CSS}</style>
+</head>
+<body><div class="wrap">
+<h1>{html.escape(title)} <a class="navlink" href="/">← 返回概览</a></h1>
+{''.join(body)}
+<footer>生成于 {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(generated))} UTC ·
+记录页（只读：成交与权益均来自本地库；账号私有读数由 tick 注入）</footer>
+<script>{_ADMIN_JS}</script>
+</div></body></html>
+"""
 
 
 # ------------------------------------------------------------------ 人工操作区
@@ -1585,7 +1819,7 @@ _ADMIN_JS = """
 def _admin_html() -> str:
     """⑦ 人工操作区：kill / 强制清仓 / 重置回撤峰值（三个写操作的唯一 UI 入口）。"""
     return (
-        '<section id="block-admin"><h2>⑦ 人工操作（admin token）</h2>'
+        '<section id="block-admin"><h2>⑥ 人工操作（admin token）</h2>'
         '<div class="adminbar">'
         '<button id="btn-kill-on" type="button">⛔ 停止开仓（kill ON）</button>'
         '<button id="btn-kill-off" type="button">▶ 恢复开仓（kill OFF）</button>'
@@ -1611,13 +1845,13 @@ def render_html(snapshot: Mapping[str, Any], *, symbols: Sequence[str] = DEFAULT
     blocks = snapshot.get("blocks") or {}
     status = blocks.get(BLOCK_STATUS) or _status_fallback("状态条缺失")
     generated = _finite(snapshot.get("as_of")) or time.time()
+    # 事件流已挪到记录页（首页只回答「现在怎么样」），编号随之从 ⑦ 变 ⑥。
     body = [
         _status_html(status, mode),
         _positions_html(blocks.get(BLOCK_POSITIONS) or _positions_fallback("缺失", symbols=symbols)),
         _stops_html(blocks.get(BLOCK_STOPS) or _stops_fallback("缺失")),
         _pnl_html(blocks.get(BLOCK_PNL) or _pnl_fallback("缺失")),
         _symbols_html(blocks.get(BLOCK_SYMBOLS) or _symbols_fallback("缺失", symbols=symbols)),
-        _events_html(blocks.get(BLOCK_EVENTS) or _events_fallback("缺失")),
         _admin_html(),
     ]
     return f"""<!doctype html>
@@ -1628,11 +1862,12 @@ def render_html(snapshot: Mapping[str, Any], *, symbols: Sequence[str] = DEFAULT
 <style>{_CSS}</style>
 </head>
 <body><div class="wrap">
-<h1>{html.escape(title)}</h1>
+<h1>{html.escape(title)} <a class="navlink" href="/records">记录页 →</a></h1>
 {''.join(body)}
 <footer>生成于 {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(generated))} UTC ·
-监控面板（读 DB + 公开行情；私有读数由 tick 注入） · 人工操作见⑦：
-kill / 清仓 / 重置回撤，用带 ?k=&lt;ADMIN_TOKEN&gt; 的链接打开一次即保存到本浏览器</footer>
+监控面板（读 DB + 公开行情；私有读数由 tick 注入） · 人工操作见⑥：
+kill / 清仓 / 重置回撤，用带 ?k=&lt;ADMIN_TOKEN&gt; 的链接打开一次即保存到本浏览器 ·
+成交与事件流见记录页</footer>
 <script>{_ADMIN_JS}</script>
 </div></body></html>
 """

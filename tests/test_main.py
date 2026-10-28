@@ -179,14 +179,23 @@ class ReadEndpointTests(StoreFixture):
         self.assertGreaterEqual(body["count"], 1)
         self.assertIn("跳过", [item["action"] for item in body["events"]])
 
-    def test_html_page_has_the_six_blocks(self) -> None:
+    def test_homepage_blocks_and_the_records_page(self) -> None:
+        """首页只回答「现在怎么样」；订单明细与事件流在 /records（2026-10-28 改版）。"""
         self.seed()
-        response = self.client().get("/")
+        client = self.client()
+        response = client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertIn("text/html", response.headers["content-type"])
-        for name in views.BLOCKS:
+        for name in views.HOMEPAGE_BLOCKS:
             with self.subTest(block=name):
                 self.assertIn(f'id="block-{name}"', response.text)
+        self.assertNotIn('id="block-events"', response.text)      # 已挪到记录页
+
+        records = client.get("/records")
+        self.assertEqual(records.status_code, 200)
+        for name in views.RECORDS_BLOCKS:
+            with self.subTest(block=name):
+                self.assertIn(f'id="block-{name}"', records.text)
 
     def test_declared_routes_are_exactly_the_intended_surface(self) -> None:
         app = main.create_app(admin_token="tok", limits=LIMITS)
@@ -227,10 +236,14 @@ class ReadEndpointDegradedTests(unittest.TestCase):
             raise RuntimeError("database is locked")
 
         app = main.create_app(store_factory=boom, limits=LIMITS)
-        response = TestClient(app).get("/")
+        client = TestClient(app)
+        response = client.get("/")
         self.assertEqual(response.status_code, 200)
-        for name in views.BLOCKS:
+        for name in views.HOMEPAGE_BLOCKS:
             self.assertIn(f'id="block-{name}"', response.text)
+        records = client.get("/records")                          # 记录页同样降级不崩
+        self.assertEqual(records.status_code, 200)
+        self.assertIn('id="block-records"', records.text)
 
 
 # --------------------------------------------------------------------------- 3. 定时口径
