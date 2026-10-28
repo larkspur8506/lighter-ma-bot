@@ -385,6 +385,23 @@ class HtmlTests(PanelFixture):
         self.assertIn("<svg", html)                     # 曲线是内联 SVG
         self.assertIn("<style>", html)                  # 样式内联
 
+    def test_theme_follows_the_system_without_a_toggle(self) -> None:
+        """明暗跟随系统：只有 prefers-color-scheme，没有按钮、没有 localStorage 偏好。
+
+        用户明确要求「不用给单独的按钮」——所以这条测试同时钉住两件事：
+        ① 亮色覆盖存在；② 页面上没有任何主题切换控件。
+        """
+        html = self._html()
+        self.assertIn("@media (prefers-color-scheme: light)", html)
+        self.assertIn("color-scheme: dark light", html)
+        # 颜色全部走变量（图表也是），否则亮色下会出现黑底图表/看不清的灰字
+        self.assertIn("var(--chart-bg)", html)
+        self.assertIn("var(--panel)", html)
+        for forbidden in ("btn-theme", "data-theme", "toggleTheme", "prefers-dark",
+                          'name="theme"'):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, html)
+
     def test_html_has_the_admin_block(self) -> None:
         """⑦ 人工操作区必须在页面上（kill / 强制清仓 / 重置回撤三个按钮）。"""
         html = self._html()

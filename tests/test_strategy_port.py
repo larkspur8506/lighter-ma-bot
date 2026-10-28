@@ -306,7 +306,40 @@ class ReferenceParityTest(unittest.TestCase):
         self.assertEqual(len(live), len(ref))
         self.assertGreaterEqual(len(live), 2)
 
-    def test_bars_too_short_produce_no_signals(self):
+    def test_short_is_blocked_while_price_is_above_sma200(self) -> None:
+        """做空趋势过滤（用户 2026-10-28 明确要核对的那条）。
+
+        判据在 `evaluate_entry`：`close < ma_min[i-1]` 破位后，还必须
+        `close < SMA200[i]`；SMA200 缺失（预热不足）同样拒绝（fail-closed）。
+        这里用最小可读的数据直接钉住三种情形：过滤成立 / 收盘在 MA200 上方被挡 /
+        MA200 算不出来被挡。止损距离用 2.5% 确保不会因为 [1.5%, 10%] 而误判。
+        """
+        from app.strategy import Bar, evaluate_entry, REGIME_MA
+
+        self.assertEqual(REGIME_MA, 200)
+        bars = [Bar(open_ms=i * BAR_MS, open=100.0, high=101.0, low=99.0,
+                    close=100.0, volume=1.0) for i in range(3)]
+        bars[2] = Bar(open_ms=2 * BAR_MS, open=100.0, high=101.0, low=96.0,
+                      close=97.0, volume=1.0)          # 收盘 97 < 下轨 99 → 破位
+        base = {"ma_max": [None, 101.0, 102.5], "ma_min": [None, 99.0, 97.0],
+                "band": [None, 0.02, 0.03], "sma200": [None, 90.0, 90.0]}
+
+        def run(sma200: float = 90.0, ma_min_prev: float = 99.0):
+            ind = {k: list(v) for k, v in base.items()}
+            ind["sma200"][2] = sma200
+            ind["ma_min"][1] = ma_min_prev
+            return evaluate_entry("SYN", bars, ind, [True, True, True], 2,
+                                  entry_price=97.0)
+
+        allowed = run()                       # 收盘 97 < SMA200 90? 否 → 应被挡
+        self.assertIsNone(allowed, "收盘 97 高于 SMA200 90，做空必须被挡")
+        below = run(sma200=120.0)             # 收盘 97 < 120 → 过滤成立
+        self.assertIsNotNone(below, "收盘 97 低于 SMA200 120，应给出做空信号")
+        self.assertEqual((below.side, round(below.stop_dist, 4)), (-1, 0.0567))
+        missing = run(sma200=None)            # 预热不足 → fail-closed
+        self.assertIsNone(missing, "SMA200 未算出时不得做空")
+
+    def test_bars_too_short_produce_no_signals(self) -> None:
         short = plateau_breakout_bars()[:strategy.MIN_BARS_REQUIRED - 1]
         self.assertEqual(strategy.scan(short, symbol="SYN", sides=(1, -1)), [])
         self.assertEqual(reference.find_signals(short, sides=(1, -1)), [])

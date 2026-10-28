@@ -1180,52 +1180,76 @@ def _events_fallback(warning: str) -> Dict[str, Any]:
 
 
 _CSS = """
-:root { color-scheme: dark; }
+/* 明暗跟随系统：不设按钮、不存偏好 —— 浏览器的 prefers-color-scheme 就是唯一开关。
+   所有颜色走 CSS 变量；内联 SVG 图表用同一批变量（SVG 在文档里，能读到 var()）。 */
+:root {
+  color-scheme: dark light;
+  --bg: #12151a; --panel: #1a1f27; --panel-2: #232a34;
+  --border: #262d38; --row: #232a34;
+  --text: #e6e8eb; --muted: #9aa4b2; --dim: #6b7684; --link: #6ea8fe;
+  --ok: #38c172; --warn: #e3a008; --bad: #e3342f;
+  --ok-bg: #16241d; --ok-bd: #2f6f4f;
+  --warn-bg: #241f14; --warn-bd: #7a6320; --warn-fg: #e3c169;
+  --bad-bg: #2a1616; --bad-bd: #8a2f2f; --bad-fg: #ffb4b4;
+  --btn-hover-bd: #3a4556; --chart-bg: #151a21; --chart-grid: #2b333f;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f5f7fa; --panel: #ffffff; --panel-2: #eef1f5;
+    --border: #d9dee6; --row: #e9edf2;
+    --text: #161a1f; --muted: #5a6673; --dim: #8b95a3; --link: #1f6feb;
+    --ok: #17864f; --warn: #9a6a05; --bad: #c0392b;
+    --ok-bg: #e9f6ee; --ok-bd: #a5d6b8;
+    --warn-bg: #fdf5e2; --warn-bd: #e2cb92; --warn-fg: #7a5a0d;
+    --bad-bg: #fdecea; --bad-bd: #e6b0a8; --bad-fg: #8c1d18;
+    --btn-hover-bd: #b7c0cc; --chart-bg: #ffffff; --chart-grid: #dde3ea;
+  }
+}
 * { box-sizing: border-box; }
-body { margin: 0; padding: 12px; background: #12151a; color: #e6e8eb;
+body { margin: 0; padding: 12px; background: var(--bg); color: var(--text);
        font: 13px/1.45 -apple-system, "Segoe UI", "Noto Sans SC", sans-serif; }
 h1 { font-size: 15px; margin: 0 0 6px; font-weight: 600; letter-spacing: .02em; }
-h2 { font-size: 13px; margin: 0 0 8px; font-weight: 600; color: #9aa4b2;
+h2 { font-size: 13px; margin: 0 0 8px; font-weight: 600; color: var(--muted);
      text-transform: uppercase; letter-spacing: .06em; }
-a { color: #6ea8fe; }
+a { color: var(--link); }
 .wrap { max-width: 1080px; margin: 0 auto; }
 .bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
-       padding: 10px 12px; border-radius: 8px; background: #1a1f27;
-       border: 1px solid #262d38; margin-bottom: 12px; }
-.bar.ok { border-color: #2f6f4f; background: #16241d; }
-.bar.warn { border-color: #7a6320; background: #241f14; }
-.bar.alert { border-color: #8a2f2f; background: #2a1616; }
+       padding: 10px 12px; border-radius: 8px; background: var(--panel);
+       border: 1px solid var(--border); margin-bottom: 12px; }
+.bar.ok { border-color: var(--ok-bd); background: var(--ok-bg); }
+.bar.warn { border-color: var(--warn-bd); background: var(--warn-bg); }
+.bar.alert { border-color: var(--bad-bd); background: var(--bad-bg); }
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
-.dot.ok { background: #38c172; } .dot.warn { background: #e3a008; }
-.dot.alert { background: #e3342f; }
-.kv { color: #9aa4b2; } .kv b { color: #e6e8eb; font-weight: 600; }
+.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); }
+.dot.alert { background: var(--bad); }
+.kv { color: var(--muted); } .kv b { color: var(--text); font-weight: 600; }
 .reasons { margin: 0 0 12px; padding: 8px 12px; border-radius: 8px;
-           background: #2a1616; border: 1px solid #8a2f2f; color: #ffb4b4; }
-section { background: #1a1f27; border: 1px solid #262d38; border-radius: 8px;
+           background: var(--bad-bg); border: 1px solid var(--bad-bd); color: var(--bad-fg); }
+section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
           padding: 12px; margin-bottom: 12px; overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-th, td { text-align: right; padding: 5px 7px; border-bottom: 1px solid #232a34;
+th, td { text-align: right; padding: 5px 7px; border-bottom: 1px solid var(--row);
          white-space: nowrap; }
-th { color: #9aa4b2; font-weight: 500; font-size: 12px; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
 th:first-child, td:first-child { text-align: left; }
 tr:last-child td { border-bottom: none; }
-.pos { color: #38c172; } .neg { color: #e3342f; } .dim { color: #6b7684; }
-.bad { color: #ff6b6b; font-weight: 600; }
+.pos { color: var(--ok); } .neg { color: var(--bad); } .dim { color: var(--dim); }
+.bad { color: var(--bad); font-weight: 600; }
 .warnlist { margin: 8px 0 0; padding: 6px 10px; border-radius: 6px;
-            background: #241f14; border: 1px solid #7a6320; color: #e3c169;
+            background: var(--warn-bg); border: 1px solid var(--warn-bd); color: var(--warn-fg);
             font-size: 12px; }
 .adminbar { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
-button { padding: 6px 12px; border-radius: 6px; border: 1px solid #262d38;
-         background: #232a34; color: #e6e8eb; cursor: pointer; font: inherit; }
-button:hover { border-color: #3a4556; }
-button.danger { border-color: #8a2f2f; background: #2a1616; color: #ff9d9d; }
-code { background: #232a34; padding: 1px 5px; border-radius: 4px; }
+button { padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
+         background: var(--panel-2); color: var(--text); cursor: pointer; font: inherit; }
+button:hover { border-color: var(--btn-hover-bd); }
+button.danger { border-color: var(--bad-bd); background: var(--bad-bg); color: var(--bad-fg); }
+code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
 .tag { display: inline-block; padding: 1px 6px; border-radius: 4px;
-       background: #232a34; color: #9aa4b2; font-size: 11px; }
-.tag.skip { background: #241f14; color: #e3c169; }
-.tag.kill { background: #2a1616; color: #ff9d9d; }
+       background: var(--panel-2); color: var(--muted); font-size: 11px; }
+.tag.skip { background: var(--warn-bg); color: var(--warn-fg); }
+.tag.kill { background: var(--bad-bg); color: var(--bad-fg); }
 svg { display: block; width: 100%; height: auto; }
-footer { color: #6b7684; font-size: 11px; padding: 4px 2px 20px; }
+footer { color: var(--dim); font-size: 11px; padding: 4px 2px 20px; }
 @media (max-width: 640px) { body { padding: 8px; } th, td { padding: 4px 5px; } }
 """
 
@@ -1253,7 +1277,7 @@ def _svg_curve(points: Sequence[Mapping[str, Any]], *, width: int = 720,
     pts = [p for p in points or () if _finite(p.get("ts")) is not None]
     if len(pts) < 2:
         return ('<svg viewBox="0 0 %d %d" role="img" aria-label="盈亏曲线">'
-                '<text x="12" y="28" fill="#6b7684" font-size="12">'
+                '<text x="12" y="28" fill="var(--dim)" font-size="12">'
                 '数据不足（至少需要 2 个权益点）</text></svg>' % (width, height))
     pad_l, pad_r, pad_t, pad_b = 48, 52, 14, 24
     ts0 = float(pts[0]["ts"])
@@ -1287,23 +1311,23 @@ def _svg_curve(points: Sequence[Mapping[str, Any]], *, width: int = 720,
     parts = [
         f'<svg viewBox="0 0 {width} {height}" preserveAspectRatio="none" '
         f'role="img" aria-label="盈亏曲线：实线累计盈亏(U)，虚线 TWR 收益指数(%)">',
-        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#151a21"/>',
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="var(--chart-bg)"/>',
         f'<line x1="{pad_l}" y1="{zero_y:.1f}" x2="{width - pad_r}" y2="{zero_y:.1f}" '
-        f'stroke="#2b333f" stroke-width="1" stroke-dasharray="3 3"/>',
-        f'<polyline points="{solid}" fill="none" stroke="#38c172" stroke-width="1.8"/>',
-        f'<polyline points="{dashed}" fill="none" stroke="#6ea8fe" stroke-width="1.6" '
+        f'stroke="var(--chart-grid)" stroke-width="1" stroke-dasharray="3 3"/>',
+        f'<polyline points="{solid}" fill="none" stroke="var(--ok)" stroke-width="1.8"/>',
+        f'<polyline points="{dashed}" fill="none" stroke="var(--link)" stroke-width="1.6" '
         f'stroke-dasharray="5 4"/>',
-        f'<text x="{pad_l - 6}" y="{pad_t + 10}" fill="#38c172" font-size="11" '
+        f'<text x="{pad_l - 6}" y="{pad_t + 10}" fill="var(--ok)" font-size="11" '
         f'text-anchor="end">{p_hi:+.2f}</text>',
-        f'<text x="{pad_l - 6}" y="{pad_t + inner_h:.1f}" fill="#38c172" font-size="11" '
+        f'<text x="{pad_l - 6}" y="{pad_t + inner_h:.1f}" fill="var(--ok)" font-size="11" '
         f'text-anchor="end">{p_lo:+.2f}</text>',
-        f'<text x="{width - pad_r + 6}" y="{pad_t + 10}" fill="#6ea8fe" font-size="11">'
+        f'<text x="{width - pad_r + 6}" y="{pad_t + 10}" fill="var(--link)" font-size="11">'
         f'{t_hi:.2f}%</text>',
-        f'<text x="{width - pad_r + 6}" y="{pad_t + inner_h:.1f}" fill="#6ea8fe" '
+        f'<text x="{width - pad_r + 6}" y="{pad_t + inner_h:.1f}" fill="var(--link)" '
         f'font-size="11">{t_lo:.2f}%</text>',
-        f'<text x="{pad_l}" y="{height - 6}" fill="#6b7684" font-size="10">'
+        f'<text x="{pad_l}" y="{height - 6}" fill="var(--dim)" font-size="10">'
         f'{time.strftime("%m-%d %H:%M", time.gmtime(ts0))} UTC</text>',
-        f'<text x="{width - pad_r}" y="{height - 6}" fill="#6b7684" font-size="10" '
+        f'<text x="{width - pad_r}" y="{height - 6}" fill="var(--dim)" font-size="10" '
         f'text-anchor="end">{time.strftime("%m-%d %H:%M", time.gmtime(ts1))} UTC</text>',
         "</svg>",
     ]
@@ -1495,7 +1519,7 @@ _ADMIN_JS = """
     var el = document.getElementById('admin-msg');
     el.style.display = 'block';
     el.textContent = text;
-    el.style.borderColor = bad ? '#8a2f2f' : '#2f6f4f';
+    el.style.borderColor = bad ? 'var(--bad-bd)' : 'var(--ok-bd)';
   }
   function post(path, params) {
     var t = token();
