@@ -761,7 +761,8 @@ def _default_panel_sources(cache: "PanelCache",
                 bars._source = source                         # type: ignore[attr-defined]
             return source(symbol)
     return views.Sources(equity=cache.equity, orders=cache.orders,
-                         prices=cache.prices, bars=bars)
+                         prices=cache.prices, bars=bars,
+                         cached_bars=cache.bars)
 
 
 async def _admin_params(request: Request) -> Dict[str, str]:

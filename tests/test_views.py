@@ -359,6 +359,37 @@ class SixBlockTests(PanelFixture):
 # --------------------------------------------------------------------------- 4. HTML
 
 
+class DataSourceProbeTests(PanelFixture):
+    """`/status` 的「数据源新鲜度」不许自己发网络请求。
+
+    实测（2026-10-28）：容器重启后第一次 `/status` 要 24s —— 因为状态条为了拿一个时间戳，
+    经 `sources.bars` 把 3 标的 × 8 页 K 线全拉了一遍。现在有 `cached_bars` 时只读缓存，
+    缓存没铺满就退回「最后一个权益点」的口径。
+    """
+
+    def _bars(self, end_s: float, count: int = 3):
+        from app.strategy import Bar
+
+        return [Bar(open_ms=int((end_s - (count - i) * BAR_S) * 1000), open=100.0, high=101.0,
+                    low=99.0, close=100.0, volume=1.0) for i in range(count)]
+
+    def test_status_never_calls_the_network_probe(self) -> None:
+        def boom(_symbol):
+            raise AssertionError("状态条不该为新鲜度去拉 K 线")
+
+        sources = views.Sources(bars=boom, cached_bars=lambda s: [])
+        panel = self.panel(sources=sources)
+        payload = panel.status()                       # 不抛 = 没走网络路径
+        self.assertEqual(payload["data_source"]["name"], "equity_curve")
+
+    def test_status_prefers_cached_bars(self) -> None:
+        bars = self._bars(self.now - BAR_S)
+        sources = views.Sources(bars=lambda s: None, cached_bars=lambda s: bars)
+        payload = self.panel(sources=sources).status()
+        self.assertEqual(payload["data_source"]["name"], "bar")
+        self.assertLessEqual(payload["data_source"]["age_s"], BAR_S + 1)
+
+
 class HtmlTests(PanelFixture):
     def _html(self) -> str:
         return self.seeded_panel().page()
