@@ -164,18 +164,20 @@ async def _run(args: argparse.Namespace) -> int:
         emit(Step("place_entry", entry.ok, entry.as_dict()))
         if not entry.ok:
             return 4
+        opened = False
 
         if not args.dry_run:
-            await asyncio.sleep(2.0)
-            account = await reader.read()
-            position = account.position_for(plan.symbol)
-            emit(Step("read_position", position is not None,
-                      {"positions": [p.as_dict() for p in account.positions],
+            ok, account, waited = await _wait_for(
+                reader.read, lambda a: a.position_for(plan.symbol) is not None)
+            opened = ok
+            emit(Step("read_position", ok,
+                      {"waited_s": waited,
+                       "positions": [p.as_dict() for p in account.positions],
                        "orders": len(account.orders)}))
-            if position is None:
+            if not ok:
                 print(json.dumps({"ok": False,
-                                  "error": "开仓 tx 已发出但账户里没有仓位：要么未成交、"
-                                           "要么账本与交易所不一致，需人工核对"}))
+                                  "error": "开仓 tx 已发出但 15s 内账户里没有仓位："
+                                           "要么未成交、要么账本不一致，需人工核对"}))
                 return 5
 
         stop: OrderResult = await exchange.place_stop(plan, bar_ms=int(time.time() // 240) * 240_000)
@@ -184,21 +186,24 @@ async def _run(args: argparse.Namespace) -> int:
             raise RuntimeError("止损挂单失败")
 
         if not args.dry_run:
-            account = await reader.read()
-            stop_present = any(o.reduce_only for o in account.orders)
-            emit(Step("verify_stop_resting", stop_present, {
-                "orders": [o.as_dict() for o in account.orders]}))
-            if not stop_present:
-                raise RuntimeError("止损单没有出现在挂单列表里")
+            # 实测：`accountActiveOrders` 对新挂单有秒级传播延迟（2s 时读到空列表，
+            # 半分钟后才出现）⇒ 一次性读会误判「止损没挂上」，必须轮询。
+            ok, account, waited = await _wait_for(
+                reader.read, lambda a: any(o.reduce_only for o in a.orders))
+            emit(Step("verify_stop_resting", ok,
+                      {"waited_s": waited,
+                       "orders": [o.as_dict() for o in account.orders]}))
+            if not ok:
+                raise RuntimeError("15s 内止损单没有出现在挂单列表里")
 
         cancel: OrderResult = await exchange.cancel_all_orders()
         emit(Step("cancel_all", cancel.ok, cancel.as_dict()))
 
         if not args.dry_run:
-            account = await reader.read()
-            emit(Step("verify_orders_cleared", not account.orders,
-                      {"orders": len(account.orders)}))
-            if account.orders:
+            ok, account, waited = await _wait_for(reader.read, lambda a: not a.orders)
+            emit(Step("verify_orders_cleared", ok,
+                      {"waited_s": waited, "orders": len(account.orders)}))
+            if not ok:
                 raise RuntimeError("撤单后仍有挂单")
 
         exit_result: OrderResult = await exchange.place_exit(
@@ -208,12 +213,12 @@ async def _run(args: argparse.Namespace) -> int:
         emit(Step("place_exit", exit_result.ok, exit_result.as_dict()))
 
         if not args.dry_run:
-            await asyncio.sleep(2.0)
-            account = await reader.read()
-            flat = not account.positions
-            emit(Step("verify_flat", flat, {"positions": [p.symbol for p in account.positions],
-                                            "equity": account.equity}))
-            if not flat:
+            ok, account, waited = await _wait_for(reader.read, lambda a: not a.positions)
+            emit(Step("verify_flat", ok,
+                      {"waited_s": waited,
+                       "positions": [p.symbol for p in account.positions],
+                       "equity": account.equity}))
+            if not ok:
                 raise RuntimeError("平仓后仍有持仓")
 
         ended_clean = all(s.ok for s in steps) if not args.dry_run else True
@@ -222,11 +227,77 @@ async def _run(args: argparse.Namespace) -> int:
                                         if s.as_dict().get("tx_hash")]},
                          ensure_ascii=False))
         return 0 if ended_clean else 6
+    except Exception as exc:                               # noqa: BLE001 - 先收尾再报错
+        print(json.dumps({"error": f"{type(exc).__name__}: {exc}",
+                          "cleanup": "开始收尾（撤单 + 平仓）"}, ensure_ascii=False))
+        if not args.dry_run:
+            await _emergency_flat(exchange, reader, plan)
+        raise
     finally:
         try:
             await exchange.aclose()
         except Exception:                                  # noqa: BLE001
             pass
+
+
+async def _wait_for(read, predicate, *, timeout_s: float = 15.0,
+                    interval: float = 0.5):
+    """轮询交易所读数直到 `predicate` 成立；返回 `(ok, 最后一次读数, 等待秒数)`。
+
+    为什么必须轮询：`accountActiveOrders` 对新挂单有秒级传播延迟（实测 2s 时读不到、
+    半分钟后才出现）。一次性读会把「还没传播到」误判成「没挂上」。
+    """
+    started = time.time()
+    while True:
+        snapshot = await read()
+        if predicate(snapshot):
+            return True, snapshot, round(time.time() - started, 1)
+        if time.time() - started >= timeout_s:
+            return False, snapshot, round(time.time() - started, 1)
+        await asyncio.sleep(interval)
+
+
+async def _emergency_flat(exchange, reader, plan) -> None:
+    """失败路径：撤掉所有挂单，再把仓位按对手价市价平掉。**尽力而为**。
+
+    这条路径是给「止损没挂上就报错退出」这种情况兜底的 —— 没有它，脚本一报错就会把
+    一个裸仓留在交易所（第一次实跑就是这么留下 0.117 SOL 的）。
+    """
+    try:
+        account = await reader.read()
+    except Exception as exc:                               # noqa: BLE001
+        print(json.dumps({"cleanup": "failed", "error": f"读取账户失败：{exc}"},
+                         ensure_ascii=False))
+        return
+    position = account.position_for(plan.symbol) if plan else None
+    if account.orders:
+        try:
+            res = await exchange.cancel_all_orders()
+            print(json.dumps({"cleanup": "cancel_all", "ok": res.ok,
+                              "error": res.error}, ensure_ascii=False))
+        except Exception as exc:                           # noqa: BLE001
+            print(json.dumps({"cleanup": "cancel_all failed", "error": str(exc)},
+                             ensure_ascii=False))
+    if position is None:
+        print(json.dumps({"cleanup": "flat", "note": "没有持仓，无需平仓"},
+                         ensure_ascii=False))
+        return
+    try:
+        from app.market import MarketClient as _MC
+        cfg = Config.from_env()
+        mid = _MC(cfg.environment).order_book(position.symbol, depth=5).mid
+        res = await exchange.place_exit(
+            symbol=position.symbol, market_id=int(position.market_id or plan.market_id),
+            side=position.side, qty_int=int(round(float(position.qty) * 10 ** int(plan.size_decimals))),
+            price_decimals=int(plan.price_decimals), exit_price=float(mid),
+            bar_ms=int(time.time() // 240) * 240_000)
+        print(json.dumps({"cleanup": "exit", "ok": res.ok, "error": res.error,
+                          "tx_hash": res.tx_hash}, ensure_ascii=False))
+    except Exception as exc:                               # noqa: BLE001
+        print(json.dumps({"cleanup": "exit failed",
+                          "error": f"{type(exc).__name__}: {exc}",
+                          "manual": f"手工平掉 {position.symbol} {position.side} {position.qty}"},
+                         ensure_ascii=False))
 
 
 def main(argv: Optional[list] = None) -> int:

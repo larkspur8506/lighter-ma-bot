@@ -842,5 +842,30 @@ class ImportBoundaryTests(unittest.TestCase):
                          f"面板的 import 图里出现了私钥路径: {result.stdout}")
 
 
+class LiveGateStatusTests(unittest.TestCase):
+    """状态条必须说清「在跑但永远不会下单」——2026-10-28 实测踩到的坑。
+
+    `.env` 里 `LIGHTER_LEVERAGE=5` 与 `LIGHTER_LIVE_ACCOUNT_INDEX=764377` 粘成一行时，
+    后者被吞进前者；`LiveGate` 的第二道门永远拒绝下单，而面板/心跳全绿。
+    """
+
+    def test_live_flag_without_account_index_is_surfaced(self) -> None:
+        status = main.credential_status({"LIGHTER_LIVE_TRADING": "1",
+                                         "LIGHTER_ACCOUNT_INDEX": "764377"})
+        self.assertIs(status["live_gate"]["ok"], False)
+        self.assertIn("LIGHTER_LIVE_ACCOUNT_INDEX", status["detail"])
+
+    def test_live_gate_ok_when_the_account_is_declared(self) -> None:
+        status = main.credential_status({"LIGHTER_LIVE_TRADING": "1",
+                                         "LIGHTER_LIVE_ACCOUNT_INDEX": "764377"})
+        self.assertIs(status["live_gate"]["ok"], True)
+        self.assertEqual(status["live_gate"]["declared_account"], 764377)
+
+    def test_dry_mode_never_warns_about_the_gate(self) -> None:
+        status = main.credential_status({"LIGHTER_LIVE_TRADING": "0"})
+        self.assertIs(status["live_gate"]["ok"], True)
+        self.assertIs(status["live_gate"]["enabled"], False)
+
+
 if __name__ == "__main__":
     unittest.main()
