@@ -304,6 +304,16 @@ T9 **不做**的事（都在 T10）：
 | 事项 | T9 提供 | T10 要做 |
 |---|---|---|
 | 每轮 tick 推进 TWR | `DrawdownGuard.update(equity=…, ts=…, flows=…)` | 在 `executor.run_once()` 之后调一次，`flows` 从交易所出入金流水来 |
+
+**流水来源的实测修正（2026-10-28）**：`/transfer/history` 对 UDA 桥接入金**恒空**
+（SDK `TransferHistoryItem` 枚举无 deposit 类；官方前端走 WS 私有频道，无 REST 替代）。
+首次 bootstrap 之后再入金，权益跳变会被全额当成交易盈利（真实事故：399 USDC 入金 →
+`cum_pnl=399`、TWR +395%）。修法：无持仓、区间内无成交时由权益跳变**推断**流水 ——
+`app/executor.infer_transfer_flow`（纯函数，三前提缺一不推断）→ `app/main._inferred_flow_for_tick`
+（落 `account_flows` 表 + 落 `flow_inferred` 事件）→ 每轮 `_stored_flows_for_replay`
+把全量流水喂回 `update()` 的重放。已发生但未推断的入金需人工补录
+（`store.record_flow(amount, ts, source='manual')`）并重置回撤峰值（峰值只升不降，
+重放修好也不会把它降回来）。
 | 心跳 | `watchdog.record_heartbeat(store)` | 调度器每轮调一次 |
 | `/health` 探针 | `default_health_probe(url)` | 保证 `/health` 200；容器内 URL 用 `127.0.0.1:8000` |
 | bar_state 探针 | `BarStateProbe(market, symbols)` 或 `Watchdog(market=…)` | 把 `MarketClient` 传进来 |

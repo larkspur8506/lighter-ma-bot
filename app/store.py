@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ 常量
 
-SCHEMA_VERSION = 2                      # 当前代码认得的库版本（PRAGMA user_version）
+SCHEMA_VERSION = 3                      # 当前代码认得的库版本（PRAGMA user_version）
 DEFAULT_BUSY_TIMEOUT_MS = 5000          # 面板进程同时读时，写方最多等 5s 再报 busy
 BASE_TWR_INDEX = 1.0                    # TWR 指数基准（建仓/重置时 = 1.0）
 DD_STATE_KEY = "live"                   # dd_state 的单行主键
@@ -435,9 +435,28 @@ _MIGRATION_2: Tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_daily_counters_day ON daily_counters(day)",
 )
 
+#: 版本 3：出入金流水表（`transfer/history` 对 UDA 入金恒空，TWR 剔出入金改靠
+#: 推断流水落库 —— `app/executor.infer_transfer_flow` 的持久化端）。
+_MIGRATION_3: Tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS account_flows (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts          REAL    NOT NULL,              -- 流水时刻（epoch 秒，正=入金负=出金的发生时刻）
+        amount      REAL    NOT NULL,              -- 带符号 USDC（正 = 净入金）
+        source      TEXT    NOT NULL,              -- inferred | manual
+        note        TEXT    NOT NULL DEFAULT '',
+        created_at  REAL    NOT NULL
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_account_flows_dedupe "
+    "ON account_flows(source, ts, amount)",
+    "CREATE INDEX IF NOT EXISTS idx_account_flows_ts ON account_flows(ts)",
+)
+
 #: `{目标版本: 该版本的语句}`。新增版本只往后追加，**永不改已发布的语句** —— 那是老库
 #: 升级路径唯一的依据（改一个字符，已升级过的库和新建的库就会分叉）。
-MIGRATIONS: Mapping[int, Tuple[str, ...]] = {1: _MIGRATION_1, 2: _MIGRATION_2}
+MIGRATIONS: Mapping[int, Tuple[str, ...]] = {1: _MIGRATION_1, 2: _MIGRATION_2,
+                                             3: _MIGRATION_3}
 
 
 class AuditFinding(dict):
@@ -1158,7 +1177,42 @@ class StateStore:
                                  (_finite(since, default=0.0),))
         return float(value or 0.0)
 
-    # ------------------------------------------------------------ 权益曲线
+    # ------------------------------------------------------------ 出入金流水
+
+    def record_flow(self, amount: float, *, ts: Optional[float] = None,
+                    source: str = "inferred", note: str = "") -> bool:
+        """写一条带符号流水（正 = 净入金）。返回 True = 新插入，False = 幂等命中。
+
+        幂等键 = `(source, ts, amount)`：同一笔流水被推断/补录两次时只落一行。
+        `ts` 必须是正的有限 epoch 秒 —— 流水落在哪个重放窗口全靠它，脏时间戳宁可不收。
+        """
+        stamp = _finite(ts)
+        if stamp is None or stamp <= 0:
+            raise StoreError(f"flow ts must be a positive finite epoch second, got {ts!r}")
+        value = _finite(amount)
+        if value is None or value == 0.0:
+            raise StoreError(f"flow amount must be a non-zero finite number, got {amount!r}")
+        text = str(source or "").strip() or "inferred"
+        with self.write_transaction() as conn:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO account_flows(ts, amount, source, note, created_at)
+                   VALUES(?,?,?,?,?)""",
+                (stamp, value, text, str(note or ""), now()),
+            )
+            inserted = int(cur.rowcount or 0) > 0
+        return inserted
+
+    def flows(self, *, since: Optional[float] = None,
+              limit: int = 10_000) -> List[Dict[str, Any]]:
+        """流水（升序）。`since` 为**含**下界；重放窗口的左开右闭由 `app.dd.net_flow` 把关。"""
+        clauses, params = [], []
+        if since is not None:
+            clauses.append("ts>=?")
+            params.append(_finite(since, default=0.0))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, int(limit)))
+        return self._fetchall(
+            f"SELECT * FROM account_flows {where} ORDER BY ts ASC, id ASC LIMIT ?", params)
 
     def record_equity(self, equity: float, *, ts: Optional[float] = None,
                       twr_index: Optional[float] = None, cum_flow: Optional[float] = None,

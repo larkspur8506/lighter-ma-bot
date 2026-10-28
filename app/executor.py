@@ -101,7 +101,8 @@ __all__ = [
     "ISSUE_CODES", "SEVERITY_DANGER", "SEVERITY_GRACE", "SEVERITY_WARN",
     "AccountReader", "ExchangeAccount", "ExchangeOrder", "ExchangePosition",
     "Executor", "ExecutorError", "LighterAccountReader", "ReaderError", "ReconcileIssue",
-    "ReconcileReport", "SymbolOutcome", "TickReport", "orders_from_payload",
+    "ReconcileReport", "SymbolOutcome", "TickReport", "TRANSFER_FLOW_EPS",
+    "account_transaction_time_from_payload", "infer_transfer_flow", "orders_from_payload",
     "pending_signal", "positions_from_payload", "reconcile", "transfers_to_flows",
 ]
 
@@ -221,6 +222,10 @@ class ExchangeAccount:
     orders: Tuple[ExchangeOrder, ...] = ()
     orders_error: str = ""
     as_of: float = 0.0
+    #: 账户最近一次链上/账户级变动的时刻（epoch 秒；`/account` 的 `transaction_time`，
+    #: 微秒 → 秒）。入金/出金会推进它 —— 流水推断（:func:`infer_transfer_flow`）用它把
+    #: 权益跳变定位到正确的时间窗。读不到保持 0（调用方按「未知」处理，不猜）。
+    transaction_time: float = 0.0
 
     def position_for(self, symbol: str) -> Optional[ExchangePosition]:
         wanted = str(symbol or "").strip().upper()
@@ -359,6 +364,30 @@ def account_equity_from_payload(payload: Mapping[str, Any], *,
                 return out
         return None
     return None
+
+
+def account_transaction_time_from_payload(payload: Mapping[str, Any], *,
+                                          account_index: Optional[int] = None) -> float:
+    """从同一份账户响应里取 `transaction_time`（**微秒** → epoch 秒）。
+
+    入金/出金/账户级变动会推进它。取不到或脏值 → `0.0`（调用方按「未知」处理）。
+    与 :func:`account_equity_from_payload` 选同一份 sub-account（按 `index` 过滤）。
+    """
+    if not isinstance(payload, Mapping):
+        return 0.0
+    accounts = payload.get("accounts")
+    if not isinstance(accounts, list):
+        return 0.0
+    for item in accounts:
+        if not isinstance(item, Mapping):
+            continue
+        if account_index is not None and _opt_int(item.get("index")) != int(account_index):
+            continue
+        raw = _opt_float(item.get("transaction_time"))
+        if raw is None or raw <= 0:
+            return 0.0
+        return raw / 1_000_000.0 if raw >= 1e12 else raw
+    return 0.0
 
 
 def orders_from_payload(payload: Mapping[str, Any]) -> Tuple[ExchangeOrder, ...]:
@@ -514,6 +543,58 @@ def transfers_to_flows(payload: Any) -> Tuple[Dict[str, float], ...]:
     return tuple(flows)
 
 
+#: 权益差小于这个值视为「没有变动」。交易所权益是 6 位小数的串，余额不动时读数
+#: 可能有个位 1e-9 的抖动；1e-6（0.000001 USDC）以下不可能是一笔真实出入金。
+TRANSFER_FLOW_EPS = 1e-6
+
+
+def infer_transfer_flow(*, prev_ts: Any, prev_equity: Any, account: "ExchangeAccount",
+                        fills_since_prev: bool,
+                        eps: float = TRANSFER_FLOW_EPS) -> Optional[Dict[str, float]]:
+    """无成交、无持仓时，权益差**只能**来自出入金 —— 据此推断一条流水。
+
+    背景（2026-10-28 实测）：`/transfer/history` 对 UDA 桥接入金**永远返回空**
+    （SDK 的 `TransferHistoryItem` 类型枚举里没有 deposit 类，官方前端走 WS 私有频道），
+    所以首次 bootstrap 之后再入金，TWR/盈亏曲线会把权益跳变全额当成交易盈利
+    （实测 399 USDC 入金 → `cum_pnl=399`、TWR 显示 +395%）。
+
+    本函数是「认得出的才收」的推断版，三条硬前提缺一不可：
+
+    * **上一格权益有效**（`prev_ts > 0`、`prev_equity > 0`）—— 没有基准就不存在「跳变」；
+    * **当前无持仓**（`account.positions` 为空）—— 有持仓时权益随 mark 价浮动，
+      无法把跳变拆成「盈亏 + 流水」，**保守放弃**（宁可少剔一笔，不能猜反方向）；
+    * **区间内无成交**（`fills_since_prev=False`）—— 有成交时跳变可能含手续费/
+      已实现盈亏，同样放弃。
+
+    满足前提时 `amount = equity_now − prev_equity`（正 = 净入金，负 = 净出金），
+    `ts` 优先用 `account.transaction_time`（入金的真实到账时刻，落进正确的重放窗口），
+    无效/不在 `(prev_ts, as_of]` 内时退回 `account.as_of`。返回 `None` 表示「不推断」，
+    **不区分**「没有变动」和「不敢推断」—— 调用方需要后者时自己看前提。
+    """
+    base_ts = _opt_float(prev_ts)
+    base_eq = _opt_float(prev_equity)
+    if base_ts is None or base_ts <= 0 or base_eq is None or base_eq <= 0:
+        return None
+    equity = _opt_float(account.equity if account is not None else None)
+    if equity is None:
+        return None
+    if account.positions:
+        return None
+    if fills_since_prev:
+        return None
+    delta = equity - float(base_eq)
+    if abs(delta) <= float(eps):
+        return None
+
+    as_of = _opt_float(account.as_of) or float(base_ts)
+    tt = _opt_float(account.transaction_time)
+    if tt is not None and float(base_ts) < tt <= as_of:
+        stamp = float(tt)
+    else:
+        stamp = max(float(base_ts), as_of)
+    return {"ts": stamp, "amount": delta}
+
+
 class LighterAccountReader(AccountReader):
     """REST 读数器：`/api/v1/account` + `/api/v1/accountActiveOrders`。
 
@@ -563,6 +644,8 @@ class LighterAccountReader(AccountReader):
         payload = await asyncio.to_thread(self._get, account_url, {})
         positions = positions_from_payload(payload, account_index=self.account_index)
         equity = account_equity_from_payload(payload, account_index=self.account_index)
+        transaction_time = account_transaction_time_from_payload(
+            payload, account_index=self.account_index)
         orders: Tuple[ExchangeOrder, ...] = ()
         orders_error = ""
         orders_url = self._url("/api/v1/accountActiveOrders", account_index=self.account_index)
@@ -575,7 +658,8 @@ class LighterAccountReader(AccountReader):
             orders_error = f"{type(exc).__name__}: {exc}"
             logger.warning("active orders unavailable: %s", orders_error)
         return ExchangeAccount(equity=equity, positions=positions, orders=orders,
-                               orders_error=orders_error, as_of=self.clock())
+                               orders_error=orders_error, as_of=self.clock(),
+                               transaction_time=transaction_time)
 
     def transfers(self) -> Tuple[Dict[str, float], ...]:
         """出入金流水（`/api/v1/transfer/history`，需要 auth；TWR 剔出入金的输入）。
