@@ -40,7 +40,8 @@ from app.executor import (BLOCK_CIRCUIT_OPEN, BLOCK_RECONCILE, ISSUE_ORDERS_UNAV
                           ISSUE_POSITION_MISSING, ISSUE_POSITION_UNKNOWN,
                           ISSUE_QTY_MISMATCH, ISSUE_SIDE_MISMATCH, ISSUE_STOP_ORDER_MISSING,
                           ExchangeAccount, ExchangeOrder, ExchangePosition,
-                          LighterAccountReader, ReconcileIssue, ReaderError, reconcile)
+                          LighterAccountReader, ReconcileIssue, ReaderError, match_stop_order,
+                          reconcile)
 from app.lifecycle import ACTION_ENTRY, ACTION_HOLD, ACTION_SKIP, ACTION_STOP
 from app.market import BarsResult
 from app.risk import RiskLimits
@@ -618,6 +619,87 @@ class ReconcileDetectionTests(Base):
         self.assertEqual(len(self.exchange.exits), 1)
         self.assertEqual(self.exchange.exits[0]["qty_int"], 415600)
         self.assertEqual(self.store.position(int(row["id"]))["state"], "CLOSED")
+
+
+class DecimalTriggerPriceTests(unittest.TestCase):
+    """交易所的止损触发价是**小数串**（`Order.trigger_price: str`）。
+
+    旧解析用 `str.isdigit()` 判空 ⇒ 所有小数触发价都被丢成 None（2026-10-28 实盘看到
+    `trigger_price_int: null`），于是「按 ±1 tick 匹配外部/老止损单」这条兜底永久失效。
+    现在：原样保留小数串，匹配时按标的的 price_decimals 换算成整数 tick 比较。
+    """
+
+    def order(self, raw, *, market_id=2, symbol="SOL"):
+        return ExchangeOrder(order_id="s", client_order_index=None, market_id=market_id,
+                             symbol=symbol, reduce_only=True, trigger_price_raw=raw)
+
+    def test_decimal_string_is_scaled_by_the_symbols_precision(self):
+        row = dict(symbol="SOL", market_id=2, stop_price_int=99057)
+        matched, by = match_stop_order(row, [self.order("99.057")])
+        self.assertIsNotNone(matched)
+        self.assertEqual(by, "trigger_price")
+
+    def test_one_tick_off_matches_two_ticks_does_not(self):
+        row = dict(symbol="SOL", market_id=2, stop_price_int=99057)
+        self.assertIsNotNone(match_stop_order(row, [self.order("99.058")])[0])
+        self.assertIsNone(match_stop_order(row, [self.order("99.059")])[0])
+
+    def test_unknown_symbol_never_matches_by_price(self):
+        """未知标的拿不到 price_decimals ⇒ 不匹配（宁可不认，也不把别人的单当自己的）。"""
+        row = dict(symbol="DOGE", market_id=2, stop_price_int=99057)
+        self.assertIsNone(match_stop_order(row, [self.order("99.057", symbol="DOGE")])[0])
+
+    def test_integer_trigger_ticks_still_work(self):
+        row = dict(symbol="BTC", market_id=1, stop_price_int=1050)
+        order = ExchangeOrder(order_id="s", client_order_index=None, market_id=1,
+                              symbol="BTC", reduce_only=True, trigger_price_int=1050)
+        self.assertEqual(match_stop_order(row, [order])[1], "trigger_price")
+
+    def test_zero_or_garbage_trigger_price_is_ignored(self):
+        row = dict(symbol="SOL", market_id=2, stop_price_int=99057)
+        for raw in ("0", "0.000", "abc", ""):
+            with self.subTest(raw=raw):
+                self.assertIsNone(match_stop_order(row, [self.order(raw)])[0])
+
+
+class OffLoopNetworkTests(unittest.TestCase):
+    """tick 里的取数必须 off-loop。
+
+    `market.bars()` / `market.market_details()` 是同步 urllib；直接在事件循环里调会把
+    uvicorn 的只读端点一起卡住（2026-10-28 实测：tick 期间 `/status` 偶发空响应）。
+    这里用一个「睡 0.3 秒」的假 market 验证：取数期间事件循环仍在转。
+    """
+
+    def test_market_bars_runs_off_the_event_loop(self) -> None:
+        import asyncio
+        import time
+        from types import SimpleNamespace
+
+        class SlowMarket:
+            def bars(self, symbol, **kwargs):
+                time.sleep(0.3)
+                return SimpleNamespace(bars=(), dropped_unclosed=())
+
+        fake_executor = SimpleNamespace(market=SlowMarket(), _prices={})
+
+        async def scenario() -> int:
+            ticks = {"n": 0}
+
+            async def ticker() -> None:
+                while True:
+                    ticks["n"] += 1
+                    await asyncio.sleep(0.005)
+
+            task = asyncio.create_task(ticker())
+            try:
+                with self.assertRaises(Exception):
+                    await executor.Executor._load_symbol(fake_executor, "BTC", 0)
+            finally:
+                task.cancel()
+            return ticks["n"]
+
+        spins = asyncio.run(scenario())
+        self.assertGreater(spins, 20, f"事件循环被阻塞了：0.3s 内只转了 {spins} 次")
 
 
 class ReconcileUnitTests(unittest.TestCase):

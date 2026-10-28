@@ -79,7 +79,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from app import views, watchdog
 from app.dd import DdError, DrawdownGuard
@@ -919,6 +919,17 @@ def create_app(*, panel: Optional[views.Panel] = None,
     def index() -> HTMLResponse:
         """自包含 HTML（内联 CSS + 内联 SVG，无 CDN、无外部 JS）。"""
         return HTMLResponse(content=panel.page())
+
+    @app.get("/admin")
+    def admin_entry(request: Request) -> RedirectResponse:
+        """`/admin` 是**旧系统（HL 面板）**的路径，本应用的面板在根路径。
+
+        保留这条路由只为「把旧链接粘过来」的场景：307 到 `/?k=...`（token 留在 query 里，
+        页面 JS 收到后存 localStorage 并从地址栏抹掉）。没有 query 就普通重定向到 `/`。
+        不加这条时 `/admin` 直接 404 —— 2026-10-28 就是这么给了用户一个坏链接。
+        """
+        query = request.url.query
+        return RedirectResponse(url="/" + (f"?{query}" if query else ""), status_code=307)
 
     # ---------------------------------------------------------------- 写操作
 
