@@ -655,6 +655,30 @@ class DecimalTriggerPriceTests(unittest.TestCase):
                               symbol="BTC", reduce_only=True, trigger_price_int=1050)
         self.assertEqual(match_stop_order(row, [order])[1], "trigger_price")
 
+    def test_reader_converts_the_decimal_string_at_parse_time(self) -> None:
+        """实测原始行：`"trigger_price": "98.890"`（小数串）→ 必须变成 98890。
+
+        否则面板与对账看到的永远是 `trigger_price_int: null`（旧行为），止损覆盖只能靠
+        client_order_index 一条腿站着。
+        """
+        payload = {"code": 200, "orders": [{
+            "order_id": "844426248695643", "client_order_index": 256212589665254,
+            "market_index": 2, "market_symbol": "SOL", "reduce_only": True,
+            "trigger_price": "98.890", "base_price": 97901, "base_size": 117,
+            "status": "pending"}]}
+        orders = executor.orders_from_payload(payload)
+        self.assertEqual(orders[0].trigger_price_int, 98890)
+        self.assertEqual(orders[0].trigger_price_raw, "98.890")
+
+    def test_reader_leaves_unknown_symbols_unconverted(self) -> None:
+        payload = {"code": 200, "orders": [{
+            "order_id": "x", "client_order_index": 1, "market_index": 9,
+            "market_symbol": "DOGE", "reduce_only": True, "trigger_price": "0.123",
+            "base_price": 12, "base_size": 1000, "status": "pending"}]}
+        order = executor.orders_from_payload(payload)[0]
+        self.assertIsNone(order.trigger_price_int)          # 不猜精度
+        self.assertEqual(order.trigger_price_raw, "0.123")
+
     def test_zero_or_garbage_trigger_price_is_ignored(self):
         row = dict(symbol="SOL", market_id=2, stop_price_int=99057)
         for raw in ("0", "0.000", "abc", ""):
