@@ -713,6 +713,35 @@ def _default_panel_sources(cache: "PanelCache",
                          prices=cache.prices, bars=bars)
 
 
+async def _admin_params(request: Request) -> Dict[str, str]:
+    """把 admin 写操作的参数**从 query、表单、JSON body 三处合并**成一个 dict。
+
+    为什么必须合并（2026-10-28 线上实测的坑）：这三个 handler 原先只声明普通参数
+    （`on: int = 1`、`confirm: str = ""`…），FastAPI 只从 **query** 取值；而面板的
+    JS 用 `application/x-www-form-urlencoded` 提交 body ⇒ 参数被静默丢弃：
+
+    * 「恢复开仓」按钮实际把 kill **打开**（`on` 落到默认 1，`reason` 也丢了）；
+    * 「强制清仓」「重置回撤峰值」永远 400（`confirm` / `reason` 读成空串）；
+    * 任何 `curl -d 'on=0'` 的脚本同理。
+
+    这是「静默回落」类 bug，所以：① 三个来源都收；② 关键参数不再给默认值
+    （`kill` 的 `on` 缺失即 400），让漏参数的调用**响亮失败**而不是反向操作。
+    """
+    params: Dict[str, str] = {str(k): str(v) for k, v in request.query_params.items()}
+    ctype = (request.headers.get("content-type") or "").lower()
+    try:
+        if "application/json" in ctype:
+            body = await request.json()
+            if isinstance(body, Mapping):
+                params.update({str(k): str(v) for k, v in body.items()})
+        elif "form" in ctype or "urlencoded" in ctype:
+            form = await request.form()
+            params.update({str(k): str(v) for k, v in form.items()})
+    except Exception:                                        # noqa: BLE001 - 脏 body 不该 500
+        logger.warning("admin request body could not be parsed", exc_info=True)
+    return params
+
+
 def create_app(*, panel: Optional[views.Panel] = None,
                store_factory: Optional[Callable[[], Any]] = None,
                sources: Optional[views.Sources] = None,
@@ -871,23 +900,45 @@ def create_app(*, panel: Optional[views.Panel] = None,
     # ---------------------------------------------------------------- 写操作
 
     @app.post("/admin/kill")
-    async def admin_kill(request: Request, k: str = "", on: int = 1,
-                         reason: str = "", by: str = "admin") -> JSONResponse:
+    async def admin_kill(request: Request) -> JSONResponse:
         """手动停开新仓（**不挡离场**）。
 
         `on=0` 关掉（重新允许开仓）。语义与 `app.dd.entry_blocked()` /
         `app.risk._gate_kill()` 完全一致：只挡 `action='entry'`，离场与交易所侧的
         止损单照常有效。
+
+        参数从 query 或 body 都认（`_admin_params`）；**`on` 必须显式给**——
+        没有默认值：缺参数时返回 400，而不是静默当成 1 把仓位停掉。
         """
+        params = await _admin_params(request)
+        k = params.get("k", "")
+        reason = params.get("reason", "")
+        by = params.get("by") or "admin"
         err = _auth_error(request, k, token)
         store = _store()
         if err:
             return _unauthorized("kill", err, store=store, by=by)
+        raw_on = str(params.get("on", "")).strip()
+        if not raw_on:
+            message = ("admin/kill 必须显式带 on=0|1：缺省曾被静默当成 1，"
+                       "于是「恢复开仓」的按钮实际把新仓停掉了")
+            _audit(store, endpoint="kill", result="rejected", by=by,
+                   reason="missing on")
+            return JSONResponse(status_code=400, content={
+                "ok": False, "degraded": False, "action": "kill",
+                "error": message, "warnings": [message]})
+        if raw_on not in ("0", "1"):
+            message = f"admin/kill 的 on 只能是 0 或 1，收到 {raw_on!r}"
+            _audit(store, endpoint="kill", result="rejected", by=by,
+                   reason=f"invalid on={raw_on!r}")
+            return JSONResponse(status_code=400, content={
+                "ok": False, "degraded": False, "action": "kill",
+                "error": message, "warnings": [message]})
         if store is None:
             return _degraded("kill", "数据库不可用，无法写 kill 状态: "
                                      f"{panel.store_error or 'unknown'}",
                              reason=reason, by=by)
-        wanted = bool(int(on))
+        wanted = raw_on == "1"
         try:
             state = views.set_kill(store, wanted, by=by, reason=reason, ts=clock())
         except Exception as exc:                              # noqa: BLE001 - 降级不崩
@@ -895,19 +946,23 @@ def create_app(*, panel: Optional[views.Panel] = None,
                              reason=reason, by=by)
         event_id = _audit(store, endpoint="kill", result="ok" if wanted else "off",
                           by=by, reason=reason,
-                          extra={"kill": state["kill"], "on": on})
+                          extra={"kill": state["kill"], "on": raw_on})
         return JSONResponse(content={"ok": True, "degraded": False, "action": "kill",
                                      "kill": state["kill"], "state": state,
                                      "audit_event_id": event_id, "warnings": []})
 
     @app.post("/admin/flatten")
-    async def admin_flatten(request: Request, k: str = "", confirm: str = "",
-                            reason: str = "", by: str = "admin") -> JSONResponse:
+    async def admin_flatten(request: Request) -> JSONResponse:
         """市价清仓 + 撤所有挂单（**唯一的「比 kill 更强」操作**）。
 
         不可撤销 ⇒ 必须二次确认（`confirm=yes`）。没确认 → **400**，并落一条
-        `admin_action` 审计（谁试过什么）。
+        `admin_action` 审计（谁试过什么）。参数从 query 或 body 都认。
         """
+        params = await _admin_params(request)
+        k = params.get("k", "")
+        confirm = params.get("confirm", "")
+        reason = params.get("reason", "")
+        by = params.get("by") or "admin"
         err = _auth_error(request, k, token)
         store = _store()
         if err:
@@ -944,14 +999,17 @@ def create_app(*, panel: Optional[views.Panel] = None,
         return JSONResponse(content=payload)
 
     @app.post("/admin/dd/reset")
-    async def admin_dd_reset(request: Request, k: str = "", reason: str = "",
-                             by: str = "admin") -> JSONResponse:
+    async def admin_dd_reset(request: Request) -> JSONResponse:
         """重置回撤峰值（熔断**永不自解**，人工介入后必须能重开）。
 
         `reason` 必填：`app.dd.DrawdownGuard.reset_peak()` 拒绝空理由（审计要能回答
         「谁为什么重置的」）。指数为 0（账户打光 / 状态坏）同样拒绝 —— 把峰值抹成 0
-        只会把爆仓藏起来。
+        只会把爆仓藏起来。参数从 query 或 body 都认。
         """
+        params = await _admin_params(request)
+        k = params.get("k", "")
+        reason = params.get("reason", "")
+        by = params.get("by") or "admin"
         err = _auth_error(request, k, token)
         store = _store()
         if err:

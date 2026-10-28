@@ -52,7 +52,7 @@ sudo docker run -d --name "$APP" --restart unless-stopped \
   -v "$DIR/data:/srv/data" \
   -v "$DIR/logs:/srv/logs" \
   "$IMG" \
-  uvicorn app.main:app --host 127.0.0.1 --port "$PORT" >/dev/null
+  uvicorn app.main:app --host 127.0.0.1 --port "$PORT" --no-access-log >/dev/null
 
 sleep 14
 echo "  容器: $(sudo docker inspect -f '{{.State.Status}} | health={{.State.Health.Status}}' $APP)"

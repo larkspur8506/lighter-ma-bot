@@ -67,7 +67,7 @@ sudo docker run -d --name lighter-ma-bot --restart unless-stopped \
   -v /opt/lighter-ma-bot/data:/srv/data \
   -v /opt/lighter-ma-bot/logs:/srv/logs \
   ghcr.io/larkspur8506/lighter-ma-bot:latest \
-  uvicorn app.main:app --host 127.0.0.1 --port 8110
+  uvicorn app.main:app --host 127.0.0.1 --port 8110 --no-access-log
 
 # 4) nginx
 sudo docker exec 1Panel-openresty-MKvt openresty -t
@@ -76,6 +76,29 @@ sudo docker exec 1Panel-openresty-MKvt openresty -s reload
 
 **`--env-file` 只在 `docker run` 时读一次** —— 改了 `.env` 必须重建容器，
 `docker restart` 不生效（会读到旧值）。
+
+**`--no-access-log` 不是省事，是必须**：`ADMIN_TOKEN` 从 `?k=` 进来，而 uvicorn 的
+access log 会把**整条带 query 的 request line** 写进 `docker logs`
+（2026-10-28 实测，面板按钮点一次就落一条明文 token）。关掉 access log 后，
+排障改用应用自己的 `events` 表与容器 stdout（启动/异常仍会打印）。
+
+------------------------------------------------------------------------
+## 3b. 写路径冒烟：最小真实往返（**真钱，单位数 USDC**）
+
+读路径与 nonce/auth 通了，不代表「签名→sendTx→挂止损→撤单→平仓」通。第一次真实信号
+之前，用这条把整条链路打穿（失败点会自己收尾：撤单 + 市价平掉）：
+
+```bash
+sudo docker exec -i -u bot lighter-ma-bot python /srv/scripts/smoke_live_order.py \
+  --confirm-live 764377            # account_index 必须与 .env 一致
+
+# 只签名不发请求（先看订单长什么样）
+sudo docker exec -i -u bot lighter-ma-bot python /srv/scripts/smoke_live_order.py \
+  --confirm-live 764377 --dry-run
+```
+
+安全边界写死在脚本里：单笔、只做多、名义 ≤ 25 USDC（默认 12，等于 SOL 的最小合法量），
+开始前必须**空仓无挂单**，结束时必须**空仓零挂单**，否则非零码退出要求人工核对。
 
 ------------------------------------------------------------------------
 ## 4. 当前的安全开关

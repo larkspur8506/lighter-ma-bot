@@ -133,19 +133,19 @@ class AuthTests(AdminFixture):
     def test_header_token_is_accepted(self) -> None:
         client = self.build()
         response = client.post("/admin/kill", headers={"X-Admin-Token": TOKEN},
-                               params={"reason": "header auth"})
+                               params={"on": 1, "reason": "header auth"})
         self.assertEqual(response.status_code, 200)
         self.assertIs(response.json()["ok"], True)
 
     def test_query_token_is_accepted(self) -> None:
         client = self.build()
-        response = client.post("/admin/kill", params={"k": TOKEN, "reason": "query auth"})
+        response = client.post("/admin/kill", params={"on": 1, "k": TOKEN, "reason": "query auth"})
         self.assertEqual(response.status_code, 200)
 
     def test_token_never_lands_in_events_or_responses(self) -> None:
         """`?k=` 会进访问日志；我们至少要保证它**不进自己的库**。"""
         client = self.build()
-        client.post("/admin/kill", params={"k": TOKEN, "reason": "audit me"})
+        client.post("/admin/kill", params={"on": 1, "k": TOKEN, "reason": "audit me"})
         body = json.dumps(client.post("/admin/flatten",
                                       params={"k": TOKEN, "confirm": "yes"}).json())
         self.assertNotIn(TOKEN, body)
@@ -169,7 +169,7 @@ class AuthTests(AdminFixture):
 class KillTests(AdminFixture):
     def test_kill_returns_200_and_persists(self) -> None:
         client = self.build()
-        response = client.post("/admin/kill", params={"k": TOKEN, "reason": "手动停手"})
+        response = client.post("/admin/kill", params={"on": 1, "k": TOKEN, "reason": "手动停手"})
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertIs(body["ok"], True)
@@ -182,7 +182,7 @@ class KillTests(AdminFixture):
 
     def test_kill_can_be_turned_off(self) -> None:
         client = self.build()
-        client.post("/admin/kill", params={"k": TOKEN, "reason": "on"})
+        client.post("/admin/kill", params={"k": TOKEN, "on": 1, "reason": "on"})
         response = client.post("/admin/kill", params={"k": TOKEN, "on": 0,
                                                       "reason": "off again"})
         self.assertEqual(response.status_code, 200)
@@ -192,7 +192,7 @@ class KillTests(AdminFixture):
 
     def test_kill_is_visible_on_the_panel(self) -> None:
         client = self.build()
-        client.post("/admin/kill", params={"k": TOKEN, "reason": "今天不交易"})
+        client.post("/admin/kill", params={"on": 1, "k": TOKEN, "reason": "今天不交易"})
         status = client.get("/status").json()
         self.assertIs(status["kill"], True)
         self.assertEqual(status["kill_reason"], "今天不交易")
@@ -207,7 +207,7 @@ class KillTests(AdminFixture):
         * `lifecycle.decide_exit()` 仍然给出 `stop` 意图 —— 它的签名里根本没有风控入参。
         """
         client = self.build()
-        client.post("/admin/kill", params={"k": TOKEN, "reason": "kill 只挡开仓"})
+        client.post("/admin/kill", params={"on": 1, "k": TOKEN, "reason": "kill 只挡开仓"})
         kill = views.kill_state(self.store)["kill"]
         self.assertIs(kill, True)
 
@@ -237,7 +237,7 @@ class KillTests(AdminFixture):
 
         panel = views.Panel(boom, limits=LIMITS, now=lambda: self.now)
         client = self.build(panel=panel, store=None)
-        response = client.post("/admin/kill", params={"k": TOKEN, "reason": "no db"})
+        response = client.post("/admin/kill", params={"on": 1, "k": TOKEN, "reason": "no db"})
         self.assertEqual(response.status_code, 200)          # 不是 500
         body = response.json()
         self.assertIs(body["ok"], False)
@@ -426,11 +426,77 @@ class AdminStateTests(AdminFixture):
 
     def test_admin_state_reports_kill_and_scheduler(self) -> None:
         client = self.build()
-        client.post("/admin/kill", params={"k": TOKEN, "reason": "state check"})
+        client.post("/admin/kill", params={"on": 1, "k": TOKEN, "reason": "state check"})
         body = client.get(f"/admin/state?k={TOKEN}").json()
         self.assertIs(body["kill"]["kill"], True)
         self.assertIs(body["scheduler"]["configured"], False)   # 注入的是 panel，没有调度器
         self.assertIs(body["cache"]["orders_known"], False)
+
+
+# --------------------------------------------------------------------------- 6. 参数来源
+# 线上实测（2026-10-28）的回归：面板 JS 用 `application/x-www-form-urlencoded` 提交，
+# 而 handler 原先只声明普通参数 ⇒ FastAPI 只认 query ⇒ body 被静默丢弃：
+#   ① 「恢复开仓」按钮实际把 kill **打开**（on 落到默认 1）；
+#   ② flatten / dd-reset 永远 400（confirm / reason 读成空串）。
+# 所以这里钉住三件事：body 生效、query 生效、**缺 on 必须 400 且不改状态**。
+
+
+class ParamSourceTests(AdminFixture):
+    def test_kill_accepts_a_form_body_and_really_turns_it_off(self) -> None:
+        client = self.build()
+        client.post("/admin/kill", params={"k": TOKEN, "on": 1, "reason": "seed on"})
+        self.assertIs(self.client.get(f"/admin/state?k={TOKEN}").json()["kill"]["kill"],
+                      True)
+
+        response = client.post("/admin/kill",
+                               data={"k": TOKEN, "on": "0", "reason": "panel: resume"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.json()["kill"], False)
+        self.assertEqual(self.client.get(f"/admin/state?k={TOKEN}").json()
+                         ["kill"]["kill"], False)
+        # reason 也必须进审计（原来连 reason 一起被丢了）
+        self.assertEqual(self.client.get(f"/admin/state?k={TOKEN}").json()
+                         ["kill"]["reason"], "panel: resume")
+
+    def test_kill_accepts_a_json_body(self) -> None:
+        client = self.build()
+        response = client.post("/admin/kill", json={"k": TOKEN, "on": 1})
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.json()["kill"], True)
+
+    def test_kill_without_on_is_rejected_and_leaves_state_alone(self) -> None:
+        client = self.build()
+        response = client.post("/admin/kill", params={"k": TOKEN, "reason": "忘了 on"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIs(response.json()["ok"], False)
+        self.assertIs(self.client.get(f"/admin/state?k={TOKEN}").json()
+                      ["kill"]["kill"], False)          # 没有被「默认开仓停手」
+        self.assertEqual(self.admin_events()[0]["data"]["result"], "rejected")
+
+    def test_kill_rejects_on_values_other_than_zero_or_one(self) -> None:
+        client = self.build()
+        for bad in ("2", "-1", "true"):
+            with self.subTest(on=bad):
+                response = client.post("/admin/kill", data={"k": TOKEN, "on": bad})
+                self.assertEqual(response.status_code, 400)
+                self.assertIs(self.client.get(f"/admin/state?k={TOKEN}").json()
+                              ["kill"]["kill"], False)
+
+    def test_flatten_accepts_confirm_from_the_body(self) -> None:
+        client = self.build()
+        response = client.post("/admin/flatten", data={"k": TOKEN, "confirm": "yes"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.json()["ok"], True)
+        self.assertEqual(len(self.flatten_calls), 1, "body 里的 confirm 必须真的清仓")
+
+    def test_dd_reset_accepts_the_reason_from_the_body(self) -> None:
+        seed_dd(self.store)
+        client = self.build()
+        response = client.post("/admin/dd/reset",
+                               data={"k": TOKEN, "reason": "面板重置：核对后重开"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.json()["ok"], True)
+        self.assertEqual(self.store.dd_state()["reset_reason"], "面板重置：核对后重开")
 
 
 if __name__ == "__main__":
