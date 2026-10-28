@@ -201,14 +201,37 @@ def credential_status(env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]
     """
     source = os.environ if env is None else env
     missing = [key for key in CREDENTIAL_ENV_KEYS if not _env_text(source, key)]
+    # 真钱模式的第二道门：`LIGHTER_LIVE_TRADING=1` 但 `LIGHTER_LIVE_ACCOUNT_INDEX`
+    # 没设时，**所有真实下单都会被 LiveGate 拒绝**，而面板/心跳看起来一切正常
+    # （2026-10-28 实测踩到：.env 里两行粘在一起，`LIVE_ACCOUNT_INDEX` 被吞进
+    # `LIGHTER_LEVERAGE` 的值里，系统「跑着但永远不会下单」）。⇒ 必须在状态条上说出来。
+    live_gate: Dict[str, Any] = {"enabled": False, "declared_account": None,
+                                 "ok": True, "detail": ""}
+    try:
+        from app.exchange import LiveGate
+        gate = LiveGate.from_env(source)
+        live_gate["enabled"] = bool(gate.enabled)
+        live_gate["declared_account"] = gate.declared_account
+        if gate.enabled and gate.declared_account is None:
+            live_gate["ok"] = False
+            live_gate["detail"] = (
+                "LIGHTER_LIVE_TRADING=1 但 LIGHTER_LIVE_ACCOUNT_INDEX 未设置 —— "
+                "所有真实下单都会被 LiveGate 拒绝（系统看起来在跑，但永远不会下单）")
+    except Exception as exc:                                  # noqa: BLE001 - 面板不崩
+        live_gate["ok"] = False
+        live_gate["detail"] = f"live gate 状态不可读: {type(exc).__name__}: {exc}"
+    detail = ("" if not missing else
+              ("交易凭据未配置（只读面板不受影响；下单 / 调度器不可用）：缺 "
+               + ", ".join(missing)))
+    if live_gate["detail"]:
+        detail = (detail + " ｜ " if detail else "") + str(live_gate["detail"])
     return {
         "known": True,
         "configured": not missing,
         "missing": missing,
         "admin_token_set": bool(_env_text(source, ADMIN_TOKEN_ENV)),
-        "detail": "" if not missing else
-                  ("交易凭据未配置（只读面板不受影响；下单 / 调度器不可用）：缺 "
-                   + ", ".join(missing)),
+        "live_gate": live_gate,
+        "detail": detail,
     }
 
 
