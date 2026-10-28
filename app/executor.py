@@ -1052,6 +1052,8 @@ class Executor:
         self.clock = clock
         self._now_ms = now_ms or (lambda: int(self.clock() * 1000))
         self._prices: Dict[str, float] = {}
+        #: 本轮各标的的已收盘 K 线（面板复用；不在面板路径上取数）
+        self._bars: Dict[str, Tuple[Any, ...]] = {}
         #: 连续硬失败计数（异常 / 下单未被接受）。一轮干净 tick 清零。
         self._failures = 0
         self._circuit_open = False
@@ -1228,6 +1230,8 @@ class Executor:
         signal = pending_signal(symbol, bars, ind, i, entry_ref, sides=self.sides,
                                 short_regime_ma=self.short_regime_ma)
         self._prices[symbol] = float(bars[-1].close)
+        # 面板要用的同一份 K 线（tick 是唯一取数者；面板只读，见 `PanelCache.set_bars`）。
+        self._bars[symbol] = tuple(bars)
         return {"symbol": symbol, "bars": bars, "ind": ind, "signal": signal,
                 "bar_ms": int(bars[-1].open_ms), "warm": True, "reason": "",
                 "entry_ref": entry_ref, "result": result}
