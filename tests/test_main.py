@@ -923,6 +923,48 @@ class WarmPanelBarsTests(unittest.TestCase):
         self.assertEqual(cache.bars("ETH"), [1, 2])
 
 
+class WarmPanelStateTests(unittest.TestCase):
+    """启动预热账户读数/现价：把「重启后 30 分钟两条冷启动提示」压到几秒。"""
+
+    def _reader(self, *, equity=101.5, orders=(), error=""):
+        class Order:
+            def __init__(self, i):
+                self.i = i
+
+            def as_dict(self):
+                return {"order_id": str(self.i), "reduce_only": True}
+
+        class Reader:
+            async def read(self_inner):
+                from types import SimpleNamespace
+                return SimpleNamespace(equity=equity, orders=tuple(Order(i) for i in orders),
+                                       orders_error=error)
+
+        return Reader()
+
+    def test_warm_fills_equity_orders_and_prices(self) -> None:
+        cache = main.PanelCache()
+        asyncio.run(main._warm_panel_state(cache, ["BTC", "ETH"],
+                                           reader=self._reader(orders=(1, 2)),
+                                           prices=lambda: {"BTC": 81000.0}))
+        self.assertEqual(cache.equity(), 101.5)
+        self.assertEqual(len(cache.orders()), 2)             # provider 不再抛「尚未采集」
+        self.assertEqual(cache.prices(), {"BTC": 81000.0})
+
+    def test_a_failing_reader_does_not_raise_or_poison_the_cache(self) -> None:
+        class Boom:
+            async def read(self_inner):
+                raise RuntimeError("proxy down")
+
+        cache = main.PanelCache()
+        asyncio.run(main._warm_panel_state(cache, ["BTC"], reader=Boom(),
+                                           prices=lambda: {"BTC": 1.0}))
+        # 账户失败但现价成功 → 现价仍然入缓存，挂单保持「未知」而不是空列表
+        self.assertEqual(cache.prices(), {"BTC": 1.0})
+        with self.assertRaises(RuntimeError):
+            cache.orders()
+
+
 class LiveGateStatusTests(unittest.TestCase):
     """状态条必须说清「在跑但永远不会下单」——2026-10-28 实测踩到的坑。
 
