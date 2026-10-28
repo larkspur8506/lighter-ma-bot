@@ -252,6 +252,35 @@ def _limits_from_env() -> RiskLimits:
         return RiskLimits()
 
 
+async def _warm_panel_bars(cache: "PanelCache", symbols: Sequence[str],
+                           fetch: Optional[Callable[[str], Any]] = None) -> None:
+    """启动时预热面板的 K 线缓存（后台任务，失败只记日志）。
+
+    为什么需要：面板首屏要 3 标的的全量 4h K 线，冷拉一次 ≈25s（实测）。重启后如果没人
+    跑过 tick，第一个打开面板的人就要等这么久。启动时先在后台拉一遍，把这段等待挪出
+    用户请求路径；此后由每轮 tick 的 `cache.set_bars` 持续刷新。
+    """
+    if fetch is None:
+        def fetch(symbol: str) -> Any:
+            from app.market import DEFAULT_ENVIRONMENT, MarketClient
+
+            env = (os.environ.get("LIGHTER_ENVIRONMENT") or "").strip() or DEFAULT_ENVIRONMENT
+            client = getattr(fetch, "_client", None)
+            if client is None:
+                client = MarketClient(env)
+                fetch._client = client                        # type: ignore[attr-defined]
+            return client.bar_list(symbol)
+
+    for symbol in symbols:
+        try:
+            bars = await asyncio.to_thread(fetch, symbol)
+        except Exception:                                     # noqa: BLE001 - 预热失败不影响服务
+            logger.warning("panel bars warm-up failed for %s", symbol, exc_info=True)
+            continue
+        cache.set_bars(symbol, bars)
+        logger.info("panel bars warmed: %s (%d bars)", symbol, len(bars))
+
+
 # ================================================================== tick 缓存
 
 
@@ -881,6 +910,12 @@ def create_app(*, panel: Optional[views.Panel] = None,
             except Exception as exc:                          # noqa: BLE001
                 sched_box["error"] = f"{type(exc).__name__}: {exc}"
                 logger.exception("could not start the injected scheduler")
+        # 启动时预热面板的 K 线缓存（后台任务）：把「首屏 25s」挪出用户请求路径。
+        # 关掉用 PANEL_WARM_BARS=0（离线测试/不装行情源的部署）。
+        if market_source and os.environ.get("PANEL_WARM_BARS", "1") != "0":
+            warm = asyncio.create_task(_warm_panel_bars(cache, symbols))
+            app.state.warm_task = warm
+            logger.info("panel bar warm-up scheduled")
         try:
             yield
         finally:

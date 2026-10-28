@@ -884,6 +884,32 @@ class BarsCacheTests(unittest.TestCase):
         self.assertEqual(len(fake._bars["BTC"]), len(bars))
 
 
+class WarmPanelBarsTests(unittest.TestCase):
+    """启动预热：把「首屏 25s」挪出用户请求路径。"""
+
+    def test_warm_fills_the_cache(self) -> None:
+        from app.strategy import Bar
+
+        cache = main.PanelCache()
+        bars = [Bar(open_ms=i * 4 * 3600 * 1000, open=100.0, high=101.0, low=99.0,
+                    close=100.0, volume=1.0) for i in range(3)]
+        asyncio.run(main._warm_panel_bars(cache, ["BTC", "ETH"], fetch=lambda s: bars))
+        self.assertEqual(len(cache.bars("BTC")), 3)
+        self.assertEqual(len(cache.bars("ETH")), 3)
+
+    def test_a_failing_symbol_does_not_abort_the_others(self) -> None:
+        cache = main.PanelCache()
+
+        def fetch(symbol):
+            if symbol == "BTC":
+                raise RuntimeError("feed died")
+            return [1, 2]
+
+        asyncio.run(main._warm_panel_bars(cache, ["BTC", "ETH"], fetch=fetch))
+        self.assertIsNone(cache.bars("BTC"))
+        self.assertEqual(cache.bars("ETH"), [1, 2])
+
+
 class LiveGateStatusTests(unittest.TestCase):
     """状态条必须说清「在跑但永远不会下单」——2026-10-28 实测踩到的坑。
 
