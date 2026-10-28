@@ -1299,6 +1299,85 @@ def _build_scheduler(store_factory: Callable[[], Any], *,
     return TickScheduler(runner, store_factory=store_factory, clock=clock)
 
 
+def _stored_flows_for_replay(store: Any) -> List[Dict[str, float]]:
+    """库里已持久化的推断流水 → 重放用流水列表（锚点之后、左开）。
+
+    `update()` 每轮都从锚点**全量重放**权益窗口，所以历史流水每轮都要重新喂进去，
+    不是只喂当轮新增的那条。锚点本身那一格的流水已体现在锚点权益里（左开区间），
+    `ts == anchor_ts` 的行要剔掉。库读失败 → 空列表（流水缺失只失真，不挂 tick）。
+    """
+    stored = store.dd_state() or {}
+    anchor_ts = stored.get("anchor_ts")
+    try:
+        rows = store.flows(since=float(anchor_ts)) if anchor_ts else store.flows()
+    except Exception:                                        # noqa: BLE001
+        return []
+    floor = float(anchor_ts) if anchor_ts else 0.0
+    out: List[Dict[str, float]] = []
+    for row in rows or ():
+        ts = row.get("ts") if isinstance(row, Mapping) else None
+        amount = row.get("amount") if isinstance(row, Mapping) else None
+        try:
+            ts_f, amount_f = float(ts), float(amount)        # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if ts_f > floor and amount_f != 0.0:
+            out.append({"ts": ts_f, "amount": amount_f})
+    return out
+
+
+def _inferred_flow_for_tick(store: Any, executor: Any) -> Optional[Dict[str, float]]:
+    """本轮 tick 的流水推断：权益跳变 + 无持仓 + 无成交 ⇒ 出入金（落库 + 落事件）。
+
+    背景：`/transfer/history` 对 UDA 桥接入金恒空（`app/executor.infer_transfer_flow`
+    的 docstring 有完整因果）。返回 `None` = 没有新流水（含幂等命中 —— 那条流水已在
+    `_stored_flows_for_replay` 里，不能再 append 一遍，否则本轮重放重复计息）。
+    """
+    from app.executor import infer_transfer_flow   # noqa: PLC0415 - 延迟 import（模块边界）
+
+    account = getattr(executor, "last_account", None)
+    if account is None:
+        return None
+    try:
+        prev = store.last_equity()
+    except Exception:                                        # noqa: BLE001
+        return None
+    if not prev:
+        return None
+    prev_ts = prev.get("ts")
+    prev_equity = prev.get("equity")
+    fills_since = True                                       # 读不到成交记录时按「有成交」保守处理
+    try:
+        rows = store.trades(since=float(prev_ts or 0.0), limit=1000)
+        fills_since = any(float(t.get("ts") or 0.0) > float(prev_ts or 0.0)
+                          for t in rows or ())
+    except Exception:                                        # noqa: BLE001
+        fills_since = True
+    flow = infer_transfer_flow(prev_ts=prev_ts, prev_equity=prev_equity,
+                               account=account, fills_since_prev=fills_since)
+    if flow is None:
+        return None
+    try:
+        recorded = store.record_flow(
+            flow["amount"], ts=flow["ts"], source="inferred",
+            note=(f"equity {float(prev_equity):.6f} -> {float(account.equity):.6f}, "
+                  "no fills / no positions in interval"))
+    except Exception:                                        # noqa: BLE001 - 流水落库失败不挂 tick
+        return None
+    if not recorded:
+        return None                                          # 幂等命中，库里已有
+    direction = "入金" if float(flow["amount"]) > 0 else "出金"
+    store.log_event(
+        "flow_inferred",
+        f"权益 {float(prev_equity):.6f} -> {float(account.equity):.6f}，区间内无成交、"
+        f"当前无持仓，推断为{direction} {abs(float(flow['amount'])):.6f} USDC"
+        "（/transfer/history 看不到 UDA 流水，由权益跳变推断）",
+        data={"ts": flow["ts"], "amount": flow["amount"],
+              "prev_equity": float(prev_equity), "equity": float(account.equity)},
+        ts=time.time())
+    return flow
+
+
 def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
                         sources_getter: Callable[[], views.Sources],
                         symbols: Sequence[str] = views.DEFAULT_SYMBOLS
@@ -1375,26 +1454,37 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
         权益未知（账户读失败）就跳过本轮推进并落事件 —— 面板/风控会按
         「回撤口径不可用」fail-closed，绝不拿旧 equity 硬算。流水读不到则按
         「无流水」推进并落事件（有出入金的时段 TWR 会失真，但开仓闸不会瞎掉）。
+
+        流水三个来源，全部喂给重放（`update()` 每轮从锚点重放全窗口）：
+        ① `reader.transfers()`（`/transfer/history`）—— 对 UDA 入金恒空，但账户间
+           转账/出金可能出现，留着；
+        ② 库里已持久化的推断流水（`account_flows`）—— 每轮都要喂回去，否则下一轮
+           重放又把入金算成盈利；
+        ③ 本轮新推断的流水（`_inferred_flow_for_tick`，落库 + 落事件）。
         """
         equity = getattr(getattr(executor, "last_account", None), "equity", None)
         if equity is None:
             store.log_event("dd_update_failed", "权益未知，本轮未推进回撤（fail-closed）",
                             data={"reason": "equity_unavailable"}, ts=time.time())
             return
-        flows: Sequence[Mapping[str, float]] = ()
+        flows: List[Mapping[str, float]] = []
         transfer_reader = getattr(reader, "transfers", None)
         if callable(transfer_reader):
             try:
-                flows = tuple(await asyncio.to_thread(transfer_reader))
+                flows.extend(await asyncio.to_thread(transfer_reader))
             except Exception as exc:                          # noqa: BLE001 - 流水失败不挡 dd
                 store.log_event(
                     "dd_update_failed",
                     "出入金流水读取失败，按无流水推进（若该时段有出入金，TWR 会失真）: "
                     f"{type(exc).__name__}: {exc}",
                     data={"reason": "flows_unavailable"}, ts=time.time())
+        flows.extend(_stored_flows_for_replay(store))
+        inferred = _inferred_flow_for_tick(store, executor)
+        if inferred is not None:
+            flows.append(inferred)
         try:
             state = DrawdownGuard(store, limits=_limits()).update(
-                equity=float(equity), ts=time.time(), flows=flows)
+                equity=float(equity), ts=time.time(), flows=tuple(flows))
             logger.info("dd advanced: index=%.6f peak=%.6f action=%s",
                         state.index, state.peak, state.action)
         except Exception as exc:                              # noqa: BLE001 - DD 不挂掉 tick

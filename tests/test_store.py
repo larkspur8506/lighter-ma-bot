@@ -69,19 +69,21 @@ class StoreTestCase(unittest.TestCase):
 
 class SchemaTests(StoreTestCase):
     def test_fresh_database_is_at_current_version(self):
-        self.assertEqual(self.store.schema_version, 2)
-        self.assertEqual(SCHEMA_VERSION, 2)
+        self.assertEqual(self.store.schema_version, SCHEMA_VERSION)
+        self.assertEqual(SCHEMA_VERSION, 3)
 
     def test_all_tables_and_indexes_exist(self):
         names = {row["name"] for row in self.store._fetchall(
             "SELECT name FROM sqlite_master WHERE type='table'")
             if not row["name"].startswith("sqlite_")}
         self.assertEqual(names, {"positions", "trades", "equity_curve", "daily_counters",
-                                 "dd_anchors", "dd_state", "events"})
+                                 "dd_anchors", "dd_state", "events", "account_flows"})
         indexes = {row["name"] for row in self.store._fetchall(
             "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")}
         self.assertIn("idx_trades_symbol_ts", indexes)
         self.assertIn("idx_positions_symbol_state", indexes)
+        self.assertIn("idx_account_flows_ts", indexes)
+        self.assertIn("ux_account_flows_dedupe", indexes)
 
     def test_positions_columns_include_v2_additions(self):
         cols = {row["name"] for row in self.store._fetchall("PRAGMA table_info(positions)")}
@@ -92,9 +94,9 @@ class SchemaTests(StoreTestCase):
                          "client_order_index"} <= cols)
 
     def test_migrate_is_idempotent(self):
-        self.assertEqual(self.store.migrate(), 2)
-        self.assertEqual(self.store.migrate(), 2)
-        self.assertEqual(self.store.schema_version, 2)
+        self.assertEqual(self.store.migrate(), SCHEMA_VERSION)
+        self.assertEqual(self.store.migrate(), SCHEMA_VERSION)
+        self.assertEqual(self.store.schema_version, SCHEMA_VERSION)
 
     def test_old_v1_database_is_upgraded_in_place(self):
         """老库（user_version=1，没有 v2 的列）能被新代码直接打开并保留数据。"""
@@ -115,7 +117,7 @@ class SchemaTests(StoreTestCase):
 
         upgraded = StateStore(path)
         self.addCleanup(upgraded.close)
-        self.assertEqual(upgraded.schema_version, 2)
+        self.assertEqual(upgraded.schema_version, SCHEMA_VERSION)
         row = upgraded.position(1)
         self.assertEqual(row["symbol"], "ETH")
         self.assertEqual(row["state"], "OPEN")
@@ -178,7 +180,7 @@ class SchemaTests(StoreTestCase):
         store = StateStore.from_config(FakeConfig())
         self.addCleanup(store.close)
         self.assertEqual(store.path, self.path)
-        self.assertEqual(store.schema_version, 2)
+        self.assertEqual(store.schema_version, SCHEMA_VERSION)
 
     def test_from_config_refuses_non_sqlite_url(self):
         class FakeConfig:
@@ -193,7 +195,7 @@ class SchemaTests(StoreTestCase):
         mem = StateStore(":memory:")
         self.addCleanup(mem.close)
         self.assertEqual(mem.journal_mode, "memory")
-        self.assertEqual(mem.schema_version, 2)
+        self.assertEqual(mem.schema_version, SCHEMA_VERSION)
         mem.record_entry(**entry_plan())
         self.assertEqual(mem.position_count(), 1)
 
@@ -312,7 +314,7 @@ class RoundTripTests(StoreTestCase):
 
         reopened = StateStore(self.path)
         self.addCleanup(reopened.close)
-        self.assertEqual(reopened.schema_version, 2)
+        self.assertEqual(reopened.schema_version, SCHEMA_VERSION)
         self.assertEqual(reopened.open_symbols(), ("BTC",))
         self.assertEqual(reopened.position(pid)["entry_price"], 80000.0)
         self.assertEqual(reopened.trade_count(), 1)
