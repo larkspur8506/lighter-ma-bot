@@ -385,19 +385,28 @@ def orders_from_payload(payload: Mapping[str, Any]) -> Tuple[ExchangeOrder, ...]
             raise ReaderError("orders payload contains a non-mapping entry")
         coi = _opt_int(row.get("client_order_index"))
         trigger = row.get("trigger_price")
-        out.append(ExchangeOrder(
+        raw_trigger = str(trigger).strip() if trigger not in (None, "") else None
+        symbol = str(row.get("market_symbol") or row.get("symbol") or "").strip().upper()
+        order = ExchangeOrder(
             order_id=str(row.get("order_id") or ""),
             client_order_index=coi,
             market_id=_opt_int(row.get("market_index", row.get("market_id"))),
-            symbol=str(row.get("market_symbol") or row.get("symbol") or "").strip().upper(),
+            symbol=symbol,
             reduce_only=bool(row.get("reduce_only")),
             trigger_price_int=(_opt_int(trigger) if str(trigger or "").strip().isdigit()
                                else None),
-            trigger_price_raw=(str(trigger).strip() if trigger not in (None, "") else None),
+            trigger_price_raw=raw_trigger,
             price_int=_opt_int(row.get("base_price")),
             qty_int=_opt_int(row.get("base_size")),
             status=str(row.get("status") or ""),
-            raw=dict(row)))
+            raw=dict(row))
+        if order.trigger_price_int is None and raw_trigger:
+            # 交易所给的是小数串（实测 `"trigger_price": "98.890"`）。这里就地按标的精度
+            # 换算成整数 tick —— 否则面板/对账看到的永远是 `trigger_price_int: null`。
+            ticks = _trigger_ticks(order, _price_decimals_for(symbol))
+            if ticks is not None:
+                order = replace(order, trigger_price_int=ticks)
+        out.append(order)
     return tuple(out)
 
 
