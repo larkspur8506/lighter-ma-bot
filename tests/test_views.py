@@ -34,6 +34,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
+import unittest.mock
 import weakref
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -162,9 +163,9 @@ class ModuleBoundaryTests(unittest.TestCase):
         # 只断言 import 图，不真去卸包；`app.views` 的模块级 import 全是 stdlib + 本项目。
         modules = self._imports(ROOT / "app" / "views.py")
         self.assertNotIn("lighter", modules)
-        self.assertTrue(all(m.split(".")[0] in ("app", "__future__", "html", "json",
-                                                "logging", "math", "time", "dataclasses",
-                                                "typing")
+        self.assertTrue(all(m.split(".")[0] in ("app", "__future__", "bisect", "html",
+                                                "json", "logging", "math", "time",
+                                                "dataclasses", "typing")
                             for m in modules), f"unexpected imports: {modules}")
 
 
@@ -965,6 +966,107 @@ class PanelStoreLifecycleTests(unittest.TestCase):
 
         store.conn.execute("select 1")      # 借用者的 close() 不许关别人的库
         self.assertFalse(store._closed)
+
+
+# --------------------------------------------------------------------------- 出入金跳变提示 + 指标缓存
+
+
+class UnexplainedJumpTests(unittest.TestCase):
+    """`_unexplained_equity_jumps`（审计 P2-3 的纯函数）：跳变 × 无成交 × 无流水覆盖。"""
+
+    def _points(self, rows):
+        return [{"ts": ts, "equity": eq, "cum_flow": cum} for ts, eq, cum in rows]
+
+    def test_big_jump_without_fills_or_flow_is_flagged(self) -> None:
+        # 101.0089 → 500.0089（+399，事故原样），区间无成交、cum_flow 不变 → 提示
+        pts = self._points([(T0, 101.0089, 0.0), (T0 + 1800, 500.0089, 0.0)])
+        jumps = views._unexplained_equity_jumps(pts, [])
+        self.assertEqual(len(jumps), 1)
+        self.assertAlmostEqual(jumps[0]["delta"], 399.0, places=6)
+        self.assertEqual(jumps[0]["ts"], T0 + 1800)
+
+    def test_jump_covered_by_flow_is_not_flagged(self) -> None:
+        # 同样的跳变，但 cum_flow 同步 +399（流水已入账）→ 不提示
+        pts = self._points([(T0, 101.0089, 0.0), (T0 + 1800, 500.0089, 399.0)])
+        self.assertEqual(views._unexplained_equity_jumps(pts, []), [])
+
+    def test_jump_with_a_fill_in_interval_is_not_flagged(self) -> None:
+        # 区间内有一笔成交 → 可能是盈亏，不提示（fail-quiet，与推断同一方向）
+        pts = self._points([(T0, 100.0, 0.0), (T0 + 1800, 400.0, 0.0)])
+        self.assertEqual(views._unexplained_equity_jumps(pts, [T0 + 900]), [])
+
+    def test_small_swing_is_not_flagged(self) -> None:
+        # 5U 阈值以下（含 5% 比例）的波动 → 静默：持仓浮盈浮亏 30 分钟内常见
+        pts = self._points([(T0, 500.0, 0.0), (T0 + 1800, 503.0, 0.0)])
+        self.assertEqual(views._unexplained_equity_jumps(pts, []), [])
+
+    def test_latest_first_and_capped_at_three(self) -> None:
+        pts = []
+        for k in range(6):                       # 6 次跳变，每次 +100
+            pts.append((T0 + k * 1800, 100.0 + k * 100.0, 0.0))
+        jumps = views._unexplained_equity_jumps(self._points(pts), [])
+        self.assertEqual(len(jumps), 3)
+        self.assertEqual([j["ts"] for j in jumps],
+                         [T0 + 5 * 1800, T0 + 4 * 1800, T0 + 3 * 1800])
+
+    def test_records_block_surfaces_the_warning(self) -> None:
+        store = make_store(self.tmp)
+        self.addCleanup(store.close)
+        store.record_equity(101.0089, ts=T0, source="exchange")
+        store.record_equity(500.0089, ts=T0 + 1800, source="exchange")
+        panel = views.Panel(lambda: store, now=lambda: T0 + 3600.0)
+        block = panel.records()
+        self.assertTrue(any("跳变" in w and "backfill_flow" in w
+                            for w in block["warnings"]))
+        self.assertEqual(len(block["funds"]["unexplained_jumps"]), 1)
+        self.assertIn("跳变", panel.records_page())            # HTML 里可见
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.store = make_store(self.tmp)
+        self.addCleanup(self.store.close)
+
+
+class SymbolIndicatorsCacheTests(unittest.TestCase):
+    """`_indicators_for`：同一代 bar 只算一次，换代重算（现价列不受缓存影响）。"""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = make_store(tmp.name)
+        self.addCleanup(self.store.close)
+        self.calls = {"n": 0}
+        real = strategy.compute_indicators
+
+        def counting(bars):
+            self.calls["n"] += 1
+            return real(bars)
+
+        self._patcher = unittest.mock.patch.object(strategy, "compute_indicators",
+                                                   side_effect=counting)
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+
+    def test_same_generation_computes_once(self) -> None:
+        from tests.test_admin import flat_bars as admin_flat_bars
+        bars = admin_flat_bars(1_740_000_000_000, 300, 100.0)
+        panel = views.Panel(lambda: self.store,
+                            sources=views.Sources(bars=lambda symbol: bars,
+                                                  prices=lambda: {"BTC": 100.0}),
+                            now=lambda: 1_740_000_000_000 / 1000.0)
+        panel.symbols_block()
+        panel.symbols_block()
+        panel.symbols_block()
+        self.assertEqual(self.calls["n"], 3)             # 三次请求 × 三标的，各算一次
+
+        newer = admin_flat_bars(1_740_000_000_000 + BAR_MS, 300, 100.0)
+        panel.sources.bars = lambda symbol: newer        # bar 换代
+        panel.symbols_block()
+        self.assertEqual(self.calls["n"], 6)             # 换代后重算
+        # 缓存只留当前一代（三标的各一条）
+        self.assertEqual(len(panel._symbol_ind_cache), 3)
 
 
 if __name__ == "__main__":

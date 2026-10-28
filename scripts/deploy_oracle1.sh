@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+# ⛔⛔⛔ 本脚本已废弃，执行即退出（2026-10-28 硬警告） ⛔⛔⛔
+#
+# 原因：本脚本硬写 `PANEL_SCHEDULER=0` + `LIGHTER_LIVE_TRADING=0`，照它重部署会把
+# **真钱模式静默降级成纯面板**（调度停摆 + 永不下单，而 healthcheck 依旧全绿）。
+#
+# 唯一权威的重部署路径：oracle1 上的 `sudo python3 /opt/lighter-ma-bot/deploy.py`
+# （从运行中容器继承 env/CMD，旧容器留作回滚点，详见 docs/DEPLOY.md §3）。
+echo "⛔ scripts/deploy_oracle1.sh 已废弃：它会静默把真钱模式降级为纯面板。" >&2
+echo "   重部署请用：sudo python3 /opt/lighter-ma-bot/deploy.py --expect-rev <sha前缀>" >&2
+echo "   说明见 docs/DEPLOY.md §3。本脚本保留仅为历史记录，请勿删除这段警告。" >&2
+exit 1
+
 # 在 oracle1 上部署 lighter-ma-bot
 # 用法: sudo bash deploy_lighter.sh
 #

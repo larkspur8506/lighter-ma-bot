@@ -55,6 +55,7 @@
 
 from __future__ import annotations
 
+import bisect
 import html
 import json
 import logging
@@ -312,6 +313,53 @@ def _flows_from_points(points: Sequence[Any]) -> List[Dict[str, float]]:
     return flows
 
 
+#: 入金跳变检测阈值（2026-10-28 审计 P2-3）：区间无成交且权益变化 ≥ max(JUMP_ABS_U,
+#: JUMP_PCT × 上一格权益) 时提示「可能有出入金没被流水覆盖」。5% 是「无成交时持仓
+#: 浮动盈亏 30 分钟内大概率到不了」的量级——宁可漏报小出入金，不能每次持仓波动都喊。
+JUMP_ABS_U = 5.0
+JUMP_PCT = 0.05
+
+
+def _unexplained_equity_jumps(points: Sequence[Any],
+                              trade_ts: Sequence[float],
+                              *, abs_u: float = JUMP_ABS_U,
+                              pct: float = JUMP_PCT) -> List[Dict[str, Any]]:
+    """找出「权益跳变但没有任何成交解释、也没有流水覆盖」的区间（纯函数，可测）。
+
+    背景：`infer_transfer_flow` 在区间内有持仓/成交时**保守放弃**推断——那笔出入金
+    就会静默混进 cum_pnl（2026-10-28 的 399 USDC 事故）。这里给面板一个显眼的提示，
+    而不是让人对着失真的盈亏曲线发呆。**只是提示**，不参与任何计算。
+
+    判定：相邻两个权益点之间 (t0, t1] 内 (a) 没有任何成交时间戳，(b) `cum_flow`
+    差为 0（该区间没有流水入账），(c) |Δequity| ≥ max(abs_u, pct × equity_t0)。
+    返回最新的在前，最多 3 条。
+    """
+    stamps = sorted(float(t) for t in trade_ts if t and t > 0)
+    cleaned: List[Tuple[float, float, float]] = []
+    for row in points:
+        ts = _finite(_row_get(row, "ts"))
+        eq = _finite(_row_get(row, "equity"))
+        cum = _finite(_row_get(row, "cum_flow"))
+        if ts is None or eq is None:
+            continue
+        cleaned.append((float(ts), float(eq), float(cum if cum is not None else 0.0)))
+    rows: List[Dict[str, Any]] = []
+    for (t0, e0, c0), (t1, e1, c1) in zip(cleaned, cleaned[1:]):
+        delta = e1 - e0
+        if abs(delta) < max(abs_u, pct * e0):
+            continue
+        if c1 != c0:
+            continue                                  # 有流水覆盖 → 已剔除，不提示
+        i = bisect.bisect_right(stamps, t0)
+        j = bisect.bisect_right(stamps, t1)
+        if j > i:
+            continue                                  # 区间内有成交 → 可能是盈亏
+        rows.append({"ts": t1, "delta": delta,
+                     "equity_before": e0, "equity_after": e1})
+    rows.sort(key=lambda r: r["ts"], reverse=True)
+    return rows[:3]
+
+
 def pnl_curve(points: Sequence[Any], *, anchor_ts: Optional[float] = None,
               anchor_equity: Optional[float] = None,
               flows: Optional[Sequence[Any]] = None) -> Dict[str, Any]:
@@ -490,6 +538,12 @@ class Panel:
         # 方向开关与执行器同源（`Executor(sides=...)`）。今天两侧都开；面板必须拿同一份，
         # 否则关掉某个方向后面板还会说「可开多」——那种假阳性比没有这一列更糟。
         self.sides: Tuple[int, ...] = tuple(int(s) for s in sides if int(s) in (1, -1)) or (1, -1)
+        # 三标的动态的指标记忆化（审计 P3）：`compute_indicators` 要扫每标的 ~3900 根
+        # bar，原来每个 /symbols 请求重算 3 份。按「代」失效——任一标的的最后一根 bar
+        # 换代（bar_ms 前进）就整体清空；同一代内每个标的小程序只算一次。现价相关的列
+        # 照常每次重算，不受缓存影响。
+        self._symbol_ind_gen: Optional[Tuple[int, int]] = None
+        self._symbol_ind_cache: Dict[str, Any] = {}
 
     def __repr__(self) -> str:
         state = ("closed" if self._closed
@@ -1005,6 +1059,19 @@ class Panel:
     def symbols_block(self) -> Dict[str, Any]:
         return self._guard(BLOCK_SYMBOLS, self._symbols, _symbols_fallback)
 
+    def _indicators_for(self, symbol: str, bars: Sequence[Any]) -> Tuple[Any, Any]:
+        """`compute_indicators` + `squeeze_flags` 的按代记忆化（见 `__init__` 注释）。"""
+        gen = (int(_row_get(bars[-1], "open_ms") or 0), len(bars))
+        if gen != self._symbol_ind_gen:
+            self._symbol_ind_gen = gen
+            self._symbol_ind_cache.clear()                # bar 换代 → 整体失效
+        cached = self._symbol_ind_cache.get(symbol)
+        if cached is None:
+            ind = strategy.compute_indicators(bars)
+            cached = (ind, strategy.squeeze_flags(ind["band"]))
+            self._symbol_ind_cache[symbol] = cached
+        return cached
+
     #: `Panel.symbols` 是标的元组（属性名），所以区块方法叫 `symbols_block()`
     #: 以免撞名；`GET /symbols` 调它。
     def _symbols(self) -> Dict[str, Any]:
@@ -1047,8 +1114,7 @@ class Panel:
         bars = list(self.sources.bars(symbol) or [])          # type: ignore[misc]
         if not bars:
             return _symbol_empty(symbol, reason="没有 K 线")
-        ind = strategy.compute_indicators(bars)
-        squeeze = strategy.squeeze_flags(ind["band"])
+        ind, squeeze = self._indicators_for(symbol, bars)
         i = len(bars) - 1
         price = _finite(prices.get(symbol))
         if price is None:
@@ -1218,6 +1284,22 @@ class Panel:
             state = store.dd_state() or {}
         except Exception as exc:                              # noqa: BLE001
             warnings.append(f"读回撤状态失败: {type(exc).__name__}: {exc}")
+        # 入金没被流水覆盖的权益跳变（审计 P2-3）：`infer_transfer_flow` 在区间内有
+        # 持仓/成交时保守放弃，那笔出入金会静默混进 cum_pnl —— 这里显眼地提示出来。
+        try:
+            all_ts = [t for t in (_finite(_row_get(r, "ts"))
+                                  for r in store.trades(limit=5000)) if t]
+            jumps = _unexplained_equity_jumps(points, all_ts)
+        except Exception as exc:                              # noqa: BLE001 - 提示失败不影响区块
+            jumps = []
+            warnings.append(f"权益跳变检测失败: {type(exc).__name__}: {exc}")
+        for jump in jumps:
+            stamp = time.strftime("%m-%d %H:%M", time.gmtime(jump["ts"]))
+            sign = "+" if jump["delta"] > 0 else ""
+            warnings.append(
+                f"权益在 {stamp} UTC 跳变 {sign}{jump['delta']:.2f} U 且区间内无成交、"
+                "无流水覆盖 —— 如有出入金请用 scripts/backfill_flow.py 补录"
+                "（有持仓时的价格波动也会触发本提示，可忽略）")
         funds = {
             "equity": _finite(_row_get(last, "equity")),
             "equity_ts": _finite(_row_get(last, "ts")),
@@ -1229,6 +1311,7 @@ class Panel:
             "trade_count": int(store.trade_count() or 0),
             "fee_total": fee_total,
             "realized_total": float(store.realized_pnl() or 0.0),
+            "unexplained_jumps": jumps,
             "shown": len(rows),
             "limit": MAX_RECORD_ROWS,
         }
@@ -1841,7 +1924,7 @@ def _records_fallback(warning: str, *, as_of: Optional[float] = None) -> Dict[st
         "funds": {"equity": 0.0, "equity_ts": None, "net_flow": 0.0, "twr_index": None,
                   "twr_peak": None, "anchor_ts": None, "anchor_equity": None,
                   "trade_count": 0, "fee_total": 0.0, "realized_total": 0.0,
-                  "shown": 0, "limit": MAX_RECORD_ROWS},
+                  "unexplained_jumps": [], "shown": 0, "limit": MAX_RECORD_ROWS},
         "trades": [], "count": 0, "warnings": [warning], "degraded": True,
     }
 
