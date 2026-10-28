@@ -322,6 +322,7 @@ JUMP_PCT = 0.05
 
 def _unexplained_equity_jumps(points: Sequence[Any],
                               trade_ts: Sequence[float],
+                              flow_ts: Sequence[float] = (),
                               *, abs_u: float = JUMP_ABS_U,
                               pct: float = JUMP_PCT) -> List[Dict[str, Any]]:
     """找出「权益跳变但没有任何成交解释、也没有流水覆盖」的区间（纯函数，可测）。
@@ -330,11 +331,13 @@ def _unexplained_equity_jumps(points: Sequence[Any],
     就会静默混进 cum_pnl（2026-10-28 的 399 USDC 事故）。这里给面板一个显眼的提示，
     而不是让人对着失真的盈亏曲线发呆。**只是提示**，不参与任何计算。
 
-    判定：相邻两个权益点之间 (t0, t1] 内 (a) 没有任何成交时间戳，(b) `cum_flow`
-    差为 0（该区间没有流水入账），(c) |Δequity| ≥ max(abs_u, pct × equity_t0)。
-    返回最新的在前，最多 3 条。
+    判定：相邻两个权益点之间 (t0, t1] 内 (a) 没有任何成交时间戳，(b) 没有任何流水
+    时间戳（`account_flows` 表，**含**锚点之前补录的历史流水—— cum_flow 列只反映
+    当前锚点之后的流水，只看它会误报已补录的跳变），(c) cum_flow 列差为 0，
+    (d) |Δequity| ≥ max(abs_u, pct × equity_t0)。返回最新的在前，最多 3 条。
     """
-    stamps = sorted(float(t) for t in trade_ts if t and t > 0)
+    stamps = sorted(float(t) for t in list(trade_ts) + list(flow_ts)
+                    if t and t > 0)
     cleaned: List[Tuple[float, float, float]] = []
     for row in points:
         ts = _finite(_row_get(row, "ts"))
@@ -1289,7 +1292,9 @@ class Panel:
         try:
             all_ts = [t for t in (_finite(_row_get(r, "ts"))
                                   for r in store.trades(limit=5000)) if t]
-            jumps = _unexplained_equity_jumps(points, all_ts)
+            flow_ts = [t for t in (_finite(_row_get(r, "ts"))
+                                   for r in store.flows()) if t]
+            jumps = _unexplained_equity_jumps(points, all_ts, flow_ts)
         except Exception as exc:                              # noqa: BLE001 - 提示失败不影响区块
             jumps = []
             warnings.append(f"权益跳变检测失败: {type(exc).__name__}: {exc}")

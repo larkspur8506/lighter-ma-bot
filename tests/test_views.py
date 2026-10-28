@@ -995,6 +995,13 @@ class UnexplainedJumpTests(unittest.TestCase):
         pts = self._points([(T0, 100.0, 0.0), (T0 + 1800, 400.0, 0.0)])
         self.assertEqual(views._unexplained_equity_jumps(pts, [T0 + 900]), [])
 
+    def test_jump_covered_by_a_backfilled_flow_is_not_flagged(self) -> None:
+        # 补录过的流水在当前锚点之前（cum_flow 列看不到）→ 靠 account_flows 的
+        # 时间戳判覆盖，不许误报（2026-10-28 线上实测的第一版就栽在这）
+        pts = self._points([(T0, 101.0089, 0.0), (T0 + 1800, 500.0089, 0.0)])
+        self.assertEqual(
+            views._unexplained_equity_jumps(pts, [], [T0 + 900]), [])
+
     def test_small_swing_is_not_flagged(self) -> None:
         # 5U 阈值以下（含 5% 比例）的波动 → 静默：持仓浮盈浮亏 30 分钟内常见
         pts = self._points([(T0, 500.0, 0.0), (T0 + 1800, 503.0, 0.0)])
