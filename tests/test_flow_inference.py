@@ -177,17 +177,18 @@ class AccountFlowsStoreTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 self.store.record_flow(amount, ts=DEPOSIT_TS)
 
-    def test_v2_database_migrates_to_v3_and_flows_work(self) -> None:
+    def test_v2_database_migrates_to_current_and_flows_work(self) -> None:
         # 线上库就是这条路径：老库（user_version=2）升级后 account_flows 可用。
+        # v3 加 account_flows、v4 加 positions.stop_expiry_ts（2026-10-29），一路升到 SCHEMA_VERSION。
         path = os.path.join(self._tmp.name, "legacy.db")
         legacy = sqlite3.connect(path)
         legacy.execute("PRAGMA user_version=2")
         legacy.commit()
         legacy.close()
-        self.assertEqual(SCHEMA_VERSION, 3)
+        self.assertGreaterEqual(SCHEMA_VERSION, 3)
         store = StateStore(path)
         self.addCleanup(store.close)
-        self.assertEqual(store.schema_version, 3)
+        self.assertEqual(store.schema_version, SCHEMA_VERSION)
         self.assertTrue(store.record_flow(399.0, ts=DEPOSIT_TS, source="manual"))
         self.assertEqual([r["amount"] for r in store.flows()], [399.0])
 
