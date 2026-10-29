@@ -75,11 +75,12 @@ import logging
 import math
 import os
 import time
+from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
 from app import views, watchdog
 from app.dd import DdError, DrawdownGuard
@@ -1297,6 +1298,36 @@ def create_app(*, panel: Optional[views.Panel] = None,
     @app.get("/pnl")
     def pnl() -> JSONResponse:
         return JSONResponse(content=panel.pnl())
+
+    # -------------------------------------------------- 手机主屏图标 / PWA 静态资源
+    # 2026-10-29：用户把面板加到手机桌面当 app 用，补 apple-touch-icon / favicon /
+    # manifest（图标 = 靛紫渐变 $ 圆环，随镜像打包，自包含约束不受影响）。
+    _static_dir = Path(__file__).resolve().parent / "static"
+
+    @app.get("/apple-touch-icon.png")
+    def apple_touch_icon() -> FileResponse:
+        return FileResponse(_static_dir / "apple-touch-icon.png", media_type="image/png")
+
+    @app.get("/favicon.ico")
+    def favicon_ico() -> FileResponse:
+        return FileResponse(_static_dir / "favicon.ico", media_type="image/x-icon")
+
+    @app.get("/favicon-32.png")
+    def favicon_32() -> FileResponse:
+        return FileResponse(_static_dir / "favicon-32.png", media_type="image/png")
+
+    @app.get("/icon-192.png")
+    def icon_192() -> FileResponse:
+        return FileResponse(_static_dir / "icon-192.png", media_type="image/png")
+
+    @app.get("/icon-512.png")
+    def icon_512() -> FileResponse:
+        return FileResponse(_static_dir / "icon-512.png", media_type="image/png")
+
+    @app.get("/manifest.webmanifest")
+    def webmanifest() -> FileResponse:
+        return FileResponse(_static_dir / "manifest.webmanifest",
+                            media_type="application/manifest+json")
 
     @app.get("/symbols")
     def symbols_block() -> JSONResponse:
