@@ -971,16 +971,18 @@ class Panel:
                 "warnings": warnings, "degraded": bool(warnings)}
 
     def _exit_price_for(self, symbol: str) -> Optional[float]:
-        """策略离场线 = 最后一根**已收盘** 4h bar 的 SMA20（与信号层同一套指标）。
+        """策略离场线 = SMA20（与「三标的动态」里那条离场线**同一口径**）。
 
         离场判定是「收盘价 vs SMA20」（多单收盘跌破 / 空单收盘升破），不是盘中触价 ——
         所以这里给的是**参考线**，不是一定会成交的价。
-        只读 tick 缓存下来的 K 线（`cached_bars`），拿不到就返回 None。
+        优先用 K 线 provider（它内部先读 tick 缓存、再按 TTL 回源），保证与三标的动态一致；
+        没有 provider 才退回只读缓存。
         """
-        if self.sources.cached_bars is None:
+        provider = self.sources.bars if self.sources.bars is not None else self.sources.cached_bars
+        if provider is None:
             return None
         try:
-            bars = list(self.sources.cached_bars(symbol) or ())
+            bars = list(provider(symbol) or ())
         except Exception:                                     # noqa: BLE001 - 只影响一列
             return None
         if not bars:
@@ -989,8 +991,8 @@ class Panel:
             ind, _ = self._indicators_for(symbol, bars)
         except Exception:                                     # noqa: BLE001
             return None
-        values = ind.get("sma20") or [None]
-        return _finite(values[-1] if values else None)
+        values = ind.get("sma20") or []
+        return _finite(values[-1]) if values else None
 
     def _position_row(self, row: Any, symbol: str, prices: Mapping[str, float],
                       now: float, snap: Optional[Mapping[str, Any]] = None,
