@@ -87,9 +87,27 @@ def seed(store: StateStore) -> None:
 
 
 def fake_orders() -> List[Dict[str, Any]]:
-    """交易所侧：BTC 止损单在、数量覆盖（1.0 = 仓位的 1.0）。"""
+    """交易所侧：BTC 止损单在、数量覆盖（1.0 = 仓位的 1.0）。
+
+    ⚠️ 这是**旧形态**（price/qty）。生产上 `views.Sources.orders` 喂的是
+    `ExchangeOrder.as_dict()`（只有 int 形态 + 触发价，没有 price/qty）——
+    只用这一份夹具测，会把「面板永远报止损没挂」的 bug 全绿放过（线上实测踩过）。
+    生产形态见 `prod_orders()`。
+    """
     return [{"symbol": "BTC", "price": 6300.0, "qty": 1.0, "order_id": "stop-1",
              "reduce_only": True}]
+
+
+def prod_orders(trigger_int: int = 630_000, price_int: int = 629_400,
+                qty_int: int = 100_000, reduce_only: bool = True,
+                coi: int = 777_000_111, symbol: str = "BTC",
+                pending_confirm: bool = False) -> List[Dict[str, Any]]:
+    """**生产形态**：`ExchangeOrder.as_dict()` 的真实键（实测自 oracle1 的活挂单）。"""
+    return [{"order_id": "1125898605399395", "client_order_index": coi, "market_id": 1,
+             "symbol": symbol, "reduce_only": reduce_only,
+             "trigger_price_int": trigger_int, "trigger_price_raw": f"{trigger_int/100:.3f}",
+             "price_int": price_int, "qty_int": qty_int, "status": "pending",
+             "pending_confirm": pending_confirm}]
 
 
 def flat_bars(start_ms: int, count: int, price: float) -> List[strategy.Bar]:
@@ -165,7 +183,7 @@ class ModuleBoundaryTests(unittest.TestCase):
         self.assertNotIn("lighter", modules)
         self.assertTrue(all(m.split(".")[0] in ("app", "__future__", "bisect", "html",
                                                 "json", "logging", "math", "time",
-                                                "dataclasses", "typing")
+                                                "dataclasses", "decimal", "typing")
                             for m in modules), f"unexpected imports: {modules}")
 
 
@@ -536,6 +554,77 @@ class RecordsTests(PanelFixture):
 
 
 # --------------------------------------------------------------------------- 5. 降级
+
+
+class StopCoverageTests(PanelFixture):
+    """「止损覆盖」的判据必须能吃**生产形态**的挂单（`ExchangeOrder.as_dict()`）。
+
+    2026-10-29 线上实测的假警报：交易所明明挂着一张 SOL 止损（trigger 105.257、
+    reduce_only、剩余 1.191，status=pending），面板却报「交易所没有这张止损单」。
+    根因是 `as_dict()` 只有 `price_int`/`qty_int`/`trigger_price_int`，而面板按
+    `price`/`qty` 取值 → 恒为 None → 每一张真实止损单都被跳过。
+    """
+
+    def _stops(self, orders: List[Dict[str, Any]], *, store_seed: bool = True) -> Dict[str, Any]:
+        if store_seed:
+            seed(self.store)
+        panel = self.panel(sources=views.Sources(orders=lambda: orders))
+        return panel.stops()
+
+    def test_production_shape_is_recognised_by_trigger_price(self) -> None:
+        block = self._stops(prod_orders())
+        self.assertTrue(block["all_protected"], block["warnings"])
+        row = block["stops"][0]
+        self.assertEqual(row["exchange_status"], "present")
+        self.assertEqual(row["note"], "已覆盖")
+        # 数量从 qty_int + size_decimals 换算回 base 单位（100000 / 10^5 = 1.0）
+        self.assertAlmostEqual(row["order_qty"], 1.0)
+
+    def test_match_by_client_order_index_wins(self) -> None:
+        """coi 命中时连触发价都不用比（老仓位/换价重挂都靠它）。"""
+        seed(self.store)
+        self.store.conn.execute("UPDATE positions SET stop_order_id='coi:777000111'")
+        self.store.conn.commit()
+        block = self.panel(sources=views.Sources(orders=lambda: prod_orders(trigger_int=630_500))).stops()
+        self.assertEqual(block["stops"][0]["exchange_status"], "present")
+
+    def test_limit_price_alone_is_not_a_stop(self) -> None:
+        """只有 `price_int`（触发后最差成交价）不算止损 —— 不能退回按它比。"""
+        orders = [{"symbol": "BTC", "reduce_only": True, "price_int": 630_000,
+                   "qty_int": 100_000, "client_order_index": 1, "market_id": 1}]
+        block = self._stops(orders)
+        self.assertEqual(block["stops"][0]["exchange_status"], "missing")
+        self.assertIn("没有", block["stops"][0]["note"])
+
+    def test_one_tick_off_still_matches_five_ticks_does_not(self) -> None:
+        seed(self.store)
+        near = self.panel(sources=views.Sources(orders=lambda: prod_orders(trigger_int=630_001))).stops()
+        self.assertEqual(near["stops"][0]["exchange_status"], "present")
+        far = self.panel(sources=views.Sources(orders=lambda: prod_orders(trigger_int=630_005))).stops()
+        self.assertEqual(far["stops"][0]["exchange_status"], "missing")
+
+    def test_trigger_raw_string_is_converted_with_price_decimals(self) -> None:
+        """解析层拿不到 decimals 时 `trigger_price_int` 是 None，只用原始串也要能比。"""
+        orders = [{"symbol": "BTC", "reduce_only": True, "trigger_price_raw": "6300.00",
+                   "qty_int": 100_000, "client_order_index": 1, "market_id": 1}]
+        block = self._stops(orders)
+        self.assertEqual(block["stops"][0]["exchange_status"], "present")
+
+    def test_partial_size_and_non_reduce_only_are_flagged(self) -> None:
+        seed(self.store)
+        partial = self.panel(sources=views.Sources(
+            orders=lambda: prod_orders(qty_int=50_000))).stops()
+        self.assertEqual(partial["stops"][0]["exchange_status"], "partial")
+        bad = self.panel(sources=views.Sources(
+            orders=lambda: prod_orders(reduce_only=False))).stops()
+        self.assertEqual(bad["stops"][0]["exchange_status"], "mismatch")
+
+    def test_pending_confirm_note_says_awaiting_next_read(self) -> None:
+        seed(self.store)
+        block = self.panel(sources=views.Sources(
+            orders=lambda: prod_orders(pending_confirm=True))).stops()
+        self.assertEqual(block["stops"][0]["exchange_status"], "present")
+        self.assertIn("下一轮读数复核", block["stops"][0]["note"])
 
 
 class DegradedTests(unittest.TestCase):

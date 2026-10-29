@@ -990,5 +990,47 @@ class LiveGateStatusTests(unittest.TestCase):
         self.assertIs(status["live_gate"]["enabled"], False)
 
 
+class MergeAcceptedStopsTests(unittest.TestCase):
+    """开仓那一轮要把「交易所已受理」的止损单并进面板缓存。
+
+    否则面板在下一轮 tick（最长 30 分钟）之前看不到这张单，把刚挂好的止损报成
+    「没挂」——2026-10-29 线上就撞上过这个窗口（tick 开头读挂单，止损几秒后才下）。
+    """
+
+    def _report(self, **stop: Any) -> Any:
+        base = {"ok": True, "dry_run": False, "symbol": "SOL", "market_id": 2,
+                "client_order_index": 215_019_876_741_086, "trigger_price_int": 105_257,
+                "price_int": 106_310, "qty_int": 1_191}
+        base.update(stop)
+        outcome = executor_mod.SymbolOutcome(symbol="SOL", action="entry", stop_order=base)
+        return executor_mod.TickReport(outcomes=(outcome,))
+
+    def test_accepted_stop_is_merged_and_marked_pending(self) -> None:
+        cache = main.PanelCache()
+        cache.update(orders=[], prices={"SOL": 99.0})
+        self.assertEqual(main.merge_accepted_stops(cache, self._report()), 1)
+        got = cache.orders()
+        self.assertEqual(len(got), 1)
+        self.assertIs(got[0]["pending_confirm"], True)
+        self.assertEqual(got[0]["client_order_index"], 215_019_876_741_086)
+        self.assertEqual(got[0]["trigger_price_int"], 105_257)
+        # 幂等：同一张单再并一次不会出现第二行
+        self.assertEqual(main.merge_accepted_stops(cache, self._report()), 0)
+        self.assertEqual(len(cache.orders()), 1)
+
+    def test_rejected_or_dry_run_stop_is_not_merged(self) -> None:
+        cache = main.PanelCache()
+        cache.update(orders=[])
+        self.assertEqual(main.merge_accepted_stops(cache, self._report(ok=False)), 0)
+        self.assertEqual(main.merge_accepted_stops(cache, self._report(dry_run=True)), 0)
+        self.assertEqual(cache.orders(), [])
+
+    def test_cold_cache_stays_unknown(self) -> None:
+        """从未采集过挂单时不合并 —— 保持「未知」，绝不编一张单出来。"""
+        cache = main.PanelCache()
+        self.assertEqual(main.merge_accepted_stops(cache, self._report()), 0)
+        self.assertIsNone(cache.orders_value)
+
+
 if __name__ == "__main__":
     unittest.main()
