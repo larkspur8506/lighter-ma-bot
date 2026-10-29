@@ -89,7 +89,7 @@ from app.exchange import OrderResult, _site_root, client_order_index
 from app.lifecycle import (ACTION_ENTRY, ACTION_EXIT, ACTION_SKIP, ACTION_STOP,
                            IDLE, OPEN, Decision, Lifecycle, Rejection)
 from app.risk import RiskLimits, RiskState
-from app.sizing import SizingConfig, from_int_qty, to_int_price
+from app.sizing import OrderPlan, SizingConfig, from_int_qty, to_int_price
 from app.state import StateAssembler
 from app.store import OPEN_STATES, StateStore
 
@@ -196,6 +196,9 @@ class ExchangeOrder:
     trigger_price_raw: Optional[str] = None
     price_int: Optional[int] = None
     qty_int: Optional[int] = None
+    #: 交易所侧的订单到期时刻（epoch **毫秒**）。挂单到期会被交易所自动废单 ——
+    #: 止损守护靠它判断「临期换单」；老库没有这一列时也用它回填。
+    order_expiry_ms: Optional[int] = None
     status: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict)
 
@@ -270,6 +273,17 @@ def _opt_int(value: Any) -> Optional[int]:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+def _finite_or_none(value: Any) -> Optional[float]:
+    """有穷浮点或 None（不是 0 兜底：0 / 缺列都当「不知道」）。"""
+    if value is None or value == "":
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
 
 
 def positions_from_payload(payload: Mapping[str, Any], *,
@@ -431,6 +445,7 @@ def orders_from_payload(payload: Mapping[str, Any]) -> Tuple[ExchangeOrder, ...]
             trigger_price_raw=raw_trigger,
             price_int=_opt_int(row.get("base_price")),
             qty_int=_opt_int(row.get("base_size")),
+            order_expiry_ms=_opt_int(row.get("order_expiry")),
             status=str(row.get("status") or ""),
             raw=dict(row))
         if order.trigger_price_int is None and raw_trigger:
@@ -642,6 +657,16 @@ class LighterAccountReader(AccountReader):
 
     def _get(self, url: str, headers: Mapping[str, str]) -> Any:
         return self._http_json(url, headers=dict(headers), timeout=self.timeout)
+
+    async def active_orders(self) -> Tuple[ExchangeOrder, ...]:
+        """只读活挂单（不读账户/持仓）。止损守护用它轮询「新挂的单可见了吗」。
+
+        单独一个方法是为了省往返：换单的验证要轮询好几秒，每次都连账户一起读太浪费。
+        读失败**抛 ReaderError**（调用方按「还不知道」处理，绝不当成「没有挂单」）。
+        """
+        orders_url = self._url("/api/v1/accountActiveOrders", account_index=self.account_index)
+        return orders_from_payload(
+            await asyncio.to_thread(self._get, orders_url, self._auth_header()))
 
     async def read(self) -> ExchangeAccount:
         account_url = self._url("/api/v1/account", by="index", value=self.account_index)
@@ -1041,6 +1066,8 @@ class TickReport:
     circuit_open: bool = False
     failures: int = 0
     error: str = ""
+    #: 本轮止损守护做了什么（补挂/换单成功的那几张单；面板把它并进挂单缓存）
+    stop_guards: Tuple[Mapping[str, Any], ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -1109,6 +1136,7 @@ class Executor:
                  require_confirmation: bool = True,
                  stop_tolerance_ticks: int = DEFAULT_STOP_TOLERANCE_TICKS,
                  enforce_in_dry_run: bool = False,
+                 stop_guard: bool = True,
                  alert: Optional[Callable[[str, str], Any]] = None,
                  clock: Callable[[], float] = time.time,
                  now_ms: Optional[Callable[[], int]] = None) -> None:
@@ -1136,6 +1164,8 @@ class Executor:
         self.require_confirmation = bool(require_confirmation)
         self.stop_tolerance_ticks = max(0, int(stop_tolerance_ticks))
         self.enforce_in_dry_run = bool(enforce_in_dry_run)
+        #: 止损守护（补挂/换单）。默认开；`LIGHTER_STOP_GUARD=0` 关。
+        self.stop_guard = bool(stop_guard)
         self.alert = alert
         self.clock = clock
         self._now_ms = now_ms or (lambda: int(self.clock() * 1000))
@@ -1221,6 +1251,15 @@ class Executor:
         # ① 交易所真相（失败即整轮停手：没有读数就没有对账结论）
         account = await self.reader.read()
         self.last_account = account
+        # ①b 止损守护（2026-10-29）：先补保护、再对账 —— 缺止损就补挂、临期就换单。
+        #     放在对账之前是刻意的：刚补上的止损不该再触发一次「缺止损」的封锁/告警。
+        #     **只加保护**：不动仓位、不改信号、不碰离场判定。
+        stop_guards: Tuple[Mapping[str, Any], ...] = ()
+        if self.stop_guard and not self.dry_run:
+            account, guards = await self._guard_stops(account)
+            stop_guards = tuple(guards)
+            if stop_guards:
+                self.last_account = account
         # ② 对账（纯分析；先对账后动手）
         rec = self.reconcile(account)
         blocks: List[str] = []
@@ -1277,7 +1316,8 @@ class Executor:
                 return replace(report, status="error", outcomes=tuple(outcomes),
                                reconcile=rec, equity=account.equity,
                                blocked_entries=tuple(blocked_entries),
-                               block_reasons=tuple(blocks), error=failure)
+                               block_reasons=tuple(blocks), error=failure,
+                               stop_guards=stop_guards)
             outcomes.append(outcome)
 
         # 一轮跑完且本轮没有任何新的硬失败 → 连续失败清零（成功一次就重置是有意的：
@@ -1288,7 +1328,7 @@ class Executor:
         return replace(report, status=status, outcomes=tuple(outcomes), reconcile=rec,
                        equity=account.equity,
                        blocked_entries=tuple(blocked_entries),
-                       block_reasons=tuple(blocks))
+                       block_reasons=tuple(blocks), stop_guards=stop_guards)
 
     # ---------------------------------------------------------------- 取数
 
@@ -1407,6 +1447,17 @@ class Executor:
             decision, order_id=f"coi:{entry_coi}",
             stop_order_id=(f"coi:{stop_coi}" if stop_ok else None),
             equity=self._equity, ts=float(self.clock()))
+        if stop_ok and transition.position_id:
+            # 记下这张止损单的**到期时刻**：交易所到期就废单，止损守护据此临期换单。
+            # 记不上不影响交易（只是守护少一个判据，缺失时会按「无到期信息」跳过换单）。
+            expiry_ms = stop.order_expiry_ms or 0
+            try:
+                self.store.set_stop_order(int(transition.position_id),
+                                          stop_order_id=f"coi:{stop_coi}",
+                                          stop_expiry_ts=(expiry_ms / 1000.0) if expiry_ms else None,
+                                          ts=float(self.clock()))
+            except Exception as exc:                              # noqa: BLE001
+                logger.warning("could not persist the stop expiry: %s", exc)
         self._event("entry", f"{symbol} opened {plan.base_qty:g} @ {plan.entry_price:g} "
                              f"(stop {plan.stop_price:g})", symbol=symbol,
                     data={"bar_ms": bar_ms, "qty_int": int(plan.qty_int),
@@ -1552,6 +1603,205 @@ class Executor:
         return reconcile(local_positions=self.store.open_positions(), account=snap,
                          now=float(self.clock()),
                          stop_tolerance_ticks=self.stop_tolerance_ticks)
+
+    # ---------------------------------------------------------------- 止损守护
+    #
+    # 为什么需要（2026-10-29 线上事实）：Lighter 的挂单有 `orderExpiry`（我们下 28 天，
+    # 交易所上限 30 天），**到期由交易所自动废单**；而在此之前整个仓库只有「开仓那一刻」
+    # 会挂止损（`place_stop` 只有一个调用点），对账只会报 `stop_order_missing` 并阻断开仓。
+    # ⇒ 持仓一旦跨过到期时刻就是**裸奔且没有通知**。这一节只做两件事，都在保护侧：
+    #   1) 交易所没有止损（但仓还在）→ 按原止损价重挂，数量取本地仓位量；
+    #   2) 止损快到期（≤ STOP_RENEW_BEFORE_S）→ 先挂新单、确认在位、再撤旧单。
+    # 绝不动仓位、不改信号、不触离场；dry-run 下整段跳过。
+
+    #: 距到期多久开始换单。24h 给「连续两个 tick 失败」留出重试余量（tick 30 分钟一轮）。
+    STOP_RENEW_BEFORE_S: float = 24 * 3600.0
+    #: 挂完新单后等它出现在 activeOrders 的轮询（实测传播 0.8~1.5s，上限给到 ~6s）
+    STOP_VERIFY_ATTEMPTS: int = 4
+    STOP_VERIFY_INTERVAL_S: float = 1.5
+
+    def _stop_plan_from_row(self, row: Mapping[str, Any]) -> OrderPlan:
+        """用**仓位行**拼一个只够挂止损的 `OrderPlan`（字段全部来自建行时的冻结值）。"""
+        price_dec = int(row.get("price_decimals") or 0)
+        size_dec = int(row.get("size_decimals") or 0)
+        stop_int = int(row.get("stop_price_int") or 0)
+        qty_int = int(row.get("qty_int") or 0)
+        return OrderPlan(
+            symbol=str(row.get("symbol") or "").upper(),
+            market_id=int(row.get("market_id") or 0),
+            side=int(row.get("side") or 0),
+            entry_price=float(row.get("entry_price") or 0.0),
+            stop_price=stop_int / (10.0 ** price_dec) if price_dec >= 0 else 0.0,
+            stop_price_int=stop_int,
+            qty_int=qty_int,
+            base_qty=qty_int / (10.0 ** size_dec) if size_dec >= 0 else 0.0,
+            notional=0.0, margin=0.0, leverage=0.0, exchange_max_leverage=0.0,
+            risk_amount=0.0, risk_amount_target=0.0, stop_dist=0.0,
+            price_decimals=price_dec, size_decimals=size_dec,
+            equity=float(self._equity or 0.0))
+
+    async def _wait_stop_visible(self, coi: int) -> bool:
+        """等新挂的止损出现在交易所活挂单里。拿不到读数器能力时按「已受理」算通过。"""
+        fn = getattr(self.reader, "active_orders", None)
+        if fn is None:
+            return True
+        for _ in range(self.STOP_VERIFY_ATTEMPTS):
+            try:
+                orders = await fn()
+            except Exception as exc:                              # noqa: BLE001 - 读不到继续等
+                logger.warning("stop guard: reading active orders failed: %s", exc)
+                orders = ()
+            if any(getattr(o, "client_order_index", None) == coi for o in orders or ()):
+                return True
+            await asyncio.sleep(self.STOP_VERIFY_INTERVAL_S)
+        return False
+
+    async def _replace_stop(self, row: Mapping[str, Any], *, reason: str,
+                            old: Optional[ExchangeOrder] = None
+                            ) -> Optional[Tuple[ExchangeOrder, Dict[str, Any]]]:
+        """挂一张新的止损单（可选：换掉 `old`）。返回 `(新单快照, 面板用 dict)`，失败 None。"""
+        symbol = str(row.get("symbol") or "").upper()
+        try:
+            plan = self._stop_plan_from_row(row)
+        except Exception as exc:                                  # noqa: BLE001
+            self._event("stop_guard_failed", f"{symbol}: 无法从仓位行拼出止损计划：{exc}",
+                        symbol=symbol, data={"reason": reason, "error": str(exc)})
+            return None
+        coi = client_order_index(symbol, int(self._now_ms()), f"stop{reason}")
+        try:
+            res = await self._place(self.exchange.place_stop(plan, client_order_index=coi),
+                                    label=f"{symbol} stop({reason})")
+        except Exception as exc:                                  # noqa: BLE001 - 下单异常也要留痕
+            self._event("stop_guard_failed",
+                        f"{symbol}: 补挂止损失败（{reason}）：{type(exc).__name__}: {exc}",
+                        symbol=symbol, data={"reason": reason, "coi": coi,
+                                             "error": f"{type(exc).__name__}: {exc}"})
+            self._alert("stop_guard_failed", f"{symbol} 止损补挂/换单失败：{exc}")
+            return None
+        if not self._accepted(res):
+            self._event("stop_guard_failed",
+                        f"{symbol}: 止损单未被受理（{reason}）：{res.error or res.kind}",
+                        symbol=symbol, data={"reason": reason, "coi": coi,
+                                             "code": res.code, "error": res.error,
+                                             "kind": res.kind})
+            self._alert("stop_guard_failed", f"{symbol} 止损单未被交易所受理：{res.error or res.kind}")
+            return None
+
+        visible = await self._wait_stop_visible(coi)
+        if old is not None and not visible:
+            # 换单的**红线**：新单没确认在位就绝不撤旧单（否则可能两头落空 = 裸奔）。
+            self._event("stop_guard_unverified",
+                        f"{symbol}: 新止损单已受理但未在活挂单里看到，保留旧单等待下一轮",
+                        symbol=symbol, data={"reason": reason, "coi": coi,
+                                             "old_coi": old.client_order_index})
+            return None
+
+        expiry_ms = res.order_expiry_ms or 0
+        expiry_ts = (expiry_ms / 1000.0) if expiry_ms else None
+        try:
+            self.store.set_stop_order(int(row.get("id") or 0),
+                                      stop_order_id=f"coi:{coi}",
+                                      stop_expiry_ts=expiry_ts, ts=float(self.clock()))
+        except Exception as exc:                                  # noqa: BLE001 - 记账失败不影响挂单
+            logger.warning("stop guard: could not persist the new stop coi: %s", exc)
+
+        cancelled = ""
+        if old is not None and str(old.order_id or "").isdigit():
+            try:
+                cres = await self.exchange.cancel_order(
+                    market_id=int(plan.market_id), order_index=int(old.order_id))
+                if not self._accepted(cres):
+                    cancelled = cres.error or cres.kind or "rejected"
+            except Exception as exc:                              # noqa: BLE001
+                cancelled = f"{type(exc).__name__}: {exc}"
+            if cancelled:
+                # 两张 reduce-only 止损并存不危险（多的一张没有仓位可减），但不干净 → 留痕。
+                self._event("stop_cancel_failed",
+                            f"{symbol}: 旧止损单撤销失败（{cancelled}）—— 现在有两张止损单",
+                            symbol=symbol, data={"old_order_index": old.order_id,
+                                                 "coi": coi, "error": cancelled})
+
+        new_order = ExchangeOrder(
+            order_id=str(old.order_id) if old is not None else "",
+            client_order_index=coi, market_id=plan.market_id, symbol=symbol,
+            reduce_only=True, trigger_price_int=plan.stop_price_int,
+            price_int=res.price_int, qty_int=plan.qty_int, status="pending")
+        guard = {"symbol": symbol, "market_id": plan.market_id, "client_order_index": coi,
+                 "trigger_price_int": plan.stop_price_int, "price_int": res.price_int,
+                 "qty_int": plan.qty_int, "reduce_only": True, "order_id": "",
+                 "status": "pending", "pending_confirm": True,
+                 # 换单时旧单已撤（或撤失败）：面板缓存里要把它从「还在挂着」里拿掉
+                 "replaced_coi": old.client_order_index if old is not None else None}
+        what = "补挂" if old is None else "换单"
+        self._event("stop_guard",
+                    f"{symbol}: 止损{what}完成（{reason}，coi={coi}"
+                    + (f"，撤旧单失败：{cancelled}" if cancelled else "") + "）",
+                    symbol=symbol, data={"reason": reason, "coi": coi,
+                                         "old_coi": None if old is None else old.client_order_index,
+                                         "stop_price_int": plan.stop_price_int,
+                                         "qty_int": plan.qty_int,
+                                         "expiry_ts": expiry_ts, "cancel_error": cancelled})
+        self._alert("stop_guard", f"{symbol} 止损{what}完成（{reason}）")
+        return new_order, guard
+
+    async def _guard_stops(self, account: ExchangeAccount
+                           ) -> Tuple[ExchangeAccount, List[Dict[str, Any]]]:
+        """补保护：缺失 → 补挂；临期 → 换单。返回（更新后的读数, 新挂单列表）。"""
+        guards: List[Dict[str, Any]] = []
+        if account.orders_error:
+            # 挂单读不到 ⇒ 不能断定「没有止损」（fail-closed：什么都不做，交给对账报告）
+            return account, guards
+        if not account.positions:
+            return account, guards
+        now_s = float(self.clock())
+        orders = list(account.orders)
+        for row in self.store.open_positions():
+            if str(row.get("state") or "").upper() != OPEN:
+                continue                       # CLOSING：正在离场，别动它的保护单
+            symbol = str(row.get("symbol") or "").upper()
+            pos = account.position_for(symbol)
+            if pos is None:
+                continue                       # 交易所已无仓：对账/结算负责
+            # 方向/数量不符时**先别挂**：拿一行的 qty/stop 去挂一张数量不对的保护单没有意义，
+            # 交给对账（它会报 blocker 并阻断开仓），修好再补。
+            if int(pos.side) != int(row.get("side") or 0):
+                continue
+            expected_qty = (Decimal(int(row.get("qty_int") or 0))
+                            .scaleb(-int(row.get("size_decimals") or 0)))
+            if pos.qty != expected_qty:
+                continue
+            if not int(row.get("stop_price_int") or 0) or not int(row.get("qty_int") or 0):
+                continue                       # 缺止损价/数量的行没法定量，跳过
+            stop_order, _ = match_stop_order(row, orders,
+                                             tolerance_ticks=self.stop_tolerance_ticks)
+            if stop_order is None:
+                placed = await self._replace_stop(row, reason="missing")
+            else:
+                expiry = _finite_or_none(row.get("stop_expiry_ts"))
+                if expiry is None and stop_order.order_expiry_ms:
+                    # v4 之前建的仓没有这一列：用交易所返回的 order_expiry 回填（一次性自愈），
+                    # 否则这一仓永远不会被判定成「临期」。
+                    expiry = stop_order.order_expiry_ms / 1000.0
+                    try:
+                        self.store.set_stop_order(
+                            int(row.get("id") or 0),
+                            stop_order_id=(str(row.get("stop_order_id") or "")
+                                           or f"coi:{stop_order.client_order_index}"),
+                            stop_expiry_ts=expiry, ts=float(self.clock()))
+                    except Exception as exc:                  # noqa: BLE001 - 回填失败不影响本轮判定
+                        logger.warning("stop guard: could not backfill the stop expiry: %s", exc)
+                if expiry is None or expiry - now_s > self.STOP_RENEW_BEFORE_S:
+                    continue
+                placed = await self._replace_stop(row, reason="expiring", old=stop_order)
+            if placed is None:
+                continue
+            new_order, guard = placed
+            orders.append(new_order)
+            guards.append(guard)
+        if guards:
+            account = replace(account, orders=tuple(orders))
+        return account, guards
+
 
     @property
     def blocking(self) -> bool:

@@ -139,6 +139,7 @@ class FakeExchange:
         self.exits = []
         self.positions = {}                    # symbol -> {'side','qty_int','market_id'}
         self.orders = []                       # ExchangeOrder（只放会挂着的单）
+        self.cancels = []                      # 单张撤单记录（止损换单用）
         self.wait_calls = []
 
     # -- 下单 ---------------------------------------------------------------
@@ -169,20 +170,34 @@ class FakeExchange:
     async def place_stop(self, plan, *, bar_ms=None, client_order_index=None, **kw):
         if "stop" in self.reject:
             return self.reject["stop"]
-        coi = coi_of(plan.symbol, int(bar_ms), "stop")
+        # 显式 coi 优先（止损守护的补挂/换单会传一个「本次尝试」的新键）
+        coi = (int(client_order_index) if client_order_index is not None
+               else coi_of(plan.symbol, int(bar_ms or 0) or 1, "stop"))
         self.stops.append({"symbol": plan.symbol, "trigger_price_int": plan.stop_price_int,
                            "side": int(plan.side), "qty_int": plan.qty_int,
-                           "reduce_only": True, "coi": coi, "bar_ms": int(bar_ms)})
+                           "reduce_only": True, "coi": coi, "bar_ms": bar_ms})
         if not self.dry_run:
             self.orders.append(ExchangeOrder(
-                order_id=f"stop-{coi}", client_order_index=coi,
+                order_id=str(100_000 + coi), client_order_index=coi,
                 market_id=int(plan.market_id), symbol=plan.symbol, reduce_only=True,
                 trigger_price_int=int(plan.stop_price_int), qty_int=int(plan.qty_int),
                 status="open"))
         return self._result("stop", symbol=plan.symbol, market_id=int(plan.market_id),
                             trigger_price_int=int(plan.stop_price_int),
                             client_order_index=coi, reduce_only=True,
-                            tx_hash=f"0xstop{int(bar_ms)}")
+                            # 交易所返回的是**绝对** epoch 毫秒（now + 28 天）
+                            order_expiry_ms=int(NOW_S * 1000) + 28 * 86400 * 1000,
+                            tx_hash=f"0xstop{coi}")
+
+    async def cancel_order(self, *, market_id, order_index):
+        self.cancels.append({"market_id": int(market_id), "order_index": int(order_index)})
+        if "cancel" in self.raise_on:
+            raise RuntimeError("cancel boom")
+        keep = [o for o in self.orders if str(o.order_id) != str(order_index)]
+        removed = len(keep) != len(self.orders)
+        self.orders = keep
+        result = self._result("cancel", market_id=int(market_id))
+        return result if removed else result
 
     async def place_exit(self, *, symbol, market_id, side, qty_int, price_decimals,
                          exit_price, bar_ms=None, client_order_index=None):
@@ -231,6 +246,13 @@ class FakeReader:
         return ExchangeAccount(equity=self.equity, positions=tuple(positions),
                                orders=tuple(orders) if not self.orders_error else (),
                                orders_error=self.orders_error, as_of=NOW_S)
+
+    async def active_orders(self):
+        """只读活挂单（止损守护换单前的可见性验证走这个）。"""
+        if self.orders_error:
+            raise ReaderError(f"activeOrders unavailable: {self.orders_error}")
+        return (tuple(self._orders) if self._orders is not None
+                else tuple(self.exchange.orders))
 
 
 class FakeClock:
@@ -513,16 +535,19 @@ class ReconcileDetectionTests(Base):
         self.assertTrue(report.reconcile.by_code(ISSUE_SIDE_MISMATCH)[0].blocker)
 
     def test_missing_stop_order_is_detected(self):
+        """对账本身必须能发现「有仓没止损」。**关掉止损守护**再测：
+        守护（2026-10-29 新增）会在对账之前把缺失的止损补上，那条路径由
+        `StopGuardTests.test_missing_stop_is_replaced_with_the_frozen_stop_price` 钉住。"""
         self.seed_position()
         self.exchange.positions[BTC] = {"side": 1, "qty_int": PLAN_QTY_INT,
                                         "market_id": 1, "size_decimals": 5}
         self.exchange.orders = []                     # 止损单没了
-        report = self.run_tick()
+        report = self.run_tick(self.make_executor(stop_guard=False))
         self.assertIn(ISSUE_STOP_ORDER_MISSING, report.reconcile.codes)
         issue = report.reconcile.by_code(ISSUE_STOP_ORDER_MISSING)[0]
         self.assertTrue(issue.blocker)
         self.assertEqual(issue.detail["stop_price_int"], 900)
-        # 不会自作主张补挂止损单
+        # 关掉守护时不会自作主张补挂
         self.assertEqual(self.exchange.stops, [])
 
     def test_orders_unavailable_blocks_entries(self):
@@ -1097,6 +1122,166 @@ class TransferFlowTests(unittest.TestCase):
         self.assertNotIn("/api/v1/api/v1", url)              # 站点根归一化（403 坑）
         self.assertIn("/api/v1/transfer/history?account_index=42", url)
         self.assertEqual(headers.get("Authorization"), "tok-9")
+
+
+class StopGuardTests(Base):
+    """止损守护：缺止损→补挂；临期→先挂新再撤旧；读不到挂单 / dry-run / 开关关 → 什么都不做。
+
+    线上动机（2026-10-29）：Lighter 挂单有 orderExpiry（28 天），交易所到期自动废单，
+    而仓库原来只有开仓那一刻挂止损 ⇒ 到期后裸奔且无人知道。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.qmarket = FakeMarket({BTC: bars_result(quiet_bars(400))})
+
+    def _open_position(self, *, stop_order_id="coi:111", expiry_ts=None,
+                       stop_price_int=STOP_PRICE_INT, qty_int=PLAN_QTY_INT):
+        self.seed_position(stop_order_id=stop_order_id, stop_price_int=stop_price_int,
+                           qty_int=qty_int)
+        self.exchange.positions[BTC] = {"side": 1, "qty_int": qty_int,
+                                        "market_id": 1, "size_decimals": 5}
+        if expiry_ts is not None:
+            pid = self.store.open_positions()[0]["id"]
+            self.store.set_stop_order(pid, stop_order_id=stop_order_id,
+                                      stop_expiry_ts=expiry_ts)
+        return self.store.open_positions()[0]
+
+    def _executor(self, **kw):
+        kw.setdefault("market", self.qmarket)
+        return self.make_executor(**kw)
+
+    def _live_stop(self, *, coi=111, trigger_int=STOP_PRICE_INT, qty_int=PLAN_QTY_INT,
+                   expiry_ms=None):
+        order = ExchangeOrder(order_id=str(100_000 + coi), client_order_index=coi,
+                              market_id=1, symbol=BTC, reduce_only=True,
+                              trigger_price_int=trigger_int, qty_int=qty_int,
+                              order_expiry_ms=expiry_ms, status="open")
+        self.exchange.orders.append(order)
+        return order
+
+    def test_expiry_is_backfilled_from_the_exchange_order(self):
+        """v4 之前建的仓没有 stop_expiry_ts：用交易所的 order_expiry 回填（一次性自愈）。"""
+        self._live_stop(coi=111, expiry_ms=int((NOW_S + 20 * 86400) * 1000))
+        self._open_position(stop_order_id="coi:111")
+        self.run_tick(self._executor())
+        after = self.store.open_positions()[0]
+        self.assertAlmostEqual(after["stop_expiry_ts"], NOW_S + 20 * 86400, delta=2)
+        self.assertEqual(self.exchange.stops, [], "20 天后才到期，不该换单")
+
+    def test_backfilled_expiry_can_trigger_a_renewal(self):
+        self._live_stop(coi=111, expiry_ms=int((NOW_S + 600) * 1000))
+        self._open_position(stop_order_id="coi:111")
+        self.run_tick(self._executor())
+        self.assertEqual(len(self.exchange.stops), 1, "回填后判定临期 → 换单")
+        self.assertEqual(len(self.exchange.cancels), 1)
+
+    def test_missing_stop_is_replaced_with_the_frozen_stop_price(self):
+        row = self._open_position()                     # 本地有仓、交易所没有止损单
+        ex = self._executor()
+        report = self.run_tick(ex)
+        self.assertEqual(len(self.exchange.stops), 1, "缺止损必须补挂一张")
+        placed = self.exchange.stops[0]
+        self.assertEqual(placed["trigger_price_int"], row["stop_price_int"])
+        self.assertEqual(placed["qty_int"], row["qty_int"])
+        # 记账改指新单，并且记下到期时刻（供下一轮临期换单）
+        after = self.store.open_positions()[0]
+        self.assertEqual(after["stop_order_id"], f"coi:{placed['coi']}")
+        self.assertIsNotNone(after["stop_expiry_ts"])
+        self.assertEqual(len(report.stop_guards), 1)
+        self.assertTrue(report.stop_guards[0]["pending_confirm"])
+        self.assertTrue(self.store.events(limit=5, kind="stop_guard"))
+        # 补上之后对账不该再报「缺止损」阻断开仓
+        self.assertNotIn(BLOCK_RECONCILE, report.block_reasons)
+
+    def test_orders_unreadable_means_no_action(self):
+        self._open_position()
+        self.reader.orders_error = "auth expired"
+        ex = self._executor(reader=self.reader)
+        report = self.run_tick(ex)
+        self.assertEqual(self.exchange.stops, [], "读不到挂单时不能断定缺止损，更不许下单")
+        self.assertIn(BLOCK_RECONCILE, report.block_reasons)
+
+    def test_dry_run_and_disabled_guard_do_nothing(self):
+        self._open_position()
+        self.exchange.dry_run = True
+        self.run_tick(self._executor())
+        self.assertEqual(self.exchange.stops, [], "dry-run 不许发单")
+        self.exchange.dry_run = False
+        self.run_tick(self._executor(stop_guard=False))
+        self.assertEqual(self.exchange.stops, [], "关掉守护就退回旧行为")
+
+    def test_expiring_stop_is_renewed_before_it_lapses(self):
+        old = self._live_stop(coi=111)
+        pid = self._open_position(stop_order_id="coi:111",
+                                  expiry_ts=NOW_S + 3600.0)["id"]
+        ex = self._executor()
+        report = self.run_tick(ex)
+        self.assertEqual(len(self.exchange.stops), 1, "临期要换一张新单")
+        new_coi = self.exchange.stops[0]["coi"]
+        self.assertNotEqual(new_coi, 111)
+        # 旧单被单张撤掉（不是 cancel_all），DB 指向新单
+        self.assertEqual(self.exchange.cancels,
+                         [{"market_id": 1, "order_index": int(old.order_id)}])
+        after = self.store.open_positions()[0]
+        self.assertEqual(after["stop_order_id"], f"coi:{new_coi}")
+        self.assertGreater(after["stop_expiry_ts"], NOW_S + 27 * 86400)
+        self.assertEqual(len(report.stop_guards), 1)
+        # 面板缓存合并时要知道「这轮换掉了哪张旧单」，好把旧 coi 从"还在挂着"里拿掉
+        self.assertEqual(report.stop_guards[0]["replaced_coi"], 111)
+
+    def test_far_expiry_is_left_alone(self):
+        self._live_stop(coi=111)
+        self._open_position(stop_order_id="coi:111", expiry_ts=NOW_S + 20 * 86400)
+        self.run_tick(self._executor())
+        self.assertEqual(self.exchange.stops, [])
+        self.assertEqual(self.exchange.cancels, [])
+
+    def test_renew_is_aborted_when_the_new_order_is_not_visible(self):
+        """换单红线：新单没在活挂单里看到，就绝不撤旧单（否则可能两头落空）。"""
+        self._live_stop(coi=111)
+        self._open_position(stop_order_id="coi:111", expiry_ts=NOW_S + 3600.0)
+
+        class BlindReader(FakeReader):
+            async def active_orders(self):
+                return ()                      # 永远看不到 → 验证失败
+
+        ex = self._executor(reader=BlindReader(self.exchange))
+        ex.STOP_VERIFY_ATTEMPTS = 1
+        ex.STOP_VERIFY_INTERVAL_S = 0.0
+        self.run_tick(ex)
+        self.assertEqual(self.exchange.cancels, [], "看不到新单时不许撤旧单")
+        self.assertEqual(self.store.open_positions()[0]["stop_order_id"], "coi:111")
+        self.assertTrue(self.store.events(limit=3, kind="stop_guard_unverified"))
+
+    def test_cancel_failure_is_recorded_but_new_stop_stays(self):
+        self._live_stop(coi=111)
+        self._open_position(stop_order_id="coi:111", expiry_ts=NOW_S + 3600.0)
+        self.exchange.raise_on.add("cancel")
+        self.run_tick(self._executor())
+        self.assertTrue(self.store.events(limit=3, kind="stop_cancel_failed"))
+        self.assertNotEqual(self.store.open_positions()[0]["stop_order_id"], "coi:111")
+
+    def test_entry_records_the_stop_expiry_for_later_renewal(self):
+        ex = self._executor(market=self.market)          # 有信号的市场 → 会开仓
+        self.run_tick(ex)
+        row = self.store.open_positions()[0]
+        self.assertIsNotNone(row["stop_expiry_ts"], "开仓后要记住止损到期时刻")
+
+    def test_closing_position_is_not_touched(self):
+        self._open_position()
+        pid = self.store.open_positions()[0]["id"]
+        self.store.set_position_state(pid, "CLOSING")
+        self.run_tick(self._executor())
+        self.assertEqual(self.exchange.stops, [], "正在离场的仓位别去动它的保护单")
+
+    def test_qty_mismatch_is_left_to_reconcile(self):
+        """交易所数量与本地不符时不补挂：先让对账把它当 blocker 报出来。"""
+        self._open_position()
+        self.exchange.positions[BTC]["qty_int"] = PLAN_QTY_INT - 1
+        report = self.run_tick(self._executor())
+        self.assertEqual(self.exchange.stops, [])
+        self.assertIn(BLOCK_RECONCILE, report.block_reasons)
 
 
 if __name__ == "__main__":                                        # pragma: no cover

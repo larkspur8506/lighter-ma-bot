@@ -435,6 +435,10 @@ class OrderResult:
     idempotency_key: str = ""
     nonce: Optional[int] = None
     tx_type: Optional[int] = None
+    #: 订单在交易所的到期时刻（epoch **毫秒**；仅挂单类有，MARKET/IOC 为 0）。
+    #: 为什么带出来：Lighter 的 orderExpiry 最长 30 天，到期交易所自动废单 —— 执行器要把它
+    #: 记进 DB，才能在临期时换单、到期后补挂（否则仓位裸奔且没人知道）。
+    order_expiry_ms: Optional[int] = None
     tx_hash: str = ""
     attempts: int = 0
     retryable: bool = False
@@ -1481,6 +1485,35 @@ class ExchangeClient:
         """撤掉**全市场**的所有挂单（`NIL_MARKET_INDEX=255`）。"""
         return await self._submit_cancel_all(NIL_MARKET_INDEX)
 
+    async def cancel_order(self, *, market_id: int, order_index: int) -> OrderResult:
+        """撤**单张**挂单（`SignCancelOrder` / tx_type=15 + `market_index` + `order_index`）。
+
+        为什么需要「单张撤」而不是 `cancel_all(market)`：止损换单必须先挂新、确认在位、
+        再撤旧；`cancel_all` 会把同市场的其它挂单一起撤掉（换单失败时等于主动制造裸奔）。
+        `order_index` 是交易所侧的数字 id（`ExchangeOrder.order_id`），**不是**我们的 coi。
+        """
+        mid = _check_int(market_id, "market_id", minimum=0)
+        oid = _check_int(order_index, "order_index", minimum=1)
+        base = OrderResult(ok=True, action="cancel", market_id=mid)
+        if self.dry_run:
+            print(f"[dry-run] CANCEL order {oid} on market {mid} (nothing signed, nothing sent)")
+            return replace(base, dry_run=True)
+        self.live_gate.assert_allowed(self.account_index)
+        sdk = self.sdk()
+        nonce = await self.nonces.allocate()
+        tx_type, tx_info, tx_hash, err = sdk.sign_cancel_order(
+            market_index=mid, order_index=oid, skip_nonce=0, nonce=nonce,
+            api_key_index=self.api_key_index)
+        if err:
+            # 签名就没过 = 肯定没进 sequencer，nonce 未消耗 → 还回去。
+            self.nonces.rollback(nonce)
+            kind, retryable = classify_error(message=str(err))
+            raise OrderRejected(
+                f"cancel signing failed: {err}", retryable=retryable,
+                detail={"market_id": mid, "order_index": oid, "signer_error": str(err)})
+        return await self._send_signed(base, tx_type=tx_type, tx_info=tx_info,
+                                       tx_hash=tx_hash, nonce=nonce, action_label="cancel")
+
     # ---------------------------------------------------------------- 提交
 
     async def _submit(self, spec: OrderSpec) -> OrderResult:
@@ -1524,6 +1557,7 @@ class ExchangeClient:
             trigger_price_int=spec.trigger_price_int, reduce_only=spec.reduce_only,
             order_type=spec.order_type, time_in_force=spec.time_in_force,
             client_order_index=spec.client_order_index,
+            order_expiry_ms=int(spec.order_expiry_ms) if spec.order_expiry_ms else None,
             idempotency_key=idempotency_key_for(spec))
 
     async def _dry_run(self, spec: OrderSpec, base: OrderResult) -> OrderResult:

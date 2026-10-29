@@ -174,6 +174,14 @@ class FakeSdk(SdkBoundary):
         tx_info = json.dumps(payload, separators=(",", ":"))
         return 16, tx_info, "c" * 80, None
 
+    def sign_cancel_order(self, **kwargs):
+        """单张撤单（止损换单用）：market_index + order_index → tx_type=15。"""
+        self.cancel_signed.append(dict(kwargs))
+        payload = {"AccountIndex": self.account_index, "Nonce": kwargs["nonce"],
+                   "MarketIndex": kwargs["market_index"],
+                   "OrderIndex": kwargs["order_index"]}
+        return 15, json.dumps(payload, separators=(",", ":")), "d" * 80, None
+
     def mint_auth_token(self, ttl_s: int):
         expires = int(self.clock()) + int(ttl_s)
         return f"{expires}:{self.account_index}:{self.api_key_index}:" + "0f" * 16, None
@@ -725,6 +733,30 @@ class CancelTests(unittest.TestCase):
         self.assertEqual(sdk.cancel_signed[0]["cancel_all_market_index"], 1)
         self.assertEqual(sdk.cancel_signed[0]["time_in_force"], 0)     # immediate
         self.assertEqual(sdk.sent[0][0], 16)                          # CancelAllOrders
+
+    def test_cancel_single_order_signs_tx15_with_market_and_order_index(self):
+        sdk = FakeSdk(nonce=72)
+        client = make_client(sdk=sdk)
+        result = asyncio.run(client.cancel_order(market_id=2, order_index=1125898605399395))
+        self.assertTrue(result.ok)
+        self.assertEqual(result.action, "cancel")
+        self.assertEqual(sdk.cancel_signed[0]["market_index"], 2)
+        self.assertEqual(sdk.cancel_signed[0]["order_index"], 1125898605399395)
+        self.assertEqual(sdk.sent[0][0], 15)                          # CancelOrder
+
+    def test_cancel_single_order_dry_run_sends_nothing(self):
+        sdk = FakeSdk()
+        client = make_client(sdk=sdk, dry_run=True)
+        result = asyncio.run(client.cancel_order(market_id=2, order_index=9))
+        self.assertTrue(result.dry_run)
+        self.assertEqual(sdk.sent, [])
+        self.assertEqual(sdk.cancel_signed, [])
+
+    def test_cancel_single_order_is_gated_too(self):
+        sdk = FakeSdk()
+        client = make_client(sdk=sdk, env={}, confirm_live=None)
+        with self.assertRaises(LiveTradingDisabled):
+            asyncio.run(client.cancel_order(market_id=2, order_index=9))
 
     def test_cancel_all_across_every_market_uses_the_nil_index(self):
         sdk = FakeSdk(nonce=71)

@@ -626,6 +626,24 @@ class StopCoverageTests(PanelFixture):
         self.assertEqual(block["stops"][0]["exchange_status"], "present")
         self.assertIn("下一轮读数复核", block["stops"][0]["note"])
 
+    def test_expiry_is_exposed_and_warned_when_close(self) -> None:
+        """止损单到期时刻要露出来（Lighter 到期自动废单）；≤7 天时文案要点明。"""
+        seed(self.store)
+        pid = self.store.open_positions()[0]["id"]
+        self.store.set_stop_order(pid, stop_order_id="stop-1",
+                                  stop_expiry_ts=self.now + 3 * 86400)
+        block = self.panel(sources=views.Sources(orders=lambda: prod_orders())).stops()
+        row = block["stops"][0]
+        self.assertAlmostEqual(row["days_left"], 3.0, delta=0.2)
+        self.assertIn("3 天后到期", row["note"])
+        self.assertIn("自动换单", row["note"])
+
+    def test_no_expiry_means_no_expiry_note(self) -> None:
+        seed(self.store)
+        block = self._stops(prod_orders())
+        self.assertIsNone(block["stops"][0]["expires_at"])
+        self.assertNotIn("到期", block["stops"][0]["note"])
+
 
 class DegradedTests(unittest.TestCase):
     def _broken(self) -> views.Panel:

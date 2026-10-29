@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ 常量
 
-SCHEMA_VERSION = 3                      # 当前代码认得的库版本（PRAGMA user_version）
+SCHEMA_VERSION = 4                      # 当前代码认得的库版本（PRAGMA user_version）
 DEFAULT_BUSY_TIMEOUT_MS = 5000          # 面板进程同时读时，写方最多等 5s 再报 busy
 BASE_TWR_INDEX = 1.0                    # TWR 指数基准（建仓/重置时 = 1.0）
 DD_STATE_KEY = "live"                   # dd_state 的单行主键
@@ -453,10 +453,18 @@ _MIGRATION_3: Tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_account_flows_ts ON account_flows(ts)",
 )
 
+#: v4（2026-10-29）：记录止损单的到期时刻。
+#: 为什么需要：Lighter 的订单 `orderExpiry` 最长 30 天（我们下 28 天），到期**交易所自动废单**，
+#: 而仓库里原来只有开仓那一刻会挂止损 ⇒ 到期后仓位裸奔且没人知道。有了这一列，tick 才能
+#: 在「快到期」时主动换单、在「已到期/已消失」时补挂。
+_MIGRATION_4: Tuple[str, ...] = (
+    "ALTER TABLE positions ADD COLUMN stop_expiry_ts REAL",
+)
+
 #: `{目标版本: 该版本的语句}`。新增版本只往后追加，**永不改已发布的语句** —— 那是老库
 #: 升级路径唯一的依据（改一个字符，已升级过的库和新建的库就会分叉）。
 MIGRATIONS: Mapping[int, Tuple[str, ...]] = {1: _MIGRATION_1, 2: _MIGRATION_2,
-                                             3: _MIGRATION_3}
+                                             3: _MIGRATION_3, 4: _MIGRATION_4}
 
 
 class AuditFinding(dict):
@@ -1108,6 +1116,28 @@ class StateStore:
             return int(self._scalar("SELECT COUNT(*) AS n FROM positions", default=0) or 0)
         return int(self._scalar("SELECT COUNT(*) AS n FROM positions WHERE state=?",
                                 (str(state).upper(),), default=0) or 0)
+
+    def set_stop_order(self, position_id: int, *, stop_order_id: Optional[str],
+                       stop_expiry_ts: Optional[float] = None,
+                       ts: Optional[float] = None) -> Dict[str, Any]:
+        """更新某仓位的**止损单身份**（coi）与到期时刻（观测字段，不影响状态机）。
+
+        什么时候写：① 开仓挂上止损后记一次；② 止损守护补挂/换单成功后改指新单。
+        `stop_expiry_ts` 是交易所侧 `orderExpiry`（epoch 秒）—— 到期后交易所自动废单，
+        守护据此在临期时换单。传 `None` 表示「不知道」，守护不会据此判断临期。
+        """
+        stamp = now() if ts is None else _finite(ts, default=now())
+        expiry = None if stop_expiry_ts is None else _finite(stop_expiry_ts)
+        with self.write_transaction() as conn:
+            row = conn.execute("SELECT * FROM positions WHERE id=?", (int(position_id),)).fetchone()
+            if row is None:
+                raise StoreError(f"position {position_id} not found")
+            conn.execute(
+                "UPDATE positions SET stop_order_id=?, stop_expiry_ts=?, updated_at=? WHERE id=?",
+                (stop_order_id, expiry, stamp, int(position_id)))
+        out = self.position(position_id)
+        assert out is not None
+        return out
 
     def set_position_state(self, position_id: int, state: str, *,
                            ts: Optional[float] = None) -> Dict[str, Any]:
