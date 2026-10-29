@@ -1890,7 +1890,7 @@ def _status_html(block: Mapping[str, Any], mode: str) -> str:
 
 
 def _funding_cell(rate: Any, cash: Any, side: int) -> str:
-    """资金费率单元格：`+0.0096%/h（收）`，并附上按当前名义估的每小时现金流。
+    """资金费率单元格：`+0.0096%/h（收）`。
 
     符号语义：正费率 = 多头付、空头收（Lighter 每小时结算一次）。
     """
@@ -1900,9 +1900,7 @@ def _funding_cell(rate: Any, cash: Any, side: int) -> str:
     receiving = (value < 0) if side > 0 else (value > 0)
     cls = "pos" if receiving else "neg"
     txt = f"{value * 100:+.4f}%/h{'（收）' if receiving else '（付）'}"
-    flow = _finite(cash)
-    extra = "" if flow is None else f" <span class=\"muted\">{flow:+.4f} U/h</span>"
-    return f"<td class=\"{cls}\">{txt}{extra}</td>"
+    return f"<td class=\"{cls}\">{txt}</td>"
 
 
 def _positions_html(block: Mapping[str, Any]) -> str:
@@ -1935,10 +1933,6 @@ def _positions_html(block: Mapping[str, Any]) -> str:
             "</tr>")
     return ('<section id="block-positions"><h2>② 仓位表</h2>'
             f"<table>{head}{''.join(rows)}</table>"
-            '<div class="legend">离场价 = 最后一根已收盘 4h 的 SMA20，'
-            '判定按收盘价（多单收盘跌破 / 空单收盘升破），盘中触线不算；'
-            '距离场% 正数表示现价离触发线还有多远 · '
-            '资金费率按 Lighter 每小时结算，正费率 = 多头付、空头收</div>'
             f"{_warn_html(block.get('warnings'))}"
             "</section>")
 

@@ -815,6 +815,8 @@ class ExitAndFundingTests(PanelFixture):
             self.assertIn(header, body)
         self.assertIn("+0.0096%/h", body)
         self.assertIn("（付）", body)          # 多单 + 正费率 = 付
+        self.assertNotIn("U/h", body)         # 资金费单元格不再带每小时现金流
+        self.assertNotIn('class="legend"', body)  # 表下描述文字已移除
 
 
 class DegradedTests(unittest.TestCase):
