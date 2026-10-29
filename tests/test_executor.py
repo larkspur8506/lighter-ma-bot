@@ -1311,22 +1311,15 @@ class StopGuardTests(Base):
         self.assertTrue(self.store.events(limit=3, kind="stop_cancel_failed"))
         self.assertNotEqual(self.store.open_positions()[0]["stop_order_id"], "coi:111")
 
-    def test_entry_sets_isolated_mode_and_allocates_collateral(self):
+    def test_entry_sets_isolated_mode_before_placing_the_order(self):
         ex = self._executor(market=self.market)
         self.run_tick(ex)
         self.assertEqual(len(self.exchange.leverage_sets), 1)
         self.assertEqual(self.exchange.leverage_sets[0],
                          {"market_id": 1, "leverage": 5.0})
-        self.assertEqual(len(self.exchange.margin_allocs), 1)
-        alloc = self.exchange.margin_allocs[0]
-        self.assertEqual(alloc["market_id"], 1)
-        # 抵押 = 名义 / 杠杆（entry 事件里的 notional 是唯一权威出处）
-        entry_evt = [e for e in self.events("entry") if e["symbol"] == BTC][0]
-        data = entry_evt["data"]
-        if isinstance(data, str):
-            data = json.loads(data)
-        expected = float(data["notional"]) / 5.0
-        self.assertAlmostEqual(alloc["usdc_amount"], expected, places=6)
+        # 抵押由交易所开仓时自动划入（2026-10-29 实测）→ 开仓路径**不盲发** ADD；
+        # 偏低由下一轮 tick 的抵押守护补足（见 MarginGuardTests）。
+        self.assertEqual(self.exchange.margin_allocs, [])
 
     def test_leverage_rejection_blocks_the_entry(self):
         ex = self._executor(market=self.market)
@@ -1338,16 +1331,6 @@ class StopGuardTests(Base):
         self.assertEqual(self.store.open_positions(), [])
         self.assertTrue(any("margin mode rejected" in e["message"]
                             for e in self.events("order_rejected")))
-
-    def test_alloc_failure_is_recorded_but_the_position_stays(self):
-        ex = self._executor(market=self.market)
-        self.exchange.reject_alloc = True
-        report = self.run_tick(ex)
-        self.assertEqual(len(self.exchange.entries), 1, "仓位已开出，照常记账")
-        self.assertEqual(len(self.store.open_positions()), 1)
-        self.assertTrue(self.store.events(limit=5, kind="margin_alloc_failed"))
-        self.assertTrue(any(k == "margin_alloc_failed" for k, _ in self.alerts))
-        self.assertFalse(report.outcomes[0].ok, "抵押没划进去 = 本轮按失败算")
 
     def test_flag_off_skips_margin_ops(self):
         ex = self._executor(market=self.market, margin_isolated=False)
@@ -1376,6 +1359,61 @@ class StopGuardTests(Base):
         report = self.run_tick(self._executor())
         self.assertEqual(self.exchange.stops, [])
         self.assertIn(BLOCK_RECONCILE, report.block_reasons)
+
+
+# ----------------------------------------------------------------- 逐仓抵押守护
+
+
+class MarginGuardTests(Base):
+    """allocated 低于 名义/杠杆 → 补差额；读不到 → 跳过不猜；被拒 → 事件+报警。"""
+
+    def _quiet_executor(self, **kw):
+        kw.setdefault("market", FakeMarket({BTC: bars_result(quiet_bars(400))}))
+        return self.make_executor(**kw)
+
+    def _account_with(self, *, allocated, position_value=10.0):
+        from app.executor import ExchangePosition
+        pos = ExchangePosition(symbol=BTC, side=1,
+                               qty=__import__("decimal").Decimal("1.0"),
+                               market_id=1, position_value=position_value,
+                               allocated_margin=allocated)
+        return FakeReader(self.exchange, positions=(pos,))
+
+    def test_shortfall_is_topped_up(self):
+        self.seed_position()
+        ex = self._quiet_executor(reader=self._account_with(allocated=1.0))  # 目标 10/5=2
+        self.run_tick(ex)
+        self.assertEqual(self.exchange.margin_allocs,
+                         [{"market_id": 1, "usdc_amount": 1.0}])
+        self.assertTrue(self.store.events(limit=5, kind="margin_topup"))
+
+    def test_healthy_allocation_is_left_alone(self):
+        self.seed_position()
+        ex = self._quiet_executor(reader=self._account_with(allocated=2.0))
+        self.run_tick(ex)
+        self.assertEqual(self.exchange.margin_allocs, [])
+
+    def test_unknown_allocation_is_skipped_not_guessed(self):
+        self.seed_position()
+        ex = self._quiet_executor(reader=self._account_with(allocated=None))
+        self.run_tick(ex)
+        self.assertEqual(self.exchange.margin_allocs, [])
+
+    def test_topup_failure_is_recorded_and_alerted(self):
+        self.seed_position()
+        ex = self._quiet_executor(reader=self._account_with(allocated=1.0))
+        self.exchange.reject_alloc = True
+        self.run_tick(ex)
+        self.assertTrue(self.store.events(limit=8, kind="margin_topup_failed"))
+        self.assertTrue(any(k == "margin_topup_failed" for k, _ in self.alerts))
+        self.assertEqual(len(self.store.open_positions()), 1, "守护只补抵押，不动仓位")
+
+    def test_flag_off_disables_the_guard(self):
+        self.seed_position()
+        ex = self._quiet_executor(reader=self._account_with(allocated=1.0),
+                                  margin_isolated=False)
+        self.run_tick(ex)
+        self.assertEqual(self.exchange.margin_allocs, [])
 
 
 if __name__ == "__main__":                                        # pragma: no cover
