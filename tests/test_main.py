@@ -1053,5 +1053,78 @@ class MergeAcceptedStopsTests(unittest.TestCase):
         self.assertIs(main.stop_guard_on({"LIGHTER_STOP_GUARD": "1"}), True)
 
 
+class MarkRefreshTests(unittest.TestCase):
+    """后台盘口刷新：只刷**有持仓**的标的（空仓标的一个请求都不发）。"""
+
+    class FakeMarket:
+        def __init__(self, quotes=None, boom=()):
+            self.quotes = dict(quotes or {})
+            self.boom = set(boom)
+            self.calls = []
+
+        def order_book(self, symbol, depth=5):
+            self.calls.append(symbol)
+            if symbol in self.boom:
+                raise RuntimeError("book down")
+            mid = self.quotes.get(symbol, 0.0)
+
+            class Q:
+                pass
+
+            q = Q()
+            q.mid = mid
+            return q
+
+    def _run_once(self, store_factory, market, *, interval=60.0):
+        """跑一轮循环体，然后让 sleep 抛 CancelledError 结束（避免死循环）。"""
+        cache = main.PanelCache()
+
+        async def fake_sleep(_seconds):
+            raise asyncio.CancelledError()
+
+        async def body():
+            with contextlib.suppress(asyncio.CancelledError):
+                await main._refresh_position_marks(cache, store=store_factory, market=market,
+                                                   interval_s=interval, sleep=fake_sleep)
+        asyncio.run(body())
+        return cache
+
+    def _store_with_btc(self):
+        store = StateStore(":memory:")
+        self.addCleanup(store.close)
+        store.record_entry("BTC", 1, qty_int=100_000, size_decimals=5, entry_price_int=650_000,
+                           price_decimals=2, stop_price_int=630_000, bar_ms=1_600_000_000_000,
+                           market_id=1, stop_order_id="coi:1", ts=1000.0)
+        return store
+
+    def test_only_symbols_with_open_positions_are_refreshed(self):
+        store = self._store_with_btc()
+        market = self.FakeMarket({"BTC": 6600.0, "ETH": 2300.0, "SOL": 100.0})
+        cache = self._run_once(lambda: store, market)
+        self.assertEqual(market.calls, ["BTC"], "空仓标的不该发请求")
+        self.assertAlmostEqual(cache.marks()["BTC"]["price"], 6600.0)
+
+    def test_no_positions_means_no_requests(self):
+        store = StateStore(":memory:")
+        self.addCleanup(store.close)
+        market = self.FakeMarket({"BTC": 6600.0})
+        cache = self._run_once(lambda: store, market)
+        self.assertEqual(market.calls, [])
+        self.assertEqual(cache.marks(), {})
+
+    def test_book_errors_are_swallowed(self):
+        store = self._store_with_btc()
+        market = self.FakeMarket({"BTC": 6600.0}, boom=("BTC",))
+        cache = self._run_once(lambda: store, market)
+        self.assertEqual(cache.marks(), {})            # 失败就不写，绝不写 0
+        self.assertEqual(market.calls, ["BTC"])
+
+    def test_interval_parsing(self):
+        self.assertEqual(main.mark_refresh_interval_s({}), 60.0)
+        self.assertEqual(main.mark_refresh_interval_s({"PANEL_MARK_REFRESH_S": "30"}), 30.0)
+        self.assertEqual(main.mark_refresh_interval_s({"PANEL_MARK_REFRESH_S": "0"}), 0.0)
+        self.assertEqual(main.mark_refresh_interval_s({"PANEL_MARK_REFRESH_S": "junk"}), 60.0)
+
+
 if __name__ == "__main__":
     unittest.main()

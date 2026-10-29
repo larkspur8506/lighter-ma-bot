@@ -686,6 +686,44 @@ class PositionPnlFromExchangeTests(PanelFixture):
         self.assertEqual(row["price_source"], "provider")
 
 
+class PositionMarkQuoteTests(PanelFixture):
+    """有持仓的标的用**实时盘口中间价**（后台每 ~60s 刷）；过期/没有就退回交易所标记价。"""
+
+    def _row(self, quote, *, snap=None, price=6500.0):
+        seed(self.store)
+        panel = self.panel(sources=views.Sources(
+            prices=lambda: {"BTC": price},
+            positions=lambda: ({"BTC": snap} if snap else {}),
+            marks=lambda: ({"BTC": quote} if quote else {})))
+        return [r for r in panel.positions()["positions"] if r["symbol"] == "BTC"][0]
+
+    def test_fresh_quote_wins_and_upnl_is_shifted(self):
+        snap = {"qty": "1.0", "position_value": 6600.0, "unrealized_pnl": -1.0}
+        row = self._row({"price": 6620.0, "ts": self.now - 30}, snap=snap)
+        self.assertEqual(row["price_source"], "mark")
+        self.assertAlmostEqual(row["price"], 6620.0)
+        # 线性永续：交易所浮盈 −1.0 按 (6620−6600)×1×1 平移 → +19.0
+        self.assertAlmostEqual(row["upnl"], 19.0)
+
+    def test_stale_quote_falls_back_to_exchange_mark(self):
+        snap = {"qty": "1.0", "position_value": 6600.0, "unrealized_pnl": -1.0}
+        row = self._row({"price": 6620.0, "ts": self.now - 600}, snap=snap)
+        self.assertEqual(row["price_source"], "exchange")
+        self.assertAlmostEqual(row["price"], 6600.0)
+        self.assertAlmostEqual(row["upnl"], -1.0)
+
+    def test_quote_alone_still_shows_live_price(self):
+        """只有盘口、没有交易所读数（刚重启）时，现价用盘口，浮盈按入场价估算。"""
+        row = self._row({"price": 6620.0, "ts": self.now - 5})
+        self.assertEqual(row["price_source"], "mark")
+        self.assertAlmostEqual(row["price"], 6620.0)
+        self.assertAlmostEqual(row["upnl"], 120.0)          # (6620−6500)×1×1
+
+    def test_no_quote_keeps_bar_close(self):
+        row = self._row(None)
+        self.assertEqual(row["price_source"], "provider")
+
+
 class DegradedTests(unittest.TestCase):
     def _broken(self) -> views.Panel:
         def boom() -> Any:

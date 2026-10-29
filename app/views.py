@@ -118,6 +118,9 @@ MAX_CURVE_POINTS = 500
 
 #: 逐仓杠杆（`docs/SIZING_RISK.md`：与回测口径一致的 5x）。只用于面板估算保证金/强平。
 LEVERAGE = 5.0
+#: 有持仓标的的盘口中间价最多能用多久（后台 `PANEL_MARK_REFRESH_S` 默认 60s 刷一次）。
+#: 超过就退回「交易所标记价」而不是拿旧报价冒充现价 —— 宁可旧一点，也不给假的新鲜度。
+MARK_QUOTE_MAX_AGE_S = 180.0
 
 #: kill 开关的持久化载体：`events` 表里最后一条 `kind='admin_kill'` 就是当前状态。
 #: 为什么要落库而不是内存变量：容器重启后「我今天不想交易」必须还生效，否则一个
@@ -511,6 +514,9 @@ class Sources:
     orders: Optional[Callable[[], Any]] = None
     #: 交易所口径的持仓读数（浮盈/仓位价值/强平价）；见类 docstring。
     positions: Optional[Callable[[], Any]] = None
+    #: `() -> {symbol: {price, ts}}`，**有持仓标的**的最新盘口中间价（后台每 ~60s 刷）。
+    #: 空仓标的没有条目 —— 它们的「现价」仍用最后一根 4h 收盘。
+    marks: Optional[Callable[[], Any]] = None
     bars: Optional[Callable[[str], Any]] = None
     prices: Optional[Callable[[], Any]] = None
     #: `(symbol) -> [strategy.Bar]`，**只读缓存、绝不发网络请求**。
@@ -906,6 +912,13 @@ class Panel:
                 live = {str(k).upper(): dict(v) for k, v in dict(raw_live).items() if v}
             except Exception as exc:                          # noqa: BLE001 - 只影响读数精度
                 warnings.append(f"持仓读数 provider 失败: {type(exc).__name__}: {exc}")
+        quotes: Dict[str, Mapping[str, Any]] = {}
+        if self.sources.marks is not None:
+            try:
+                quotes = {str(k).upper(): dict(v) for k, v in dict(self.sources.marks() or {}).items()
+                          if isinstance(v, Mapping)}
+            except Exception as exc:                          # noqa: BLE001
+                warnings.append(f"盘口 provider 失败: {type(exc).__name__}: {exc}")
         try:
             kill = kill_state(store)
             verdict = self._dd_verdict(store, now, warnings)
@@ -938,7 +951,8 @@ class Panel:
                     "position_id": None, "warnings": [],
                 })
                 continue
-            out.append(self._position_row(row, symbol, prices, now, live.get(symbol)))
+            out.append(self._position_row(row, symbol, prices, now, live.get(symbol),
+                                          quotes.get(symbol)))
 
         if not prices:
             warnings.append("没有现价 —— 浮盈/名义/强平按开仓价估算（标记为估算）")
@@ -948,12 +962,14 @@ class Panel:
                 "warnings": warnings, "degraded": bool(warnings)}
 
     def _position_row(self, row: Any, symbol: str, prices: Mapping[str, float],
-                      now: float, snap: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-        """一行仓位。`snap` = 交易所侧读数（优先）：浮盈/现价/强平都按交易所口径。
+                      now: float, snap: Optional[Mapping[str, Any]] = None,
+                      quote: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        """一行仓位。价格优先级：**有持仓的实时盘口中间价** → 交易所标记价 → 4h 收盘。
 
-        为什么优先交易所读数：`prices` 来自 tick 缓存的**最后一根已收盘 4h bar 的收盘价**
-        （可能滞后 ≤4h），而入场价往往就是那根 bar 的收盘 ⇒ 浮盈恒显示 0（2026-10-29 实测）。
-        交易所给的 `position_value / 数量` 就是标记价，`unrealized_pnl` 还已经把资金费算进去了。
+        为什么：`prices` 来自 tick 缓存的最后一根已收盘 4h bar 收盘价（最多滞后 4 小时，
+        且入场价往往就是那根 bar 的收盘 ⇒ 浮盈恒 0，2026-10-29 实测）。交易所读数解决「口径」，
+        盘口 mid（`quote`）解决「新鲜度」—— 只对有持仓的标的由后台每 ~60s 刷一次；
+        空仓标的仍用 4h 收盘（用户拍板的平衡口径）。
         """
         side = int(_row_get(row, "side") or 0)
         entry = _zero(_row_get(row, "entry_price"))
@@ -966,8 +982,14 @@ class Panel:
         live_qty = _finite(live.get("qty")) or qty
         if value is not None and live_qty:
             mark = value / live_qty                     # 交易所仓位价值 ÷ 数量 = 标记价
-        price = mark if mark else _finite(prices.get(symbol))
-        if mark:
+        # 有持仓标的的实时盘口中间价（后台刷新；过期就退回交易所标记价，避免拿旧报价当现价）
+        mid, mid_ts = _finite((quote or {}).get("price")), _finite((quote or {}).get("ts"))
+        fresh_mid = (mid if (mid and mid_ts is not None
+                             and 0 <= now - mid_ts <= MARK_QUOTE_MAX_AGE_S) else None)
+        price = fresh_mid if fresh_mid else (mark if mark else _finite(prices.get(symbol)))
+        if fresh_mid:
+            price_source = "mark"
+        elif mark:
             price_source = "exchange"
         elif price is not None:
             price_source = "provider"
@@ -978,8 +1000,12 @@ class Panel:
         # 名义按**当前价**算（面板看的是现在的敞口）；没有现价才退回记账时的名义。
         notional = abs(value) if value else (abs(price * qty) if qty else _zero(_row_get(row, "notional")))
         live_upnl = _finite(live.get("unrealized_pnl"))
-        upnl = live_upnl if live_upnl is not None else (
-            (price - entry) * qty * side if entry > 0 else 0.0)
+        if live_upnl is not None:
+            # 线性永续：浮盈对标记价是线性的 ⇒ 用交易所那份（已含资金费）按价格差平移即精确。
+            upnl = live_upnl + ((fresh_mid - mark) * live_qty * side
+                                if (fresh_mid and mark) else 0.0)
+        else:
+            upnl = (price - entry) * qty * side if entry > 0 else 0.0
         upnl_pct = ((price - entry) / entry * side) if entry > 0 else 0.0
         dist = None
         if stop is not None and stop > 0 and price > 0:
