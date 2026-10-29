@@ -36,7 +36,7 @@ from app.executor import (
     TRANSFER_FLOW_EPS, ExchangeAccount, account_transaction_time_from_payload,
     infer_transfer_flow,
 )
-from app.store import SCHEMA_VERSION, StateStore
+from app.store import MIGRATIONS, SCHEMA_VERSION, StateStore
 from app.views import pnl_curve
 
 # 事故时间线（2026-10-28，真实数值）：14:33:27 tick 写下 101.0089 → 14:39:07 入金
@@ -178,10 +178,13 @@ class AccountFlowsStoreTests(unittest.TestCase):
                 self.store.record_flow(amount, ts=DEPOSIT_TS)
 
     def test_v2_database_migrates_to_current_and_flows_work(self) -> None:
-        # 线上库就是这条路径：老库（user_version=2）升级后 account_flows 可用。
-        # v3 加 account_flows、v4 加 positions.stop_expiry_ts（2026-10-29），一路升到 SCHEMA_VERSION。
+        # 线上库就是这条路径：老库（user_version=2、已有 v1/v2 的表）升级后 account_flows 可用。
+        # v3 加 account_flows、v4 给 positions 加 stop_expiry_ts（2026-10-29），一路升到 SCHEMA_VERSION。
+        # 注意：**必须真的建出 v2 的表结构**（v4 是 `ALTER TABLE positions`，空库会报没有该表）。
         path = os.path.join(self._tmp.name, "legacy.db")
         legacy = sqlite3.connect(path)
+        for statement in MIGRATIONS[1] + MIGRATIONS[2]:
+            legacy.execute(statement)
         legacy.execute("PRAGMA user_version=2")
         legacy.commit()
         legacy.close()
