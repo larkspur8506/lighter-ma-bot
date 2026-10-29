@@ -971,12 +971,13 @@ class Panel:
                 "warnings": warnings, "degraded": bool(warnings)}
 
     def _exit_price_for(self, symbol: str) -> Optional[float]:
-        """策略离场线 = SMA20（与「三标的动态」里那条离场线**同一口径**）。
+        """下一根 4h 收盘要跌破/升破的线 —— 也就是「什么价格会离场」。
 
-        离场判定是「收盘价 vs SMA20」（多单收盘跌破 / 空单收盘升破），不是盘中触价 ——
-        所以这里给的是**参考线**，不是一定会成交的价。
-        优先用 K 线 provider（它内部先读 tick 缓存、再按 TTL 回源），保证与三标的动态一致；
-        没有 provider 才退回只读缓存。
+        策略判据是 `close_i < sma20_i`（多）/ `close_i > sma20_i`（空），而 `sma20_i`
+        **包含被判定那根自己的收盘**：`close_i > mean(close_{i-19..i})` 等价于
+        `close_i > mean(close_{i-19..i-1})`。所以下一根的离场价 = 最近 **19** 根已收盘
+        收盘价的均值，而不是「含下一根的 20 根均值」（那个数解不出来，还差一截）。
+        判定按收盘、不按盘中触价。
         """
         provider = self.sources.bars if self.sources.bars is not None else self.sources.cached_bars
         if provider is None:
@@ -985,14 +986,15 @@ class Panel:
             bars = list(provider(symbol) or ())
         except Exception:                                     # noqa: BLE001 - 只影响一列
             return None
-        if not bars:
+        now = self._now()
+        while bars and int(_row_get(bars[-1], "open_ms") or 0) + BAR_MS > now * 1000:
+            bars = bars[:-1]                                  # 兜底：剔除还在走的那根
+        if len(bars) < 19:
             return None
-        try:
-            ind, _ = self._indicators_for(symbol, bars)
-        except Exception:                                     # noqa: BLE001
+        closes = [_finite(_row_get(bar, "close")) for bar in bars[-19:]]
+        if any(close is None for close in closes):
             return None
-        values = ind.get("sma20") or []
-        return _finite(values[-1]) if values else None
+        return sum(closes) / 19.0
 
     def _position_row(self, row: Any, symbol: str, prices: Mapping[str, float],
                       now: float, snap: Optional[Mapping[str, Any]] = None,

@@ -745,6 +745,26 @@ class ExitAndFundingTests(PanelFixture):
         # 多单、现价 6600 > SMA20 6500 ⇒ 离场线在下方，距离 = (6600−6500)/6600
         self.assertAlmostEqual(row["dist_to_exit_pct"], 100.0 / 6600.0, places=9)
 
+    def test_exit_price_is_mean_of_last_19_closes_not_20(self):
+        """判据 `close_i > sma20_i` 里 sma20 含本根 ⇒ 下一根的离场价 = 最近 19 根收盘均值。"""
+        bars = flat_bars(int(T0 * 1000) - 40 * int(BAR_S * 1000), 39, 6500.0)
+        last = bars[-1]
+        bars[-1] = type(last)(open_ms=last.open_ms, open=last.open, high=last.high,
+                             low=last.low, close=6880.0, volume=last.volume)
+        row = self._row(bars=bars)
+        self.assertAlmostEqual(row["exit_price"], (18 * 6500.0 + 6880.0) / 19.0, places=6)
+
+    def test_forming_bar_is_dropped(self):
+        now_ms = int((T0 + 3 * BAR_S + 600.0) * 1000)
+        bars = flat_bars(now_ms - 3_600_000 - 38 * int(BAR_S * 1000), 39, 6500.0)
+        # 最后一根还没收盘（open + 4h > now）且收盘价被打歪 —— 必须被剔除
+        last = bars[-1]
+        bars[-1] = type(last)(open_ms=last.open_ms, open=last.open, high=last.high,
+                             low=last.low, close=9000.0, volume=last.volume)
+        self.assertGreater(last.open_ms + 4 * 3600 * 1000, now_ms)
+        row = self._row(bars=bars)
+        self.assertAlmostEqual(row["exit_price"], 6500.0, places=6)
+
     def test_short_exit_distance_is_positive_when_price_below_the_line(self):
         seed(self.store)
         # 手工造一个空仓（seed 里是多单）
