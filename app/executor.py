@@ -178,6 +178,10 @@ class ExchangePosition:
     liquidation_price: Optional[float] = None
     #: 本仓**累计**已付资金费（正 = 付出，负 = 收到；交易所 `total_funding_paid_out`）。
     funding_paid: Optional[float] = None
+    #: 逐仓口径（市场切 isolated 后交易所**开仓时自动划入** ≈名义/杠杆，平仓自动释放；
+    #: 2026-10-29 实测）。`None` = 响应里没有这两个字段（旧数据/未知）→ 抵押守护跳过不猜。
+    margin_mode: Optional[int] = None
+    allocated_margin: Optional[float] = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -361,6 +365,8 @@ def positions_from_payload(payload: Mapping[str, Any], *,
             position_value=_opt_float(row.get("position_value")),
             liquidation_price=_opt_float(row.get("liquidation_price")),
             funding_paid=_opt_float(row.get("total_funding_paid_out")),
+            margin_mode=_opt_int(row.get("margin_mode")),
+            allocated_margin=_opt_float(row.get("allocated_margin")),
             raw=dict(row)))
     return tuple(out)
 
@@ -1288,6 +1294,9 @@ class Executor:
             stop_guards = tuple(guards)
             if stop_guards:
                 self.last_account = account
+        # ①c 逐仓抵押守护（2026-10-29）：allocated 低于 名义/杠杆 才补差额（幂等）。
+        #     实测交易所开仓时已自动划入，正常这里什么都不做；只修偏低，**从不撤出**。
+        await self._guard_margins(account)
         # ② 对账（纯分析；先对账后动手）
         rec = self.reconcile(account)
         blocks: List[str] = []
@@ -1480,25 +1489,6 @@ class Executor:
                         symbol=symbol, data={"kind": stop.kind, "code": stop.code,
                                              "error": stop.error, "tx_hash": stop.tx_hash})
             self._alert("stop_order_failed", f"{symbol} 开仓成功但止损单挂单失败：{stop.error}")
-
-        alloc_ok = True
-        if self.margin_isolated:
-            # 成交后给逐仓仓划入抵押（≈名义/杠杆）。实测交易所会把划入量归一到
-            # 名义/杠杆、平仓时自动释放；被拒 = 资金路径保护失败，照 stop 失败同档处理
-            # （留痕 + 报警 + 计失败），**不平仓**：止损已在位，强平口径已是逐仓。
-            alloc_usdc = float(plan.notional) / float(plan.leverage or 5.0)
-            alloc = await self._place(self.exchange.allocate_margin(
-                market_id=int(plan.market_id), usdc_amount=alloc_usdc),
-                label=f"{symbol} margin alloc")
-            alloc_ok = self._accepted(alloc)
-            if not alloc_ok:
-                self._event("margin_alloc_failed",
-                            f"{symbol}: entry filled but the margin allocation was rejected",
-                            symbol=symbol,
-                            data={"kind": alloc.kind, "code": alloc.code, "error": alloc.error,
-                                  "usdc_amount": alloc_usdc, "tx_hash": alloc.tx_hash})
-                self._alert("margin_alloc_failed",
-                            f"{symbol} 开仓成功但逐仓抵押划入失败：{alloc.error}")
         transition = self.lifecycle.apply_entry(
             decision, order_id=f"coi:{entry_coi}",
             stop_order_id=(f"coi:{stop_coi}" if stop_ok else None),
@@ -1519,17 +1509,16 @@ class Executor:
                     data={"bar_ms": bar_ms, "qty_int": int(plan.qty_int),
                           "entry_coi": entry_coi, "stop_coi": stop_coi,
                           "notional": float(plan.notional),
-                          "margin_alloc_ok": alloc_ok,
                           "dry_run": bool(self.dry_run),
                           "position_id": transition.position_id})
         outcome = SymbolOutcome(
             symbol=symbol, action=ACTION_ENTRY, bar_ms=bar_ms,
             reason=f"opened {plan.base_qty:g} @ {plan.entry_price:g}",
             decision=decision.as_dict(), order=order.as_dict(),
-            stop_order=stop.as_dict(), filled=True, ok=(stop_ok and alloc_ok),
+            stop_order=stop.as_dict(), filled=True, ok=stop_ok,
             detail={"position_id": transition.position_id, "entry_coi": entry_coi,
-                    "stop_coi": stop_coi, "stop_ok": stop_ok, "alloc_ok": alloc_ok})
-        if not (stop_ok and alloc_ok):
+                    "stop_coi": stop_coi, "stop_ok": stop_ok})
+        if not stop_ok:
             self._failures += 1
             self._maybe_open_circuit()
         return outcome
@@ -1800,6 +1789,49 @@ class Executor:
                                          "expiry_ts": expiry_ts, "cancel_error": cancelled})
         self._alert("stop_guard", f"{symbol} 止损{what}完成（{reason}）")
         return new_order, guard
+
+    async def _guard_margins(self, account: ExchangeAccount) -> None:
+        """逐仓抵押守护：`allocated_margin` 低于 名义/杠杆 时补划差额（只补不撤）。
+
+        交易所开仓时已自动划入 ≈名义/杠杆、平仓自动释放（2026-10-29 实测），正常这里
+        什么都不做；2% 容差内的偏低不补（免得每次 tick 都为舍入差发一笔 tx）。
+        `allocated_margin` 读不到（旧数据/字段缺失）→ 跳过不猜；补划被拒 → 事件 + 报警，
+        **不平仓**（止损已在位，强平口径本就是逐仓）。
+        """
+        if not self.margin_isolated or self.dry_run:
+            return
+        leverage = float(getattr(self.lifecycle.sizing_config, "leverage", 0.0) or 5.0)
+        if leverage <= 0:
+            leverage = 5.0
+        live = {str(p.symbol): p for p in account.positions}
+        for row in self.store.open_positions():
+            symbol = str(row.get("symbol") or "").upper()
+            pos = live.get(symbol)
+            if pos is None or not pos.position_value or pos.allocated_margin is None:
+                continue                                   # 没仓/没读数：不猜
+            required = float(pos.position_value) / leverage
+            shortfall = required - float(pos.allocated_margin)
+            if shortfall <= required * 0.02:
+                continue
+            try:
+                res = await self._place(self.exchange.allocate_margin(
+                    market_id=int(pos.market_id or row.get("market_id") or 0),
+                    usdc_amount=shortfall), label=f"{symbol} margin topup")
+            except Exception as exc:                       # noqa: BLE001 - 留痕不中断
+                self._event("margin_topup_failed", f"{symbol}: {exc}", symbol=symbol,
+                            data={"error": str(exc)})
+                self._alert("margin_topup_failed", f"{symbol} 逐仓抵押补划失败：{exc}")
+                continue
+            if self._accepted(res):
+                self._event("margin_topup", f"{symbol} 补划抵押 {shortfall:.4f} USDC",
+                            symbol=symbol,
+                            data={"shortfall": round(shortfall, 6),
+                                  "allocated": float(pos.allocated_margin),
+                                  "required": round(required, 6)})
+            else:
+                self._event("margin_topup_failed", f"{symbol}: topup rejected",
+                            symbol=symbol, data={"code": res.code, "error": res.error})
+                self._alert("margin_topup_failed", f"{symbol} 逐仓抵押补划失败：{res.error}")
 
     async def _guard_stops(self, account: ExchangeAccount
                            ) -> Tuple[ExchangeAccount, List[Dict[str, Any]]]:
