@@ -131,6 +131,8 @@ class FakeSdk(SdkBoundary):
         self.send_results = deque(send_results or [])
         self.signed: list[dict] = []
         self.cancel_signed: list[dict] = []
+        self.leverage_signed: list[dict] = []
+        self.margin_signed: list[dict] = []
         self.sent: list[tuple[int, str]] = []
         self.tx_states: dict[str, dict] = {}
         self.next_nonce_calls = 0
@@ -181,6 +183,22 @@ class FakeSdk(SdkBoundary):
                    "MarketIndex": kwargs["market_index"],
                    "OrderIndex": kwargs["order_index"]}
         return 15, json.dumps(payload, separators=(",", ":")), "d" * 80, None
+
+    def sign_update_leverage(self, **kwargs):
+        """逐仓模式 + 杠杆（fraction=10000/leverage、margin_mode 0/1）。"""
+        self.leverage_signed.append(dict(kwargs))
+        payload = {"AccountIndex": self.account_index, "Nonce": kwargs["nonce"],
+                   "MarketIndex": kwargs["market_index"],
+                   "Fraction": kwargs["fraction"], "MarginMode": kwargs["margin_mode"]}
+        return 12, json.dumps(payload, separators=(",", ":")), "e" * 80, None
+
+    def sign_update_margin(self, **kwargs):
+        """逐仓抵押划入/撤出（usdc_amount 整数 ×1e6、direction ADD=1/REMOVE=0）。"""
+        self.margin_signed.append(dict(kwargs))
+        payload = {"AccountIndex": self.account_index, "Nonce": kwargs["nonce"],
+                   "MarketIndex": kwargs["market_index"],
+                   "USDCAmount": kwargs["usdc_amount"], "Direction": kwargs["direction"]}
+        return 13, json.dumps(payload, separators=(",", ":")), "f" * 80, None
 
     def mint_auth_token(self, ttl_s: int):
         expires = int(self.clock()) + int(ttl_s)
@@ -718,6 +736,64 @@ class AuthTokenTests(unittest.TestCase):
         clock.now += 300                                  # 仍新鲜
         self.assertEqual(client.auth.get(), token)
         self.assertEqual(client.auth.mints, 1)
+
+
+# ------------------------------------------------------- 6b. 逐仓模式与抵押
+
+
+class IsolatedMarginTests(unittest.TestCase):
+    def test_ensure_isolated_signs_fraction_and_mode(self):
+        sdk = FakeSdk(nonce=80)
+        client = make_client(sdk=sdk)
+        result = asyncio.run(client.ensure_isolated(market_id=2, leverage=5.0))
+        self.assertTrue(result.ok)
+        self.assertEqual(result.action, "update_leverage")
+        self.assertEqual(sdk.leverage_signed[0]["market_index"], 2)
+        self.assertEqual(sdk.leverage_signed[0]["fraction"], 2000)     # 10000/5
+        self.assertEqual(sdk.leverage_signed[0]["margin_mode"], 1)     # isolated
+        self.assertEqual(sdk.sent[0][0], 12)
+
+    def test_ensure_isolated_rejects_bad_leverage(self):
+        client = make_client(sdk=FakeSdk())
+        with self.assertRaises(ValueError):
+            asyncio.run(client.ensure_isolated(market_id=2, leverage=0.0))
+
+    def test_ensure_isolated_dry_run_sends_nothing(self):
+        sdk = FakeSdk()
+        client = make_client(sdk=sdk, dry_run=True)
+        result = asyncio.run(client.ensure_isolated(market_id=2, leverage=5.0))
+        self.assertTrue(result.dry_run)
+        self.assertEqual(sdk.sent, [])
+        self.assertEqual(sdk.leverage_signed, [])
+
+    def test_ensure_isolated_is_gated_too(self):
+        client = make_client(sdk=FakeSdk(), env={}, confirm_live=None)
+        with self.assertRaises(LiveTradingDisabled):
+            asyncio.run(client.ensure_isolated(market_id=2, leverage=5.0))
+
+    def test_allocate_margin_converts_usdc_to_raw_units(self):
+        sdk = FakeSdk(nonce=81)
+        client = make_client(sdk=sdk)
+        result = asyncio.run(client.allocate_margin(market_id=2, usdc_amount=2.4))
+        self.assertTrue(result.ok)
+        self.assertEqual(result.action, "update_margin_add")
+        self.assertEqual(sdk.margin_signed[0]["market_index"], 2)
+        self.assertEqual(sdk.margin_signed[0]["usdc_amount"], 2_400_000)  # ×1e6
+        self.assertEqual(sdk.margin_signed[0]["direction"], 1)            # ADD
+        self.assertEqual(sdk.sent[0][0], 13)
+
+    def test_allocate_margin_rejects_non_positive_amount(self):
+        client = make_client(sdk=FakeSdk())
+        with self.assertRaises(ValueError):
+            asyncio.run(client.allocate_margin(market_id=2, usdc_amount=0.0))
+
+    def test_allocate_margin_dry_run_sends_nothing(self):
+        sdk = FakeSdk()
+        client = make_client(sdk=sdk, dry_run=True)
+        result = asyncio.run(client.allocate_margin(market_id=2, usdc_amount=2.4))
+        self.assertTrue(result.dry_run)
+        self.assertEqual(sdk.sent, [])
+        self.assertEqual(sdk.margin_signed, [])
 
 
 # --------------------------------------------------------------------------- 7. 撤单
