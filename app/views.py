@@ -495,16 +495,22 @@ class Sources:
     """面板可选的**外部**读数（全部可不给；不给 = 对应区块降级）。
 
     * `equity`  ：`() -> float`，账户权益（USDC）。生产上由 Lighter 只读账户接口提供。
-    * `orders`  ：`() -> [{symbol, price, qty, order_id, reduce_only}]`，交易所**活挂单**。
+    * `orders`  ：`() -> [{symbol, price, qty, order_id, reduce_only, ...}]`，交易所**活挂单**。
                   止损覆盖区块全靠它 —— 没有它就只能显示「未知」，绝不显示「在」。
+    * `positions`：`() -> {symbol: {qty, position_value, unrealized_pnl, liquidation_price}}`，
+                  **交易所口径**的持仓读数。仓位表的浮盈/现价/强平优先用它：本地按最后一根
+                  已收盘 4h bar 的收盘价现算会滞后最多 4 小时（入场价恰好是那根 bar 的收盘时，
+                  浮盈就恒显示 0）。不给则退回「现价 − 记账入场价」的估算并标 price_source。
     * `bars`    ：`(symbol) -> [strategy.Bar]`，**已收盘**的 4h K 线（`app.market` 给）。
-    * `prices`  ：`() -> {symbol: 最新价}`，仓位表的「现价」。
+    * `prices`  ：`() -> {symbol: 最新价}`，仓位表的「现价」兜底来源。
 
     每个都是**尽力而为**：抛异常 = 该区块降级（0 值 + WARNING），不冒泡。
     """
 
     equity: Optional[Callable[[], Any]] = None
     orders: Optional[Callable[[], Any]] = None
+    #: 交易所口径的持仓读数（浮盈/仓位价值/强平价）；见类 docstring。
+    positions: Optional[Callable[[], Any]] = None
     bars: Optional[Callable[[str], Any]] = None
     prices: Optional[Callable[[], Any]] = None
     #: `(symbol) -> [strategy.Bar]`，**只读缓存、绝不发网络请求**。
@@ -893,6 +899,13 @@ class Panel:
                 prices = {str(k).upper(): _zero(v) for k, v in dict(raw).items()}
             except Exception as exc:                          # noqa: BLE001
                 warnings.append(f"现价 provider 失败: {type(exc).__name__}: {exc}")
+        live: Dict[str, Mapping[str, Any]] = {}
+        if self.sources.positions is not None:
+            try:
+                raw_live = self.sources.positions() or {}
+                live = {str(k).upper(): dict(v) for k, v in dict(raw_live).items() if v}
+            except Exception as exc:                          # noqa: BLE001 - 只影响读数精度
+                warnings.append(f"持仓读数 provider 失败: {type(exc).__name__}: {exc}")
         try:
             kill = kill_state(store)
             verdict = self._dd_verdict(store, now, warnings)
@@ -925,7 +938,7 @@ class Panel:
                     "position_id": None, "warnings": [],
                 })
                 continue
-            out.append(self._position_row(row, symbol, prices, now))
+            out.append(self._position_row(row, symbol, prices, now, live.get(symbol)))
 
         if not prices:
             warnings.append("没有现价 —— 浮盈/名义/强平按开仓价估算（标记为估算）")
@@ -935,25 +948,44 @@ class Panel:
                 "warnings": warnings, "degraded": bool(warnings)}
 
     def _position_row(self, row: Any, symbol: str, prices: Mapping[str, float],
-                      now: float) -> Dict[str, Any]:
+                      now: float, snap: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        """一行仓位。`snap` = 交易所侧读数（优先）：浮盈/现价/强平都按交易所口径。
+
+        为什么优先交易所读数：`prices` 来自 tick 缓存的**最后一根已收盘 4h bar 的收盘价**
+        （可能滞后 ≤4h），而入场价往往就是那根 bar 的收盘 ⇒ 浮盈恒显示 0（2026-10-29 实测）。
+        交易所给的 `position_value / 数量` 就是标记价，`unrealized_pnl` 还已经把资金费算进去了。
+        """
         side = int(_row_get(row, "side") or 0)
         entry = _zero(_row_get(row, "entry_price"))
         qty = _zero(_row_get(row, "qty"))
         stop = _finite(_row_get(row, "stop_price"))
         state = str(_row_get(row, "state") or "")
-        price = _finite(prices.get(symbol))
-        price_source = "provider" if price is not None else "entry_price"
+        live = dict(snap or {})
+        mark = None
+        value = _finite(live.get("position_value"))
+        live_qty = _finite(live.get("qty")) or qty
+        if value is not None and live_qty:
+            mark = value / live_qty                     # 交易所仓位价值 ÷ 数量 = 标记价
+        price = mark if mark else _finite(prices.get(symbol))
+        if mark:
+            price_source = "exchange"
+        elif price is not None:
+            price_source = "provider"
+        else:
+            price_source = "entry_price"
         if price is None:
             price = entry
         # 名义按**当前价**算（面板看的是现在的敞口）；没有现价才退回记账时的名义。
-        notional = abs(price * qty) if qty else _zero(_row_get(row, "notional"))
-        upnl = (price - entry) * qty * side if entry > 0 else 0.0
+        notional = abs(value) if value else (abs(price * qty) if qty else _zero(_row_get(row, "notional")))
+        live_upnl = _finite(live.get("unrealized_pnl"))
+        upnl = live_upnl if live_upnl is not None else (
+            (price - entry) * qty * side if entry > 0 else 0.0)
         upnl_pct = ((price - entry) / entry * side) if entry > 0 else 0.0
         dist = None
         if stop is not None and stop > 0 and price > 0:
             dist = (price - stop) / price * side        # 正数 = 现价离止损还有多远
-        liq = None
-        if entry > 0 and side:
+        liq = _finite(live.get("liquidation_price"))
+        if liq is None and entry > 0 and side:
             liq = entry * (1 - side / LEVERAGE)          # 逐仓 5x 近似（不含维持保证金）
         opened = _finite(_row_get(row, "opened_at"))
         holding = None if opened is None else max(0.0, now - opened)

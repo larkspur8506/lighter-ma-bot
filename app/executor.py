@@ -169,11 +169,21 @@ class ExchangePosition:
     qty_str: str = ""
     market_id: Optional[int] = None
     avg_entry_price: Optional[float] = None
+    #: 交易所自己算的浮动盈亏（USDC，**已含资金费**）。面板必须用这个数：
+    #: 本地按「4h 收盘价 − 记账入场价」现算会滞后最多一根 4h，甚至恒为 0（入场价就是那根 bar 的收盘）。
+    unrealized_pnl: Optional[float] = None
+    #: 仓位当前价值（= 数量 × 标记价）。有了它才能反推**标记价**给面板显示「现价」。
+    position_value: Optional[float] = None
+    #: 交易所给的强平价（本地按杠杆估的只是近似）。
+    liquidation_price: Optional[float] = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
         return {"symbol": self.symbol, "side": self.side, "qty": str(self.qty),
-                "market_id": self.market_id, "avg_entry_price": self.avg_entry_price}
+                "market_id": self.market_id, "avg_entry_price": self.avg_entry_price,
+                "unrealized_pnl": self.unrealized_pnl,
+                "position_value": self.position_value,
+                "liquidation_price": self.liquidation_price}
 
 
 @dataclass(frozen=True)
@@ -342,6 +352,11 @@ def positions_from_payload(payload: Mapping[str, Any], *,
             qty_str=str(row.get("position")),
             market_id=_opt_int(row.get("market_id")),
             avg_entry_price=(float(avg) if avg not in (None, "") else None),
+            # 交易所口径的浮盈/仓位价值/强平价（都是字符串）——面板显示盈亏只用这一份，
+            # 不再拿「最后一根已收盘 4h bar 的收盘价」去现算（那会滞后最多 4 小时）。
+            unrealized_pnl=_opt_float(row.get("unrealized_pnl")),
+            position_value=_opt_float(row.get("position_value")),
+            liquidation_price=_opt_float(row.get("liquidation_price")),
             raw=dict(row)))
     return tuple(out)
 

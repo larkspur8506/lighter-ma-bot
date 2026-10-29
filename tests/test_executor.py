@@ -646,6 +646,32 @@ class ReconcileDetectionTests(Base):
         self.assertEqual(self.store.position(int(row["id"]))["state"], "CLOSED")
 
 
+class PositionPayloadPnlTests(unittest.TestCase):
+    """账户响应里的浮盈/仓位价值/强平价必须被解析出来（面板的盈亏就靠这三个）。"""
+
+    def payload(self, **pos):
+        row = {"market_id": 2, "symbol": "SOL", "sign": -1, "position": "1.191",
+               "avg_entry_price": "99.577", "position_value": "119.845566",
+               "unrealized_pnl": "-1.249359", "liquidation_price": "507.22748904544505"}
+        row.update(pos)
+        return {"code": 200, "accounts": [{"index": 764377, "positions": [row]}]}
+
+    def test_fields_are_parsed_from_strings(self):
+        pos = executor.positions_from_payload(self.payload(), account_index=764377)[0]
+        self.assertAlmostEqual(pos.unrealized_pnl, -1.249359, places=6)
+        self.assertAlmostEqual(pos.position_value, 119.845566, places=6)
+        self.assertAlmostEqual(pos.liquidation_price, 507.2275, places=3)
+        self.assertEqual(pos.as_dict()["unrealized_pnl"], -1.249359)
+
+    def test_missing_fields_degrade_to_none_not_zero(self):
+        payload = self.payload()
+        payload["accounts"][0]["positions"][0].pop("unrealized_pnl")
+        payload["accounts"][0]["positions"][0].pop("position_value")
+        pos = executor.positions_from_payload(payload, account_index=764377)[0]
+        self.assertIsNone(pos.unrealized_pnl)
+        self.assertIsNone(pos.position_value)
+
+
 class DecimalTriggerPriceTests(unittest.TestCase):
     """交易所的止损触发价是**小数串**（`Order.trigger_price: str`）。
 
