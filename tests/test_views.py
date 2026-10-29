@@ -724,6 +724,79 @@ class PositionMarkQuoteTests(PanelFixture):
         self.assertEqual(row["price_source"], "provider")
 
 
+class ExitAndFundingTests(PanelFixture):
+    """仓位表的新两列：离场价（SMA20）+ 距离，资金费率（每小时）。"""
+
+    def _bars(self, price=6500.0, count=40):
+        return flat_bars(int(T0 * 1000) - count * BAR_S * 1000, count, price)
+
+    def _row(self, *, funding=None, bars=None, snap=None):
+        seed(self.store)
+        panel = self.panel(sources=views.Sources(
+            prices=lambda: {"BTC": 6600.0},
+            positions=lambda: ({"BTC": snap} if snap else {}),
+            funding=lambda: funding or {},
+            cached_bars=lambda symbol: (bars if bars is not None else self._bars())))
+        return [r for r in panel.positions()["positions"] if r["symbol"] == "BTC"][0]
+
+    def test_exit_price_is_sma20_of_last_closed_bar_and_distance(self):
+        row = self._row(bars=self._bars(6500.0))
+        self.assertAlmostEqual(row["exit_price"], 6500.0, places=6)
+        # 多单、现价 6600 > SMA20 6500 ⇒ 离场线在下方，距离 = (6600−6500)/6600
+        self.assertAlmostEqual(row["dist_to_exit_pct"], 100.0 / 6600.0, places=9)
+
+    def test_short_exit_distance_is_positive_when_price_below_the_line(self):
+        seed(self.store)
+        # 手工造一个空仓（seed 里是多单）
+        self.store.record_entry("ETH", -1, qty_int=100_000, size_decimals=5,
+                                entry_price_int=230_000, price_decimals=2,
+                                stop_price_int=260_000, bar_ms=1_600_000_100_000,
+                                market_id=0, stop_order_id="coi:9", ts=1001.0)
+        panel = self.panel(sources=views.Sources(
+            prices=lambda: {"ETH": 2300.0},
+            cached_bars=lambda symbol: self._bars(2400.0)))
+        row = [r for r in panel.positions()["positions"] if r["symbol"] == "ETH"][0]
+        self.assertAlmostEqual(row["exit_price"], 2400.0, places=6)
+        # 空单、现价 2300 低于 SMA20 2400 ⇒ (2300−2400)/2300×(−1) = +4.35%
+        self.assertAlmostEqual(row["dist_to_exit_pct"], 100.0 / 2300.0, places=9)
+
+    def test_funding_rate_and_hourly_cash_flow(self):
+        row = self._row(funding={"BTC": {"rate": 0.0001, "exchange": "lighter"}})
+        self.assertAlmostEqual(row["funding_rate"], 0.0001)
+        self.assertEqual(row["funding_rate_exchange"], "lighter")
+        # 多单 + 正费率 ⇒ 付出：−0.0001 × 名义(=6600) = −0.66 U/h
+        self.assertAlmostEqual(row["funding_rate_cash"], -0.66, places=6)
+
+    def test_short_receives_positive_funding(self):
+        seed(self.store)
+        self.store.record_entry("ETH", -1, qty_int=100_000, size_decimals=5,
+                                entry_price_int=230_000, price_decimals=2,
+                                stop_price_int=260_000, bar_ms=1_600_000_100_000,
+                                market_id=0, stop_order_id="coi:9", ts=1001.0)
+        panel = self.panel(sources=views.Sources(
+            prices=lambda: {"ETH": 2300.0},
+            funding=lambda: {"ETH": {"rate": 0.0001, "exchange": "lighter"}}))
+        row = [r for r in panel.positions()["positions"] if r["symbol"] == "ETH"][0]
+        self.assertGreater(row["funding_rate_cash"], 0)      # 空单 + 正费率 = 收
+
+    def test_missing_funding_leaves_it_blank(self):
+        row = self._row()
+        self.assertIsNone(row["funding_rate"])
+        self.assertIsNone(row["funding_rate_cash"])
+
+    def test_html_has_the_new_columns(self):
+        seed(self.store)
+        panel = self.panel(sources=views.Sources(
+            prices=lambda: {"BTC": 6600.0},
+            funding=lambda: {"BTC": {"rate": 0.000096, "exchange": "lighter"}},
+            cached_bars=lambda symbol: self._bars(6500.0)))
+        body = views._positions_html(panel.positions())
+        for header in ("离场价", "距离场%", "资金费率"):
+            self.assertIn(header, body)
+        self.assertIn("+0.0096%/h", body)
+        self.assertIn("（付）", body)          # 多单 + 正费率 = 付
+
+
 class DegradedTests(unittest.TestCase):
     def _broken(self) -> views.Panel:
         def boom() -> Any:

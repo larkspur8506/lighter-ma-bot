@@ -517,6 +517,8 @@ class Sources:
     #: `() -> {symbol: {price, ts}}`，**有持仓标的**的最新盘口中间价（后台每 ~60s 刷）。
     #: 空仓标的没有条目 —— 它们的「现价」仍用最后一根 4h 收盘。
     marks: Optional[Callable[[], Any]] = None
+    #: `() -> {symbol: {rate, exchange, ts}}`，**当前资金费率**（Lighter 周期 1 小时）。
+    funding: Optional[Callable[[], Any]] = None
     bars: Optional[Callable[[str], Any]] = None
     prices: Optional[Callable[[], Any]] = None
     #: `(symbol) -> [strategy.Bar]`，**只读缓存、绝不发网络请求**。
@@ -919,6 +921,13 @@ class Panel:
                           if isinstance(v, Mapping)}
             except Exception as exc:                          # noqa: BLE001
                 warnings.append(f"盘口 provider 失败: {type(exc).__name__}: {exc}")
+        funding: Dict[str, Mapping[str, Any]] = {}
+        if self.sources.funding is not None:
+            try:
+                funding = {str(k).upper(): dict(v) for k, v in dict(self.sources.funding() or {}).items()
+                           if isinstance(v, Mapping)}
+            except Exception as exc:                          # noqa: BLE001
+                warnings.append(f"资金费率 provider 失败: {type(exc).__name__}: {exc}")
         try:
             kill = kill_state(store)
             verdict = self._dd_verdict(store, now, warnings)
@@ -952,7 +961,7 @@ class Panel:
                 })
                 continue
             out.append(self._position_row(row, symbol, prices, now, live.get(symbol),
-                                          quotes.get(symbol)))
+                                          quotes.get(symbol), funding.get(symbol)))
 
         if not prices:
             warnings.append("没有现价 —— 浮盈/名义/强平按开仓价估算（标记为估算）")
@@ -961,9 +970,32 @@ class Panel:
                 "entry_blocked": entry_blocked, "symbols": symbols,
                 "warnings": warnings, "degraded": bool(warnings)}
 
+    def _exit_price_for(self, symbol: str) -> Optional[float]:
+        """策略离场线 = 最后一根**已收盘** 4h bar 的 SMA20（与信号层同一套指标）。
+
+        离场判定是「收盘价 vs SMA20」（多单收盘跌破 / 空单收盘升破），不是盘中触价 ——
+        所以这里给的是**参考线**，不是一定会成交的价。
+        只读 tick 缓存下来的 K 线（`cached_bars`），拿不到就返回 None。
+        """
+        if self.sources.cached_bars is None:
+            return None
+        try:
+            bars = list(self.sources.cached_bars(symbol) or ())
+        except Exception:                                     # noqa: BLE001 - 只影响一列
+            return None
+        if not bars:
+            return None
+        try:
+            ind, _ = self._indicators_for(symbol, bars)
+        except Exception:                                     # noqa: BLE001
+            return None
+        values = ind.get("sma20") or [None]
+        return _finite(values[-1] if values else None)
+
     def _position_row(self, row: Any, symbol: str, prices: Mapping[str, float],
                       now: float, snap: Optional[Mapping[str, Any]] = None,
-                      quote: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+                      quote: Optional[Mapping[str, Any]] = None,
+                      funding: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         """一行仓位。价格优先级：**有持仓的实时盘口中间价** → 交易所标记价 → 4h 收盘。
 
         为什么：`prices` 来自 tick 缓存的最后一根已收盘 4h bar 收盘价（最多滞后 4 小时，
@@ -1013,6 +1045,14 @@ class Panel:
         liq = _finite(live.get("liquidation_price"))
         if liq is None and entry > 0 and side:
             liq = entry * (1 - side / LEVERAGE)          # 逐仓 5x 近似（不含维持保证金）
+        # 策略离场线（SMA20 收盘判定）：正数 = 现价离触发线还有多远（按现价的比例）
+        exit_px = self._exit_price_for(symbol)
+        dist_exit = None
+        if exit_px and price > 0 and side:
+            dist_exit = (price - exit_px) / price * side
+        # 当前资金费率（Lighter 周期 1 小时）：正费率 = 多头付、空头收
+        rate = _finite((funding or {}).get("rate"))
+        rate_cash = None if (rate is None or not notional) else -side * rate * notional
         opened = _finite(_row_get(row, "opened_at"))
         holding = None if opened is None else max(0.0, now - opened)
         return {
@@ -1024,6 +1064,10 @@ class Panel:
             "upnl": upnl, "upnl_pct": upnl_pct, "qty": qty,
             "stop_price": 0.0 if stop is None else stop,
             "dist_to_stop_pct": dist,
+            "exit_price": exit_px, "dist_to_exit_pct": dist_exit,
+            "funding_rate": rate, "funding_rate_cash": rate_cash,
+            "funding_rate_exchange": str((funding or {}).get("exchange") or ""),
+            "funding_paid": _finite(live.get("funding_paid")),
             "notional": notional, "margin": notional / LEVERAGE if LEVERAGE else 0.0,
             "liq_price": liq,
             "opened_at": opened, "holding_s": holding, "holding_text": _dur(holding),
@@ -1841,10 +1885,27 @@ def _status_html(block: Mapping[str, Any], mode: str) -> str:
     return "".join(parts)
 
 
+def _funding_cell(rate: Any, cash: Any, side: int) -> str:
+    """资金费率单元格：`+0.0096%/h（收）`，并附上按当前名义估的每小时现金流。
+
+    符号语义：正费率 = 多头付、空头收（Lighter 每小时结算一次）。
+    """
+    value = _finite(rate)
+    if value is None:
+        return "<td class=\"muted\">—</td>"
+    receiving = (value < 0) if side > 0 else (value > 0)
+    cls = "pos" if receiving else "neg"
+    txt = f"{value * 100:+.4f}%/h{'（收）' if receiving else '（付）'}"
+    flow = _finite(cash)
+    extra = "" if flow is None else f" <span class=\"muted\">{flow:+.4f} U/h</span>"
+    return f"<td class=\"{cls}\">{txt}{extra}</td>"
+
+
 def _positions_html(block: Mapping[str, Any]) -> str:
     head = ("<tr><th>标的</th><th>方向</th><th>开仓价</th><th>现价</th><th>浮盈(U)</th>"
-            "<th>浮盈%</th><th>数量</th><th>止损价</th><th>距止损%</th><th>名义(U)</th>"
-            "<th>保证金(U)</th><th>强平≈</th><th>持仓时长</th><th>状态</th></tr>")
+            "<th>浮盈%</th><th>数量</th><th>止损价</th><th>距止损%</th>"
+            "<th>离场价</th><th>距离场%</th><th>资金费率</th>"
+            "<th>名义(U)</th><th>保证金(U)</th><th>强平≈</th><th>持仓时长</th><th>状态</th></tr>")
     rows = []
     for row in block.get("positions") or ():
         rows.append(
@@ -1858,14 +1919,23 @@ def _positions_html(block: Mapping[str, Any]) -> str:
             f"<td>{_qty_text(row.get('qty')) if row.get('position_id') else '—'}</td>"
             f"<td>{_money(row.get('stop_price')) if row.get('position_id') else '—'}</td>"
             f"<td>{_pct(row.get('dist_to_stop_pct'))}</td>"
-            f"<td>{_money(row.get('notional'))}</td>"
+            f"<td>{_money(row.get('exit_price')) if row.get('position_id') else '—'}</td>"
+            f"<td class=\"{_cls(row.get('dist_to_exit_pct'))}\">{_pct(row.get('dist_to_exit_pct'))}</td>"
+            + _funding_cell(row.get("funding_rate"), row.get("funding_rate_cash"),
+                            int(row.get("side") or 0))
+            + f"<td>{_money(row.get('notional'))}</td>"
             f"<td>{_money(row.get('margin'))}</td>"
             f"<td>{_money(row.get('liq_price'))}</td>"
             f"<td>{html.escape(str(row.get('holding_text')))}</td>"
             f"<td>{html.escape(str(row.get('status')))}</td>"
             "</tr>")
     return ('<section id="block-positions"><h2>② 仓位表</h2>'
-            f"<table>{head}{''.join(rows)}</table>{_warn_html(block.get('warnings'))}"
+            f"<table>{head}{''.join(rows)}</table>"
+            '<div class="legend">离场价 = 最后一根已收盘 4h 的 SMA20，'
+            '判定按收盘价（多单收盘跌破 / 空单收盘升破），盘中触线不算；'
+            '距离场% 正数表示现价离触发线还有多远 · '
+            '资金费率按 Lighter 每小时结算，正费率 = 多头付、空头收</div>'
+            f"{_warn_html(block.get('warnings'))}"
             "</section>")
 
 

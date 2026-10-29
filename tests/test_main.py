@@ -1053,6 +1053,50 @@ class MergeAcceptedStopsTests(unittest.TestCase):
         self.assertIs(main.stop_guard_on({"LIGHTER_STOP_GUARD": "1"}), True)
 
 
+class FundingRefreshTests(unittest.TestCase):
+    """后台资金费率刷新：一次请求拿全部市场，只取 exchange='lighter' 的那一行。"""
+
+    class FakeMarket:
+        def __init__(self, rates=None, boom=False):
+            self.rates = dict(rates or {})
+            self.boom = boom
+            self.calls = 0
+
+        def funding_rates(self, *, exchange="lighter"):
+            self.calls += 1
+            if self.boom:
+                raise RuntimeError("funding endpoint 403")
+            return dict(self.rates)
+
+    def _run_once(self, market, *, interval=600.0):
+        cache = main.PanelCache()
+
+        async def fake_sleep(_seconds):
+            raise asyncio.CancelledError()
+
+        async def body():
+            with contextlib.suppress(asyncio.CancelledError):
+                await main._refresh_funding_rates(cache, market=market,
+                                                  interval_s=interval, sleep=fake_sleep)
+        asyncio.run(body())
+        return cache
+
+    def test_rates_are_cached(self):
+        cache = self._run_once(self.FakeMarket({"BTC": 0.0001, "SOL": 0.000096}))
+        got = cache.funding()
+        self.assertAlmostEqual(got["SOL"]["rate"], 0.000096)
+        self.assertEqual(got["SOL"]["exchange"], "lighter")
+
+    def test_endpoint_failure_is_swallowed(self):
+        cache = self._run_once(self.FakeMarket(boom=True))
+        self.assertEqual(cache.funding(), {})
+
+    def test_interval_parsing(self):
+        self.assertEqual(main.funding_refresh_interval_s({}), 600.0)
+        self.assertEqual(main.funding_refresh_interval_s({"PANEL_FUNDING_REFRESH_S": "120"}), 120.0)
+        self.assertEqual(main.funding_refresh_interval_s({"PANEL_FUNDING_REFRESH_S": "0"}), 0.0)
+
+
 class MarkRefreshTests(unittest.TestCase):
     """后台盘口刷新：只刷**有持仓**的标的（空仓标的一个请求都不发）。"""
 

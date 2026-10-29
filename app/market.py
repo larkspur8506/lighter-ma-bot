@@ -855,6 +855,33 @@ class MarketClient:
 
     # -------------------------------------------------------------- 盘口
 
+    def funding_rates(self, *, exchange: str = "lighter") -> Dict[str, float]:
+        """各标的**当前资金费率**（公开端点 `/funding-rates`，无需签名）。
+
+        返回 `{symbol: rate}`（只取 `exchange` 那一行；Lighter 的资金费周期是 **1 小时**，
+        所以这个 rate 就是「每小时」的费率）。费率是多交易所并列返回的，必须按 exchange 过滤：
+        拿 binance 的费率当 Lighter 的会误导人。
+        """
+        payload = self._get_json("funding-rates")
+        rows = payload.get("funding_rates") if isinstance(payload, Mapping) else None
+        if not isinstance(rows, list):
+            raise FeedError("funding-rates payload has no 'funding_rates' list")
+        wanted = str(exchange or "").strip().lower()
+        out: Dict[str, float] = {}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("exchange") or "").strip().lower() != wanted:
+                continue
+            symbol = str(row.get("symbol") or "").strip().upper()
+            try:
+                rate = float(row.get("rate"))
+            except (TypeError, ValueError):
+                continue
+            if symbol and rate == rate:                       # 排除 NaN
+                out[symbol] = rate
+        return out
+
     def order_book(self, symbol: str, *, depth: int = 10) -> OrderBook:
         """盘口前 `depth` 档（按价格聚合后的档位）。
 
