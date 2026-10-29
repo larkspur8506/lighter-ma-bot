@@ -204,6 +204,10 @@ class ExchangeOrder:
                 "market_id": self.market_id, "symbol": self.symbol,
                 "reduce_only": self.reduce_only,
                 "trigger_price_int": self.trigger_price_int,
+                # 交易所原样触发价（小数串）：面板的「止损覆盖」要比对**触发价**，
+                # 而触发价和真正挂在簿上的 `price_int`（触发后最差成交价 = 触发价 + 滑点）
+                # 是两个数。少了这个字段，面板只能拿 price 去比 stop_price ⇒ 永远差一点。
+                "trigger_price_raw": self.trigger_price_raw,
                 "price_int": self.price_int, "qty_int": self.qty_int,
                 "status": self.status}
 

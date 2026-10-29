@@ -62,6 +62,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from app import dd as dd_module
@@ -185,6 +186,42 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
         return row[key]
     except (IndexError, KeyError, TypeError):
         return getattr(row, key, default)
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _stop_coi_of(row: Any) -> Optional[int]:
+    """仓位行里的止损单身份：`positions.stop_order_id` 形如 `coi:<clientOrderIndex>`。"""
+    raw = str(_row_get(row, "stop_order_id") or "").strip()
+    if raw.startswith("coi:"):
+        raw = raw[4:]
+    return _int_or_none(raw)
+
+
+def _order_trigger_tick(order: Mapping[str, Any], price_decimals: int) -> Optional[int]:
+    """挂单**触发价** → 整数 tick。
+
+    优先用解析层给的 `trigger_price_int`；拿不到就按该标的的 `price_decimals`
+    把原始小数串（交易所返回 `"105.257"` 这种字符串）换算成 tick。
+    **不要**退回 `price_int`：那是触发后的最差成交价（= 触发价 + 滑点），比止损价高/低一截。
+    """
+    ticks = _int_or_none(order.get("trigger_price_int"))
+    if ticks is not None:
+        return ticks
+    raw = order.get("trigger_price_raw")
+    if raw in (None, ""):
+        return None
+    try:
+        return int((Decimal(str(raw).strip()) * (Decimal(10) ** int(price_decimals))).to_integral_value())
+    except (ArithmeticError, ValueError):
+        return None
 
 
 def _loads(value: Any) -> Dict[str, Any]:
@@ -959,6 +996,15 @@ class Panel:
                         "qty": _finite(_row_get(item, "qty")),
                         "order_id": _row_get(item, "order_id"),
                         "reduce_only": _row_get(item, "reduce_only"),
+                        # ↓ 生产形态（`ExchangeOrder.as_dict()`）：没有 `price`/`qty`，
+                        #   只有 int 形态 + 触发价。少了这几个键，止损单永远比不上 ⇒ 假警报。
+                        "client_order_index": _int_or_none(_row_get(item, "client_order_index")),
+                        "market_id": _int_or_none(_row_get(item, "market_id")),
+                        "trigger_price_int": _int_or_none(_row_get(item, "trigger_price_int")),
+                        "trigger_price_raw": _row_get(item, "trigger_price_raw"),
+                        "qty_int": _int_or_none(_row_get(item, "qty_int")),
+                        # 刚开仓那一轮由 tick 并进来的「交易所已受理」单：还没被真读数复核过
+                        "pending_confirm": bool(_row_get(item, "pending_confirm")),
                     })
             except Exception as exc:                          # noqa: BLE001
                 warnings.append(f"挂单 provider 失败: {type(exc).__name__}: {exc}")
@@ -973,17 +1019,30 @@ class Panel:
             stop = _finite(_row_get(row, "stop_price"))
             qty = _zero(_row_get(row, "qty"))
             decimals = int(_row_get(row, "price_decimals") or 0)
+            size_decimals = int(_row_get(row, "size_decimals") or 0)
             tol = max(1e-9, 1.5 * (10.0 ** -decimals)) if decimals >= 0 else 1e-9
+            stop_coi = _stop_coi_of(row)
+            stop_int = _int_or_none(_row_get(row, "stop_price_int"))
+            if stop_int is None and stop is not None:
+                stop_int = int(round(stop * (10.0 ** decimals)))
+            # 判据顺序：coi（唯一键）→ 触发价 ±1 tick（老仓位没写 coi 时）→ 价格字段（旧形态/测试注入）。
             match = None
             for order in orders:
                 if order["symbol"] and order["symbol"] != symbol:
                     continue
-                price = order["price"]
-                if stop is None or price is None:
-                    continue
-                if abs(price - stop) <= tol:
+                if stop_coi is not None and order["client_order_index"] == stop_coi:
                     match = order
                     break
+                if stop_int is not None:
+                    ticks = _order_trigger_tick(order, decimals)
+                    if ticks is not None and abs(ticks - int(stop_int)) <= 1:
+                        match = order
+                        break
+                price = order["price"]
+                if stop is not None and price is not None and abs(price - stop) <= tol:
+                    match = order
+                    break
+            order_qty = None
             if stop is None:
                 status, protected = "missing", False
                 note = "止损价缺失（仓位裸奔）"
@@ -994,22 +1053,26 @@ class Panel:
                 status, protected = "missing", False
                 note = f"交易所**没有**这张止损单（应在 {stop:g}）"
             else:
-                covered = match["qty"] is None or match["qty"] + 1e-12 >= qty
+                order_qty = match["qty"]
+                if order_qty is None and match["qty_int"] is not None and size_decimals >= 0:
+                    order_qty = match["qty_int"] / (10.0 ** size_decimals)
+                covered = order_qty is None or order_qty + 1e-12 >= qty
                 if match["reduce_only"] is False:
                     status, protected = "mismatch", False
                     note = "止损单不是 reduce-only（可能反向开仓）"
                 elif not covered:
                     status, protected = "partial", False
-                    note = f"挂单数量 {(match['qty'] or 0):g} < 仓位 {qty:g}"
+                    note = f"挂单数量 {order_qty:g} < 仓位 {qty:g}"
                 else:
                     status, protected = "present", True
-                    note = "已覆盖"
+                    note = ("已下单（交易所已受理，下一轮读数复核）" if match["pending_confirm"]
+                            else "已覆盖")
             out.append({
                 "symbol": symbol, "position_id": _row_get(row, "id"),
                 "side": int(_row_get(row, "side") or 0),
                 "stop_price": 0.0 if stop is None else stop,
                 "qty": qty,
-                "order_qty": None if match is None else match["qty"],
+                "order_qty": None if match is None else order_qty,
                 "order_id": _row_get(row, "stop_order_id") or (match or {}).get("order_id"),
                 "exchange_status": status, "protected": protected,
                 "checked_at": now, "note": note,

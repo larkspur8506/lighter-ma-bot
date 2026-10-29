@@ -433,6 +433,45 @@ class PanelCache:
         return dict(self.prices_value)
 
 
+def merge_accepted_stops(cache: PanelCache, report: Any) -> int:
+    """把本轮「交易所已受理」的止损单并进面板的挂单缓存；返回并入张数。
+
+    为什么需要：tick **开头**读账户挂单，而止损单是开仓之后几秒才下的 ⇒ 面板在下一轮
+    tick（最长 30 分钟）之前完全看不到它，会把刚挂好的止损报成「没挂」。这里只并
+    `ok=True`（= API 已受理 code=200）的那张，并标 `pending_confirm`；下一轮真读数覆盖它。
+
+    **纯观测**：只写面板缓存，不参与任何交易决策（对账走 `ExchangeAccount.orders` 的实时值）。
+    `orders_value is None`（从未采集过挂单）时什么都不做 —— 保持「未知」，不编造。
+    """
+    current = cache.orders_value
+    if current is None:
+        return 0
+    merged = [dict(o) for o in current]
+    seen = {o.get("client_order_index") for o in merged}
+    added = 0
+    for outcome in getattr(report, "outcomes", ()) or ():
+        stop = getattr(outcome, "stop_order", None) or {}
+        if not stop.get("ok") or stop.get("dry_run"):
+            continue
+        coi = stop.get("client_order_index")
+        if coi is None or coi in seen:
+            continue
+        merged.append({"symbol": str(stop.get("symbol") or "").upper(),
+                       "market_id": stop.get("market_id"),
+                       "client_order_index": coi,
+                       "trigger_price_int": stop.get("trigger_price_int"),
+                       "price_int": stop.get("price_int"),
+                       "qty_int": stop.get("qty_int"),
+                       "reduce_only": True, "order_id": "", "status": "pending",
+                       "pending_confirm": True})
+        seen.add(coi)
+        added += 1
+    if added:
+        cache.update(orders=merged, error=getattr(cache, "error", ""))
+        logger.info("[panel] 本轮新挂的止损单已并入面板缓存（%d 张，等下一轮读数复核）", added)
+    return added
+
+
 class MarketBarSource:
     """`app.market` 的公开只读 K 线（**无鉴权、无签名**），带 TTL 缓存。
 
@@ -1444,6 +1483,8 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
                          prices=dict(getattr(executor, "_prices", {}) or {}),
                          ts=time.time(),
                          error=str(getattr(account, "orders_error", "") or ""))
+        # 刚并进缓存的那张止损单是开仓之后才下的：tick 开头那次读数看不到它。
+        merge_accepted_stops(cache, report)
         await _advance_drawdown(store, executor, reader)
         return report
 
