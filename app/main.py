@@ -388,6 +388,8 @@ class PanelCache:
         #: 「有持仓的标的」的最新盘口中间价（symbol → {price, ts}）。后台每 ~60s 刷一次，
         #: 只刷有仓的（0~3 个请求/分钟）；空仓标的仍用最后一根 4h 收盘——用户拍板的平衡口径。
         self.marks_value: Dict[str, Dict[str, float]] = {}
+        #: 最近一次**当前资金费率**（symbol → {rate, exchange, ts}）。Lighter 周期 1 小时。
+        self.funding_value: Dict[str, Dict[str, Any]] = {}
         self.updated_at: Optional[float] = None
         self.error: str = ""
         # tick 已经拉过的 K 线（symbol → (ts, bars)）。面板直接复用，别再自己去交易所
@@ -461,6 +463,22 @@ class PanelCache:
     def marks(self) -> Dict[str, Dict[str, float]]:
         """最近一次盘口中间价（symbol → {price, ts}）。可能是空的 = 还没刷新/没有持仓。"""
         return {k: dict(v) for k, v in self.marks_value.items()}
+
+    def set_funding(self, symbol: str, rate: Any, *, exchange: str = "lighter",
+                    ts: Optional[float] = None) -> None:
+        """记一笔**当前资金费率**（Lighter 的周期是 1 小时）。"""
+        try:
+            value = float(rate)
+        except (TypeError, ValueError):
+            return
+        if value != value:
+            return
+        self.funding_value[str(symbol).upper()] = {
+            "rate": value, "exchange": str(exchange or ""), "ts": float(ts if ts is not None else time.time())}
+
+    def funding(self) -> Dict[str, Dict[str, Any]]:
+        """最近一次资金费率（symbol → {rate, exchange, ts}）。空 = 还没刷新。"""
+        return {k: dict(v) for k, v in self.funding_value.items()}
 
     def positions(self) -> Dict[str, Dict[str, Any]]:
         """交易所侧持仓读数（可能为空 dict = 还没采集过/空仓，不是「未知」）。"""
@@ -577,6 +595,42 @@ async def _refresh_position_marks(cache: "PanelCache", *,
                 cache.set_mark(symbol, quote)
         try:
             await sleep(max(5.0, float(interval_s)))
+        except asyncio.CancelledError:                     # pragma: no cover - 关闭路径
+            return
+
+
+def funding_refresh_interval_s(env: Optional[Mapping[str, str]] = None) -> float:
+    """资金费率刷新间隔（秒），默认 600。0 = 关（面板不显示费率）。费率按小时结算，不必刷太快。"""
+    raw = str((env if env is not None else os.environ).get("PANEL_FUNDING_REFRESH_S", "600")
+              or "600").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 600.0
+    if value != value or value < 0:
+        return 600.0
+    return value
+
+
+async def _refresh_funding_rates(cache: "PanelCache", *, market: Any,
+                                 interval_s: float = 600.0,
+                                 sleep: Callable[[float], Any] = asyncio.sleep) -> None:
+    """后台刷「当前资金费率」（公开端点，一次请求拿全部市场）。
+
+    为什么要它：仓位表要回答「这个仓每小时被收/收多少资金费」。费率列表是多交易所并列的，
+    只取 `exchange='lighter'` 那一行（拿 binance 的当 Lighter 的会误导人）。
+    **只写观测缓存**；任何异常只记日志，绝不抛。
+    """
+    while True:
+        try:
+            rates = await asyncio.to_thread(market.funding_rates)
+        except Exception:                                  # noqa: BLE001 - 拿不到就沿用上一次
+            logger.warning("funding refresh failed", exc_info=True)
+            rates = None
+        for symbol, rate in (rates or {}).items():
+            cache.set_funding(symbol, rate, exchange="lighter")
+        try:
+            await sleep(max(30.0, float(interval_s)))
         except asyncio.CancelledError:                     # pragma: no cover - 关闭路径
             return
 
@@ -1018,6 +1072,7 @@ def _default_panel_sources(cache: "PanelCache",
             return source(symbol)
     return views.Sources(equity=cache.equity, orders=cache.orders,
                          positions=cache.positions, marks=cache.marks,
+                         funding=cache.funding,
                          prices=cache.prices, bars=bars,
                          cached_bars=cache.bars)
 
@@ -1148,20 +1203,28 @@ def create_app(*, panel: Optional[views.Panel] = None,
             logger.info("panel warm-up scheduled (bars + account/prices)")
             # 有持仓标的的盘口中间价：后台每 PANEL_MARK_REFRESH_S 秒刷一次（只刷有仓的）。
             # 用户拍板的口径：有仓按实时价、空仓按最后一根 4h 收盘。0 = 关。
+            # 资金费率（公开端点，一次拿全部市场）：每 PANEL_FUNDING_REFRESH_S 秒刷一次。
             mark_interval = mark_refresh_interval_s()
-            if mark_interval > 0:
+            funding_interval = funding_refresh_interval_s()
+            if mark_interval > 0 or funding_interval > 0:
                 try:
                     from app.market import DEFAULT_ENVIRONMENT, MarketClient
 
                     mark_env = ((os.environ.get("LIGHTER_ENVIRONMENT") or "").strip()
                                 or DEFAULT_ENVIRONMENT)
-                    app.state.mark_task = asyncio.create_task(
-                        _refresh_position_marks(cache, store=factory,
-                                                market=MarketClient(mark_env),
-                                                interval_s=mark_interval))
-                    logger.info("position mark refresh scheduled (every %ss)", mark_interval)
+                    price_client = MarketClient(mark_env)
+                    if mark_interval > 0:
+                        app.state.mark_task = asyncio.create_task(
+                            _refresh_position_marks(cache, store=factory, market=price_client,
+                                                    interval_s=mark_interval))
+                        logger.info("position mark refresh scheduled (every %ss)", mark_interval)
+                    if funding_interval > 0:
+                        app.state.funding_task = asyncio.create_task(
+                            _refresh_funding_rates(cache, market=price_client,
+                                                   interval_s=funding_interval))
+                        logger.info("funding rate refresh scheduled (every %ss)", funding_interval)
                 except Exception:                          # noqa: BLE001 - 起不来只影响新鲜度
-                    logger.warning("could not start the mark refresh task", exc_info=True)
+                    logger.warning("could not start the price/funding refresh tasks", exc_info=True)
         try:
             yield
         finally:
@@ -1186,6 +1249,9 @@ def create_app(*, panel: Optional[views.Panel] = None,
             mark_task = getattr(_app.state, "mark_task", None)
             if mark_task is not None:
                 mark_task.cancel()
+            funding_task = getattr(_app.state, "funding_task", None)
+            if funding_task is not None:
+                funding_task.cancel()
 
     # No docs/openapi routes: the panel is the only intended surface. Fewer default
     # routes = less to accidentally expose.

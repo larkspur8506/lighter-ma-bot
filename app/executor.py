@@ -176,6 +176,8 @@ class ExchangePosition:
     position_value: Optional[float] = None
     #: 交易所给的强平价（本地按杠杆估的只是近似）。
     liquidation_price: Optional[float] = None
+    #: 本仓**累计**已付资金费（正 = 付出，负 = 收到；交易所 `total_funding_paid_out`）。
+    funding_paid: Optional[float] = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -183,7 +185,8 @@ class ExchangePosition:
                 "market_id": self.market_id, "avg_entry_price": self.avg_entry_price,
                 "unrealized_pnl": self.unrealized_pnl,
                 "position_value": self.position_value,
-                "liquidation_price": self.liquidation_price}
+                "liquidation_price": self.liquidation_price,
+                "funding_paid": self.funding_paid}
 
 
 @dataclass(frozen=True)
@@ -357,6 +360,7 @@ def positions_from_payload(payload: Mapping[str, Any], *,
             unrealized_pnl=_opt_float(row.get("unrealized_pnl")),
             position_value=_opt_float(row.get("position_value")),
             liquidation_price=_opt_float(row.get("liquidation_price")),
+            funding_paid=_opt_float(row.get("total_funding_paid_out")),
             raw=dict(row)))
     return tuple(out)
 
