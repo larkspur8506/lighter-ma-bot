@@ -385,6 +385,9 @@ class PanelCache:
         #: 交易所侧持仓读数（symbol → ExchangePosition.as_dict()）。面板的「浮盈/现价/强平」
         #: 用**交易所口径**：本地按 4h 收盘现算会滞后最多一根 bar（曾因此在仓位表显示 0 盈亏）。
         self.positions_value: Dict[str, Dict[str, Any]] = {}
+        #: 「有持仓的标的」的最新盘口中间价（symbol → {price, ts}）。后台每 ~60s 刷一次，
+        #: 只刷有仓的（0~3 个请求/分钟）；空仓标的仍用最后一根 4h 收盘——用户拍板的平衡口径。
+        self.marks_value: Dict[str, Dict[str, float]] = {}
         self.updated_at: Optional[float] = None
         self.error: str = ""
         # tick 已经拉过的 K 线（symbol → (ts, bars)）。面板直接复用，别再自己去交易所
@@ -443,6 +446,21 @@ class PanelCache:
 
     def prices(self) -> Dict[str, float]:
         return dict(self.prices_value)
+
+    def set_mark(self, symbol: str, price: Any, *, ts: Optional[float] = None) -> None:
+        """记一笔**公开盘口**的最新中间价（只给「有持仓」的标的用）。"""
+        try:
+            value = float(price)
+        except (TypeError, ValueError):
+            return
+        if value != value or value <= 0 or value in (float("inf"), float("-inf")):
+            return
+        self.marks_value[str(symbol).upper()] = {
+            "price": value, "ts": float(ts if ts is not None else time.time())}
+
+    def marks(self) -> Dict[str, Dict[str, float]]:
+        """最近一次盘口中间价（symbol → {price, ts}）。可能是空的 = 还没刷新/没有持仓。"""
+        return {k: dict(v) for k, v in self.marks_value.items()}
 
     def positions(self) -> Dict[str, Dict[str, Any]]:
         """交易所侧持仓读数（可能为空 dict = 还没采集过/空仓，不是「未知」）。"""
@@ -511,6 +529,56 @@ def merge_accepted_stops(cache: PanelCache, report: Any) -> int:
         cache.update(orders=merged, error=getattr(cache, "error", ""))
         logger.info("[panel] 本轮新挂的止损单已并入面板缓存（%d 张，等下一轮读数复核）", added)
     return added
+
+
+def mark_refresh_interval_s(env: Optional[Mapping[str, str]] = None) -> float:
+    """有持仓标的的盘口刷新间隔（秒）。0 / 负数 = 关掉（退回「只有 tick 时的标记价」）。"""
+    raw = str((env if env is not None else os.environ).get("PANEL_MARK_REFRESH_S", "60")
+              or "60").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 60.0
+    if value != value or value < 0:                       # NaN / 负数
+        return 60.0
+    return value
+
+
+async def _refresh_position_marks(cache: "PanelCache", *,
+                                  store: Callable[[], Any], market: Any,
+                                  interval_s: float = 60.0,
+                                  sleep: Callable[[float], Any] = asyncio.sleep) -> None:
+    """后台只给**有持仓**的标的刷盘口中间价（空仓标的继续用最后一根 4h 收盘）。
+
+    为什么是这个口径（用户 2026-10-29 拍板「有仓按实时价、没仓按 4h 收盘，比较平衡」）：
+    - 有仓的标的浮盈/距止损都要「现在」，30 分钟一轮 tick 的标记价太旧；
+    - 空仓的标的只看个大概行情，为了它每分钟多打请求不值。
+    成本：0~3 个公开盘口请求/分钟（无鉴权、无签名、不在请求路径上）。
+
+    **只写观测缓存**：交易路径（tick/下单/对账/止损守护）一律不读 `cache.marks()`。
+    任何异常只记日志，绝不抛出（后台任务死掉不能让面板变慢或崩）。
+    """
+    while True:
+        symbols: List[str] = []
+        try:
+            rows = store().open_positions() or ()
+            symbols = [str(r.get("symbol") or "").strip().upper() for r in rows
+                       if str(r.get("symbol") or "").strip()]
+        except Exception:                                  # noqa: BLE001 - DB 抖动不算故障
+            logger.warning("mark refresh: could not read open positions", exc_info=True)
+        for symbol in dict.fromkeys(symbols):              # 去重且保序
+            try:
+                quote = await asyncio.to_thread(
+                    lambda s=symbol: market.order_book(s, depth=5).mid)
+            except Exception:                              # noqa: BLE001 - 单个标的失败不影响其它
+                logger.warning("mark refresh: no mid for %s", symbol, exc_info=True)
+                continue
+            if quote:
+                cache.set_mark(symbol, quote)
+        try:
+            await sleep(max(5.0, float(interval_s)))
+        except asyncio.CancelledError:                     # pragma: no cover - 关闭路径
+            return
 
 
 class MarketBarSource:
@@ -949,7 +1017,7 @@ def _default_panel_sources(cache: "PanelCache",
                 bars._source = source                         # type: ignore[attr-defined]
             return source(symbol)
     return views.Sources(equity=cache.equity, orders=cache.orders,
-                         positions=cache.positions,
+                         positions=cache.positions, marks=cache.marks,
                          prices=cache.prices, bars=bars,
                          cached_bars=cache.bars)
 
@@ -1078,6 +1146,22 @@ def create_app(*, panel: Optional[views.Panel] = None,
             # 「没有现价」「挂单读数尚未采集」两条（看起来像故障，其实只是冷的）。
             app.state.warm_state_task = asyncio.create_task(_warm_panel_state(cache, symbols))
             logger.info("panel warm-up scheduled (bars + account/prices)")
+            # 有持仓标的的盘口中间价：后台每 PANEL_MARK_REFRESH_S 秒刷一次（只刷有仓的）。
+            # 用户拍板的口径：有仓按实时价、空仓按最后一根 4h 收盘。0 = 关。
+            mark_interval = mark_refresh_interval_s()
+            if mark_interval > 0:
+                try:
+                    from app.market import DEFAULT_ENVIRONMENT, MarketClient
+
+                    mark_env = ((os.environ.get("LIGHTER_ENVIRONMENT") or "").strip()
+                                or DEFAULT_ENVIRONMENT)
+                    app.state.mark_task = asyncio.create_task(
+                        _refresh_position_marks(cache, store=factory,
+                                                market=MarketClient(mark_env),
+                                                interval_s=mark_interval))
+                    logger.info("position mark refresh scheduled (every %ss)", mark_interval)
+                except Exception:                          # noqa: BLE001 - 起不来只影响新鲜度
+                    logger.warning("could not start the mark refresh task", exc_info=True)
         try:
             yield
         finally:
@@ -1099,6 +1183,9 @@ def create_app(*, panel: Optional[views.Panel] = None,
                         logger.warning("could not close the injected scheduler", exc_info=True)
             # 面板最后关：所有只读端点都读它，它的 store 是懒建的、没人替它收尾。
             panel.close()
+            mark_task = getattr(_app.state, "mark_task", None)
+            if mark_task is not None:
+                mark_task.cancel()
 
     # No docs/openapi routes: the panel is the only intended surface. Fewer default
     # routes = less to accidentally expose.
