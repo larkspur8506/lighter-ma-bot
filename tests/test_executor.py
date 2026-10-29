@@ -140,6 +140,10 @@ class FakeExchange:
         self.positions = {}                    # symbol -> {'side','qty_int','market_id'}
         self.orders = []                       # ExchangeOrder（只放会挂着的单）
         self.cancels = []                      # 单张撤单记录（止损换单用）
+        self.leverage_sets = []                # ensure_isolated 调用记录
+        self.margin_allocs = []                # allocate_margin 调用记录
+        self.reject_leverage = False           # True → ensure_isolated 返回拒绝
+        self.reject_alloc = False              # True → allocate_margin 返回拒绝
         self.wait_calls = []
 
     # -- 下单 ---------------------------------------------------------------
@@ -148,6 +152,25 @@ class FakeExchange:
         return OrderResult(ok=True, action=action, code=200, symbol=symbol,
                            dry_run=self.dry_run, confirmed=self.confirmed,
                            idempotency_key=f"fake:{action}", **extra)
+
+    async def ensure_isolated(self, *, market_id: int, leverage: float):
+        from app.exchange import OrderResult
+        self.leverage_sets.append({"market_id": int(market_id), "leverage": float(leverage)})
+        if self.reject_leverage:
+            return OrderResult(ok=False, action="update_leverage", code=20001,
+                               error="leverage update rejected")
+        return self._result("update_leverage", market_id=int(market_id),
+                            tx_hash=f"0xlev{len(self.leverage_sets)}")
+
+    async def allocate_margin(self, *, market_id: int, usdc_amount: float):
+        from app.exchange import OrderResult
+        self.margin_allocs.append({"market_id": int(market_id),
+                                   "usdc_amount": float(usdc_amount)})
+        if self.reject_alloc:
+            return OrderResult(ok=False, action="update_margin_add", code=20001,
+                               error="margin allocation rejected")
+        return self._result("update_margin_add", market_id=int(market_id),
+                            tx_hash=f"0xalloc{len(self.margin_allocs)}")
 
     async def place_entry(self, plan, *, bar_ms=None, client_order_index=None, **kw):
         if "entry" in self.raise_on:
@@ -1287,6 +1310,51 @@ class StopGuardTests(Base):
         self.run_tick(self._executor())
         self.assertTrue(self.store.events(limit=3, kind="stop_cancel_failed"))
         self.assertNotEqual(self.store.open_positions()[0]["stop_order_id"], "coi:111")
+
+    def test_entry_sets_isolated_mode_and_allocates_collateral(self):
+        ex = self._executor(market=self.market)
+        self.run_tick(ex)
+        self.assertEqual(len(self.exchange.leverage_sets), 1)
+        self.assertEqual(self.exchange.leverage_sets[0],
+                         {"market_id": 1, "leverage": 5.0})
+        self.assertEqual(len(self.exchange.margin_allocs), 1)
+        alloc = self.exchange.margin_allocs[0]
+        self.assertEqual(alloc["market_id"], 1)
+        # 抵押 = 名义 / 杠杆（entry 事件里的 notional 是唯一权威出处）
+        entry_evt = [e for e in self.events("entry") if e["symbol"] == BTC][0]
+        data = entry_evt["data"]
+        if isinstance(data, str):
+            data = json.loads(data)
+        expected = float(data["notional"]) / 5.0
+        self.assertAlmostEqual(alloc["usdc_amount"], expected, places=6)
+
+    def test_leverage_rejection_blocks_the_entry(self):
+        ex = self._executor(market=self.market)
+        self.exchange.reject_leverage = True
+        report = self.run_tick(ex)
+        outcome = report.outcomes[0]
+        self.assertFalse(outcome.ok)
+        self.assertEqual(self.exchange.entries, [], "模式设置失败就不许开仓")
+        self.assertEqual(self.store.open_positions(), [])
+        self.assertTrue(any("margin mode rejected" in e["message"]
+                            for e in self.events("order_rejected")))
+
+    def test_alloc_failure_is_recorded_but_the_position_stays(self):
+        ex = self._executor(market=self.market)
+        self.exchange.reject_alloc = True
+        report = self.run_tick(ex)
+        self.assertEqual(len(self.exchange.entries), 1, "仓位已开出，照常记账")
+        self.assertEqual(len(self.store.open_positions()), 1)
+        self.assertTrue(self.store.events(limit=5, kind="margin_alloc_failed"))
+        self.assertTrue(any(k == "margin_alloc_failed" for k, _ in self.alerts))
+        self.assertFalse(report.outcomes[0].ok, "抵押没划进去 = 本轮按失败算")
+
+    def test_flag_off_skips_margin_ops(self):
+        ex = self._executor(market=self.market, margin_isolated=False)
+        self.run_tick(ex)
+        self.assertEqual(self.exchange.leverage_sets, [])
+        self.assertEqual(self.exchange.margin_allocs, [])
+        self.assertEqual(len(self.exchange.entries), 1)
 
     def test_entry_records_the_stop_expiry_for_later_renewal(self):
         ex = self._executor(market=self.market)          # 有信号的市场 → 会开仓

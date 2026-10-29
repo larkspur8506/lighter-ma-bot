@@ -485,6 +485,18 @@ class PanelCache:
         return {k: dict(v) for k, v in self.positions_value.items()}
 
 
+def isolated_margin_on(env: Optional[Mapping[str, str]] = None) -> bool:
+    """逐仓保证金开关，默认**开**（`LIGHTER_ISOLATED_MARGIN=0` 关）。
+
+    开 = 每次开仓前把市场切到 isolated + 目标杠杆（幂等），成交后划入抵押
+    （≈名义/杠杆）。账户 2026-10-29 起三个市场已切逐仓，机器人**必须**配抵押；
+    关掉等于回退全仓时代的行为（市场级设置仍在，但不再显式划入）。
+    """
+    raw = str((env if env is not None else os.environ).get("LIGHTER_ISOLATED_MARGIN", "1")
+              or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def stop_guard_on(env: Optional[Mapping[str, str]] = None) -> bool:
     """止损守护开关，默认**开**（`LIGHTER_STOP_GUARD=0` 关）。
 
@@ -1665,7 +1677,8 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
             store = box["store"] = StateStore.from_config(config)
         executor = Executor(store=store, market=market, exchange=exchange, reader=reader,
                             symbols=symbols, limits=_limits(), alert=None,
-                            stop_guard=stop_guard_on())
+                            stop_guard=stop_guard_on(),
+                            margin_isolated=isolated_margin_on())
         report = await executor.run_once()
         record_tick_outcomes(store, report, ts=time.time())
         # 面板复用本轮取到的 K 线：不额外取数、且与决策用同一份序列（含同一个起点）

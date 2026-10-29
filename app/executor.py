@@ -1156,6 +1156,7 @@ class Executor:
                  stop_tolerance_ticks: int = DEFAULT_STOP_TOLERANCE_TICKS,
                  enforce_in_dry_run: bool = False,
                  stop_guard: bool = True,
+                 margin_isolated: bool = True,
                  alert: Optional[Callable[[str, str], Any]] = None,
                  clock: Callable[[], float] = time.time,
                  now_ms: Optional[Callable[[], int]] = None) -> None:
@@ -1185,6 +1186,14 @@ class Executor:
         self.enforce_in_dry_run = bool(enforce_in_dry_run)
         #: 止损守护（补挂/换单）。默认开；`LIGHTER_STOP_GUARD=0` 关。
         self.stop_guard = bool(stop_guard)
+        #: 逐仓保证金：开仓前把市场切到 isolated + 目标杠杆（幂等），成交后划入抵押
+        #: （≈名义/杠杆，交易所会归一；平仓时交易所自动释放，无需 REMOVE）。
+        #: 默认开（账户 2026-10-29 起已切逐仓）；`LIGHTER_ISOLATED_MARGIN=0` 关。
+        self.margin_isolated = bool(margin_isolated)
+        #: 逐仓保证金：开仓前把市场切到 isolated + 目标杠杆（幂等），成交后划入抵押
+        #: （≈名义/杠杆，交易所会归一；平仓时交易所自动释放，无需 REMOVE）。
+        #: 默认开（账户 2026-10-29 起已切逐仓）；`LIGHTER_ISOLATED_MARGIN=0` 关。
+        self.margin_isolated = bool(margin_isolated)
         self.alert = alert
         self.clock = clock
         self._now_ms = now_ms or (lambda: int(self.clock() * 1000))
@@ -1447,6 +1456,15 @@ class Executor:
         entry_coi = client_order_index(symbol, bar_ms, "entry")
         stop_coi = client_order_index(symbol, bar_ms, "stop")
 
+        if self.margin_isolated:
+            # 开仓前把市场切到逐仓 + 目标杠杆（幂等；被拒 = 资金路径设置失败，
+            # **不发单**直接拒绝本轮意图 —— 不允许在未知保证金模式下开仓）。
+            mode = await self._place(self.exchange.ensure_isolated(
+                market_id=int(plan.market_id), leverage=float(plan.leverage or 5.0)),
+                label=f"{symbol} margin mode")
+            if not self._accepted(mode):
+                return self._reject(symbol, decision, mode, label="margin mode")
+
         order = await self._place(self.exchange.place_entry(plan, bar_ms=bar_ms),
                                   label=f"{symbol} entry")
         if not self._accepted(order):
@@ -1462,6 +1480,25 @@ class Executor:
                         symbol=symbol, data={"kind": stop.kind, "code": stop.code,
                                              "error": stop.error, "tx_hash": stop.tx_hash})
             self._alert("stop_order_failed", f"{symbol} 开仓成功但止损单挂单失败：{stop.error}")
+
+        alloc_ok = True
+        if self.margin_isolated:
+            # 成交后给逐仓仓划入抵押（≈名义/杠杆）。实测交易所会把划入量归一到
+            # 名义/杠杆、平仓时自动释放；被拒 = 资金路径保护失败，照 stop 失败同档处理
+            # （留痕 + 报警 + 计失败），**不平仓**：止损已在位，强平口径已是逐仓。
+            alloc_usdc = float(plan.notional) / float(plan.leverage or 5.0)
+            alloc = await self._place(self.exchange.allocate_margin(
+                market_id=int(plan.market_id), usdc_amount=alloc_usdc),
+                label=f"{symbol} margin alloc")
+            alloc_ok = self._accepted(alloc)
+            if not alloc_ok:
+                self._event("margin_alloc_failed",
+                            f"{symbol}: entry filled but the margin allocation was rejected",
+                            symbol=symbol,
+                            data={"kind": alloc.kind, "code": alloc.code, "error": alloc.error,
+                                  "usdc_amount": alloc_usdc, "tx_hash": alloc.tx_hash})
+                self._alert("margin_alloc_failed",
+                            f"{symbol} 开仓成功但逐仓抵押划入失败：{alloc.error}")
         transition = self.lifecycle.apply_entry(
             decision, order_id=f"coi:{entry_coi}",
             stop_order_id=(f"coi:{stop_coi}" if stop_ok else None),
@@ -1482,16 +1519,17 @@ class Executor:
                     data={"bar_ms": bar_ms, "qty_int": int(plan.qty_int),
                           "entry_coi": entry_coi, "stop_coi": stop_coi,
                           "notional": float(plan.notional),
+                          "margin_alloc_ok": alloc_ok,
                           "dry_run": bool(self.dry_run),
                           "position_id": transition.position_id})
         outcome = SymbolOutcome(
             symbol=symbol, action=ACTION_ENTRY, bar_ms=bar_ms,
             reason=f"opened {plan.base_qty:g} @ {plan.entry_price:g}",
             decision=decision.as_dict(), order=order.as_dict(),
-            stop_order=stop.as_dict(), filled=True, ok=stop_ok,
+            stop_order=stop.as_dict(), filled=True, ok=(stop_ok and alloc_ok),
             detail={"position_id": transition.position_id, "entry_coi": entry_coi,
-                    "stop_coi": stop_coi, "stop_ok": stop_ok})
-        if not stop_ok:
+                    "stop_coi": stop_coi, "stop_ok": stop_ok, "alloc_ok": alloc_ok})
+        if not (stop_ok and alloc_ok):
             self._failures += 1
             self._maybe_open_circuit()
         return outcome

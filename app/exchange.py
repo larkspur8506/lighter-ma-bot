@@ -275,6 +275,10 @@ ORDER_TIME_IN_FORCE_GTT = 1
 ORDER_TIME_IN_FORCE_POST_ONLY = 2
 
 NIL_MARKET_INDEX = 255          # `SignerClient.NIL_MARKET_INDEX`：cancel-all 用「全市场」
+#: 保证金模式（`SignUpdateLeverage` 的 `margin_mode`）：CROSS=0 / ISOLATED=1。
+#: 下单接口没有 margin_mode 参数 —— 模式是市场级账户设置，见 `ensure_isolated`。
+MARGIN_MODE_ISOLATED = 1
+MARGIN_DIRECTION_ADD = 1        # `SignUpdateMargin` 的 direction：ADD=1 / REMOVE=0
 
 # auth token 的有效期（Lighter 上限 8 小时）。SDK 的 `create_auth_token_with_expiry`
 # 的入参是**相对秒数**，它会自己加上当前时间戳；传绝对时间戳会被服务端判成
@@ -1044,6 +1048,14 @@ class SdkBoundary:
     def sign_cancel_order(self, **kwargs: Any) -> Tuple[Any, Any, Any, Any]:
         raise NotImplementedError
 
+    def sign_update_leverage(self, **kwargs: Any) -> Tuple[Any, Any, Any, Any]:
+        """切市场保证金模式 + 杠杆（`fraction=10000/leverage`、margin_mode 0/1）。"""
+        raise NotImplementedError
+
+    def sign_update_margin(self, **kwargs: Any) -> Tuple[Any, Any, Any, Any]:
+        """给逐仓仓位划入/撤出抵押（`usdc_amount` 整数 ×1e6、direction ADD=1/REMOVE=0）。"""
+        raise NotImplementedError
+
     def mint_auth_token(self, ttl_s: int) -> Tuple[str, Optional[str]]:
         raise NotImplementedError
 
@@ -1269,6 +1281,12 @@ class LighterSdk(SdkBoundary):
 
     def sign_cancel_order(self, **kwargs: Any) -> Tuple[Any, Any, Any, Any]:
         return self._signer.sign_cancel_order(**kwargs)
+
+    def sign_update_leverage(self, **kwargs: Any) -> Tuple[Any, Any, Any, Any]:
+        return self._signer.sign_update_leverage(**kwargs)
+
+    def sign_update_margin(self, **kwargs: Any) -> Tuple[Any, Any, Any, Any]:
+        return self._signer.sign_update_margin(**kwargs)
 
     def mint_auth_token(self, ttl_s: int) -> Tuple[str, Optional[str]]:
         token, err = self._signer.create_auth_token_with_expiry(
@@ -1513,6 +1531,73 @@ class ExchangeClient:
                 detail={"market_id": mid, "order_index": oid, "signer_error": str(err)})
         return await self._send_signed(base, tx_type=tx_type, tx_info=tx_info,
                                        tx_hash=tx_hash, nonce=nonce, action_label="cancel")
+
+    async def ensure_isolated(self, *, market_id: int, leverage: float) -> OrderResult:
+        """把市场切到逐仓 + 目标杠杆（`SignUpdateLeverage`，tx_type=12 族）。
+
+        `margin_mode` 是**市场级账户设置**，持久；对已 isolated 的市场重发同一参数
+        实测幂等（200），所以这里不做状态判断、每次开仓前都发一遍（无仓时发，语义
+        就是「设置」，不会误伤已有仓）。下单接口本身没有 margin_mode 参数。
+        """
+        mid = _check_int(market_id, "market_id", minimum=0)
+        lev = float(leverage)
+        if lev <= 0:
+            raise ValueError(f"leverage must be > 0, got {leverage}")
+        fraction = int(10_000 // int(lev))
+        base = OrderResult(ok=True, action="update_leverage", market_id=mid)
+        if self.dry_run:
+            print(f"[dry-run] UPDATE_LEVERAGE market {mid} -> isolated {lev:g}x "
+                  f"(fraction={fraction}; nothing signed, nothing sent)")
+            return replace(base, dry_run=True)
+        self.live_gate.assert_allowed(self.account_index)
+        sdk = self.sdk()
+        nonce = await self.nonces.allocate()
+        tx_type, tx_info, tx_hash, err = sdk.sign_update_leverage(
+            market_index=mid, fraction=fraction, margin_mode=MARGIN_MODE_ISOLATED,
+            skip_nonce=0, nonce=nonce, api_key_index=self.api_key_index)
+        if err:
+            # 签名就没过 = 肯定没进 sequencer，nonce 未消耗 → 还回去。
+            self.nonces.rollback(nonce)
+            kind, retryable = classify_error(message=str(err))
+            raise OrderRejected(
+                f"update_leverage signing failed: {err}", retryable=retryable,
+                detail={"market_id": mid, "signer_error": str(err)})
+        return await self._send_signed(base, tx_type=tx_type, tx_info=tx_info,
+                                       tx_hash=tx_hash, nonce=nonce,
+                                       action_label="update_leverage")
+
+    async def allocate_margin(self, *, market_id: int, usdc_amount: float) -> OrderResult:
+        """给逐仓仓位划入抵押（`SignUpdateMargin`，direction=ADD）。
+
+        `usdc_amount` 用浮点 USDC（内部 ×1e6 取整）。实测交易所会把划入量归一到
+        ≈仓位名义/杠杆（多要不给）；抵押在**平仓时自动释放**（allocated_margin 回 0，
+        2026-10-29 实测），所以平仓侧不需要 REMOVE。**只对已有仓位发**。
+        """
+        mid = _check_int(market_id, "market_id", minimum=0)
+        usd = float(usdc_amount)
+        if usd <= 0:
+            raise ValueError(f"usdc_amount must be > 0, got {usdc_amount}")
+        raw = int(round(usd * 1_000_000))
+        base = OrderResult(ok=True, action="update_margin_add", market_id=mid)
+        if self.dry_run:
+            print(f"[dry-run] UPDATE_MARGIN market {mid} ADD {usd:.4f} USDC "
+                  f"(raw={raw}; nothing signed, nothing sent)")
+            return replace(base, dry_run=True)
+        self.live_gate.assert_allowed(self.account_index)
+        sdk = self.sdk()
+        nonce = await self.nonces.allocate()
+        tx_type, tx_info, tx_hash, err = sdk.sign_update_margin(
+            market_index=mid, usdc_amount=raw, direction=MARGIN_DIRECTION_ADD,
+            skip_nonce=0, nonce=nonce, api_key_index=self.api_key_index)
+        if err:
+            self.nonces.rollback(nonce)
+            kind, retryable = classify_error(message=str(err))
+            raise OrderRejected(
+                f"update_margin signing failed: {err}", retryable=retryable,
+                detail={"market_id": mid, "signer_error": str(err)})
+        return await self._send_signed(base, tx_type=tx_type, tx_info=tx_info,
+                                       tx_hash=tx_hash, nonce=nonce,
+                                       action_label="update_margin_add")
 
     # ---------------------------------------------------------------- 提交
 
