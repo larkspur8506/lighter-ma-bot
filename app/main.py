@@ -280,11 +280,16 @@ async def _warm_panel_state(cache: "PanelCache", symbols: Sequence[str], *,
 
     equity = None
     orders = None
+    positions: Dict[str, Any] = {}
     error = ""
     try:
         account = await asyncio.to_thread(_read_account_sync, reader)
         equity = getattr(account, "equity", None)
         orders = [o.as_dict() for o in (getattr(account, "orders", ()) or ())]
+        # 交易所口径的持仓读数（浮盈/仓位价值/强平价）：重启后到第一轮 tick 之间面板也能
+        # 显示真实浮盈，而不是拿「最后一根 4h 收盘」现算出来的 0。
+        positions = {p.symbol: p.as_dict() for p in
+                     (getattr(account, "positions", ()) or ())}
         error = str(getattr(account, "orders_error", "") or "")
     except Exception as exc:                              # noqa: BLE001
         logger.warning("panel state warm-up (account) failed", exc_info=True)
@@ -314,9 +319,10 @@ async def _warm_panel_state(cache: "PanelCache", symbols: Sequence[str], *,
     if equity is None and not mid and orders is None:
         return
     cache.update(equity=equity, orders=orders, prices=mid or None,
+                 positions=positions or None,
                  ts=time.time(), error=error)
-    logger.info("panel state warmed: equity=%s orders=%s prices=%s",
-                equity, None if orders is None else len(orders), len(mid))
+    logger.info("panel state warmed: equity=%s orders=%s prices=%s positions=%s",
+                equity, None if orders is None else len(orders), len(mid), len(positions))
 
 
 def _read_account_sync(reader: Any) -> Any:
@@ -376,6 +382,9 @@ class PanelCache:
         self.equity_value: Optional[float] = None
         self.orders_value: Optional[List[Dict[str, Any]]] = None
         self.prices_value: Dict[str, float] = {}
+        #: 交易所侧持仓读数（symbol → ExchangePosition.as_dict()）。面板的「浮盈/现价/强平」
+        #: 用**交易所口径**：本地按 4h 收盘现算会滞后最多一根 bar（曾因此在仓位表显示 0 盈亏）。
+        self.positions_value: Dict[str, Dict[str, Any]] = {}
         self.updated_at: Optional[float] = None
         self.error: str = ""
         # tick 已经拉过的 K 线（symbol → (ts, bars)）。面板直接复用，别再自己去交易所
@@ -405,6 +414,7 @@ class PanelCache:
 
     def update(self, *, equity: Any = None, orders: Optional[Sequence[Any]] = None,
                prices: Optional[Mapping[str, Any]] = None,
+               positions: Optional[Mapping[str, Any]] = None,
                ts: Optional[float] = None, error: str = "") -> None:
         if equity is not None:
             self.equity_value = float(equity)
@@ -412,6 +422,8 @@ class PanelCache:
             self.orders_value = [dict(o) for o in orders]
         if prices is not None:
             self.prices_value = {str(k).upper(): float(v) for k, v in dict(prices).items()}
+        if positions is not None:
+            self.positions_value = {str(k).upper(): dict(v) for k, v in dict(positions).items()}
         self.updated_at = float(ts) if ts is not None else time.time()
         self.error = str(error or "")
 
@@ -431,6 +443,10 @@ class PanelCache:
 
     def prices(self) -> Dict[str, float]:
         return dict(self.prices_value)
+
+    def positions(self) -> Dict[str, Dict[str, Any]]:
+        """交易所侧持仓读数（可能为空 dict = 还没采集过/空仓，不是「未知」）。"""
+        return {k: dict(v) for k, v in self.positions_value.items()}
 
 
 def stop_guard_on(env: Optional[Mapping[str, str]] = None) -> bool:
@@ -933,6 +949,7 @@ def _default_panel_sources(cache: "PanelCache",
                 bars._source = source                         # type: ignore[attr-defined]
             return source(symbol)
     return views.Sources(equity=cache.equity, orders=cache.orders,
+                         positions=cache.positions,
                          prices=cache.prices, bars=bars,
                          cached_bars=cache.bars)
 
@@ -1506,6 +1523,8 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
             cache.update(equity=getattr(account, "equity", None),
                          orders=[order.as_dict() for order in
                                  (getattr(account, "orders", ()) or ())],
+                         positions={p.symbol: p.as_dict() for p in
+                                    (getattr(account, "positions", ()) or ())},
                          prices=dict(getattr(executor, "_prices", {}) or {}),
                          ts=time.time(),
                          error=str(getattr(account, "orders_error", "") or ""))

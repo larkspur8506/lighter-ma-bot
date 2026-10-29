@@ -645,6 +645,47 @@ class StopCoverageTests(PanelFixture):
         self.assertNotIn("到期", block["stops"][0]["note"])
 
 
+class PositionPnlFromExchangeTests(PanelFixture):
+    """仓位表的浮盈/现价必须用**交易所口径**。
+
+    线上症状（2026-10-29）：SOL 空单浮盈显示 0。根因是「现价」取的是 tick 缓存的**
+    最后一根已收盘 4h bar 的收盘价**，而入场价恰好就是那根 bar 的收盘 ⇒ (price-entry)=0；
+    真实浮盈是 −1.25 U（交易所 unrealized_pnl，已含资金费）。
+    """
+
+    def _row(self, live: dict, prices: dict = None):
+        seed(self.store)
+        panel = self.panel(sources=views.Sources(
+            prices=lambda: (prices if prices is not None else {"BTC": 6500.0}),
+            positions=lambda: live))
+        return [r for r in panel.positions()["positions"] if r["symbol"] == "BTC"][0]
+
+    def test_exchange_snapshot_drives_upnl_mark_and_liq(self):
+        row = self._row({"BTC": {"qty": "1.0", "position_value": 6600.0,
+                                 "unrealized_pnl": -1.25, "liquidation_price": 5200.0}})
+        self.assertEqual(row["price_source"], "exchange")
+        self.assertAlmostEqual(row["price"], 6600.0)          # 6600 / 1.0
+        self.assertAlmostEqual(row["upnl"], -1.25)            # 交易所口径（含资金费）
+        self.assertAlmostEqual(row["notional"], 6600.0)
+        self.assertAlmostEqual(row["liq_price"], 5200.0)      # 有交易所强平价就别用本地近似
+
+    def test_stale_bar_close_no_longer_hides_the_loss(self):
+        """现价 == 入场价（同一根 4h 收盘）时，有交易所读数就该显示真实盈亏而不是 0。"""
+        row = self._row({"BTC": {"qty": "1.0", "position_value": 6490.0,
+                                 "unrealized_pnl": -10.0}}, prices={"BTC": 6500.0})
+        self.assertAlmostEqual(row["price"], 6490.0)
+        self.assertAlmostEqual(row["upnl"], -10.0)
+
+    def test_without_positions_provider_falls_back_to_prices(self):
+        btc = self.seeded_panel().positions()["positions"][0]
+        self.assertEqual(btc["price_source"], "provider")
+        self.assertAlmostEqual(btc["upnl"], 100.0)            # (6600−6500)×1×1
+
+    def test_empty_live_snapshot_keeps_the_estimate(self):
+        row = self._row({})                                   # 交易所读数还没采集到
+        self.assertEqual(row["price_source"], "provider")
+
+
 class DegradedTests(unittest.TestCase):
     def _broken(self) -> views.Panel:
         def boom() -> Any:
