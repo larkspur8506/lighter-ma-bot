@@ -437,14 +437,20 @@ class HtmlTests(PanelFixture):
         """自包含 = 没有外链（运行环境可能没外网；CDN 挂了就是空白页）。
 
         内联 `<script>`（⑦ 人工操作区的三个写按钮）是允许的：它同样不依赖任何
-        外部资源 —— 所以禁的是外链形态（http(s)://、<link、src=、@import、cdn.），
-        不是 script 本身。
+        外部资源。2026-10-29 起手机主屏图标/PWA 的 `<link>` 指向**本站静态路由**
+        （/apple-touch-icon.png 等，由镜像自带），也不依赖外部 —— 所以禁的形态是
+        `http(s)://`、`src=`、`@import`、`cdn.`、`javascript:`，以及**任何**指向
+        http(s) 的 href；`<link rel=... href="/...">` 这种本站资源不在禁止之列。
         """
         html = self._html()
-        for needle in ("http://", "https://", "<link", "src=", "@import", "cdn.",
-                       "javascript:"):
+        for needle in ("http://", "https://", "src=", "@import", "cdn.",
+                       "javascript:", 'href="http', "src='http"):
             with self.subTest(needle=needle):
                 self.assertNotIn(needle, html)
+        for route in ("/apple-touch-icon.png", "/manifest.webmanifest",
+                      "/favicon-32.png"):
+            with self.subTest(route=route):
+                self.assertIn(route, html)              # 主屏图标头已挂上
         self.assertIn("<script>", html)                 # 人工操作脚本是内联的
         self.assertIn("<svg", html)                     # 曲线是内联 SVG
         self.assertIn("<style>", html)                  # 样式内联

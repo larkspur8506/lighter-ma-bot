@@ -120,6 +120,33 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(calls["n"], 0, "/health 不许碰 DB（T1 契约）")
 
 
+# --------------------------------------------------- 1b. 手机主屏图标静态资源
+
+
+class StaticIconTests(StoreFixture):
+    def test_icon_assets_are_served_from_the_image(self) -> None:
+        """/apple-touch-icon.png 等 PWA 资源由镜像自带（app/static/），不依赖外部。"""
+        client = self.client()
+        expectations = {
+            "/apple-touch-icon.png": "image/png",
+            "/favicon.ico": "image/x-icon",
+            "/favicon-32.png": "image/png",
+            "/icon-192.png": "image/png",
+            "/icon-512.png": "image/png",
+            "/manifest.webmanifest": "application/manifest+json",
+        }
+        for path, media in expectations.items():
+            with self.subTest(path=path):
+                response = client.get(path)
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.headers["content-type"].startswith(media),
+                                response.headers["content-type"])
+                self.assertGreater(len(response.content), 100)
+        manifest = client.get("/manifest.webmanifest").json()
+        self.assertEqual(manifest["display"], "standalone")
+        self.assertTrue(manifest["icons"])
+
+
 # --------------------------------------------------------------------------- 2. 只读端点
 
 

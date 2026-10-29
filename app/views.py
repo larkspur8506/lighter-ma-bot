@@ -2220,6 +2220,7 @@ def render_records_html(status: Mapping[str, Any], records: Mapping[str, Any],
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)}</title>
+{_HEAD_LINKS}
 <style>{_CSS}</style>
 </head>
 <body><div class="wrap">
@@ -2321,6 +2322,19 @@ def _admin_html() -> str:
     )
 
 
+#: 手机「添加到主屏幕」用的图标/PWA 头（2026-10-29，用户选定的靛紫 $ 圆环）。
+#: 链接全部指向**本站静态路由**（app/main.py 提供）—— 自包含约束禁的是外链，
+#: 不是本站资源；测试钉的是「无 http(s):// 与无 src=」而不是「无 <link>」。
+_HEAD_LINKS = ("""<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<link rel="shortcut icon" href="/favicon.ico">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#4338ca">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">""")
+
+
 def render_html(snapshot: Mapping[str, Any], *, symbols: Sequence[str] = DEFAULT_SYMBOLS,
                 mode: str = "live", title: str = "lighter-ma-bot 监控面板") -> str:
     """把 :meth:`Panel.snapshot` 的载荷渲染成**一个**自包含 HTML 文档。
@@ -2345,6 +2359,7 @@ def render_html(snapshot: Mapping[str, Any], *, symbols: Sequence[str] = DEFAULT
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)}</title>
+{_HEAD_LINKS}
 <style>{_CSS}</style>
 </head>
 <body><div class="wrap">
