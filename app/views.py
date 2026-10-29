@@ -1043,6 +1043,8 @@ class Panel:
                     match = order
                     break
             order_qty = None
+            expiry_ts = _finite(_row_get(row, "stop_expiry_ts"))
+            days_left = None if expiry_ts is None else round((expiry_ts - now) / 86400.0, 1)
             if stop is None:
                 status, protected = "missing", False
                 note = "止损价缺失（仓位裸奔）"
@@ -1067,6 +1069,10 @@ class Panel:
                     status, protected = "present", True
                     note = ("已下单（交易所已受理，下一轮读数复核）" if match["pending_confirm"]
                             else "已覆盖")
+                    # 交易所到期会自动废单（我们下 28 天）：临期要说出来，别让人以为永久有效。
+                    if days_left is not None and days_left <= 7:
+                        note += (f" · 止损将在 {days_left:g} 天后到期（系统会自动换单）"
+                                 if days_left > 0 else " · 止损已过到期时刻（等下一轮补挂）")
             out.append({
                 "symbol": symbol, "position_id": _row_get(row, "id"),
                 "side": int(_row_get(row, "side") or 0),
@@ -1076,6 +1082,7 @@ class Panel:
                 "order_id": _row_get(row, "stop_order_id") or (match or {}).get("order_id"),
                 "exchange_status": status, "protected": protected,
                 "checked_at": now, "note": note,
+                "expires_at": expiry_ts, "days_left": days_left,
             })
         uncovered = [r["symbol"] for r in out if not r["protected"]]
         if uncovered:

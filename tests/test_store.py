@@ -70,7 +70,26 @@ class StoreTestCase(unittest.TestCase):
 class SchemaTests(StoreTestCase):
     def test_fresh_database_is_at_current_version(self):
         self.assertEqual(self.store.schema_version, SCHEMA_VERSION)
-        self.assertEqual(SCHEMA_VERSION, 3)
+        self.assertEqual(SCHEMA_VERSION, 4)
+
+    def test_v4_adds_stop_expiry_column(self):
+        """v4：止损到期时刻（Lighter 的 orderExpiry 到期废单，守护据此临期换单）。"""
+        cols = {row["name"] for row in self.store._fetchall("PRAGMA table_info(positions)")}
+        self.assertIn("stop_expiry_ts", cols)
+
+    def test_set_stop_order_updates_identity_and_expiry(self):
+        pid = self.store.record_entry(
+            "BTC", 1, qty_int=100_000, size_decimals=5, entry_price_int=650_000,
+            price_decimals=2, stop_price_int=630_000, bar_ms=1_600_000_000_000,
+            market_id=1, stop_order_id="coi:1", ts=1000.0).position_id
+        out = self.store.set_stop_order(pid, stop_order_id="coi:2",
+                                        stop_expiry_ts=1_700_000_000.0, ts=1001.0)
+        self.assertEqual(out["stop_order_id"], "coi:2")
+        self.assertEqual(out["stop_expiry_ts"], 1_700_000_000.0)
+        self.assertEqual(out["state"], "OPEN")
+        # 不知道到期时刻时不许写成 0（0 会被临期判定误读成「早就过期」）
+        out = self.store.set_stop_order(pid, stop_order_id="coi:3", ts=1002.0)
+        self.assertIsNone(out["stop_expiry_ts"])
 
     def test_all_tables_and_indexes_exist(self):
         names = {row["name"] for row in self.store._fetchall(

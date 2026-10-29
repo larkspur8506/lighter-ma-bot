@@ -1031,6 +1031,27 @@ class MergeAcceptedStopsTests(unittest.TestCase):
         self.assertEqual(main.merge_accepted_stops(cache, self._report()), 0)
         self.assertIsNone(cache.orders_value)
 
+    def test_guard_replacements_are_merged_and_replaced_coi_dropped(self) -> None:
+        """止损守护补挂/换单的那张单也要并进缓存；换单时旧 coi 要被拿掉。"""
+        cache = main.PanelCache()
+        cache.update(orders=[{"symbol": "SOL", "client_order_index": 999,
+                              "trigger_price_int": 105_257, "qty_int": 1_191,
+                              "reduce_only": True, "order_id": "1", "status": "pending"}])
+        report = executor_mod.TickReport(stop_guards=(
+            {"symbol": "SOL", "market_id": 2, "client_order_index": 1234,
+             "trigger_price_int": 105_257, "price_int": 106_310, "qty_int": 1_191,
+             "reduce_only": True, "order_id": "", "status": "pending",
+             "pending_confirm": True, "replaced_coi": 999},))
+        self.assertEqual(main.merge_accepted_stops(cache, report), 1)
+        got = cache.orders()
+        self.assertEqual([o["client_order_index"] for o in got], [1234])
+
+    def test_stop_guard_switch_defaults_on(self) -> None:
+        self.assertIs(main.stop_guard_on({}), True)
+        for off in ("0", "false", "no", "off"):
+            self.assertIs(main.stop_guard_on({"LIGHTER_STOP_GUARD": off}), False)
+        self.assertIs(main.stop_guard_on({"LIGHTER_STOP_GUARD": "1"}), True)
+
 
 if __name__ == "__main__":
     unittest.main()

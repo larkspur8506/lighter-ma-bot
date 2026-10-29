@@ -433,6 +433,17 @@ class PanelCache:
         return dict(self.prices_value)
 
 
+def stop_guard_on(env: Optional[Mapping[str, str]] = None) -> bool:
+    """止损守护开关，默认**开**（`LIGHTER_STOP_GUARD=0` 关）。
+
+    只影响「补挂/换单」这一个保护动作：关了它，行为退回到 2026-10-29 之前
+    （止损只在开仓那一刻挂，到期后无人补）。资金路径的其他部分不受影响。
+    """
+    raw = str((env if env is not None else os.environ).get("LIGHTER_STOP_GUARD", "1")
+              or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def merge_accepted_stops(cache: PanelCache, report: Any) -> int:
     """把本轮「交易所已受理」的止损单并进面板的挂单缓存；返回并入张数。
 
@@ -464,6 +475,20 @@ def merge_accepted_stops(cache: PanelCache, report: Any) -> int:
                        "qty_int": stop.get("qty_int"),
                        "reduce_only": True, "order_id": "", "status": "pending",
                        "pending_confirm": True})
+        seen.add(coi)
+        added += 1
+    # 止损守护本轮补挂/换单的那几张（`TickReport.stop_guards`）：同样只写观测缓存。
+    for guard in getattr(report, "stop_guards", ()) or ():
+        item = dict(guard)
+        replaced = item.pop("replaced_coi", None)
+        coi = item.get("client_order_index")
+        if coi is None:
+            continue
+        if replaced is not None:
+            merged = [o for o in merged if o.get("client_order_index") != replaced]
+        if coi in seen:
+            continue
+        merged.append(item)
         seen.add(coi)
         added += 1
     if added:
@@ -1469,7 +1494,8 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
         if store is None:
             store = box["store"] = StateStore.from_config(config)
         executor = Executor(store=store, market=market, exchange=exchange, reader=reader,
-                            symbols=symbols, limits=_limits(), alert=None)
+                            symbols=symbols, limits=_limits(), alert=None,
+                            stop_guard=stop_guard_on())
         report = await executor.run_once()
         record_tick_outcomes(store, report, ts=time.time())
         # 面板复用本轮取到的 K 线：不额外取数、且与决策用同一份序列（含同一个起点）
