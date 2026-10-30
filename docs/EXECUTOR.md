@@ -174,6 +174,28 @@ run_once(now_ms)
 
 红线：**有 `fill_id`（交易所成交回报确认过）的成交行，`void_position` 一律拒绝作废**。
 
+### 3.1.2 最差价的锚：实时 mid，不是 4h 收盘（2026-10-30）
+
+订单是 `MARKET + IOC + 最差价`，而「最差价」原来的锚是**上一根 4h 处盘的收盘价**——
+tick 在收盘后 3~4 分钟才发单，这段漂移（实测 p90=18bp、max=58bp）会把 30bp 的带宽吃光，
+剩下的容忍度是负的 ⇒ IOC 零成交。同一根信号的对照（2026-10-29 20:03）：
+
+| | 参考价 | 上限 | 当时市价 | 结果 |
+|---|---|---|---|---|
+| HL（crypto-ma-alert） | **实时 mid** = `all_mids()` | mid × 0.997 | 实时 | **成交 99.446**（比收盘价差 39bp） |
+| Lighter（旧） | 4h 收盘 99.835 | 99.535 | 99.1 | 零成交 |
+
+⇒ 现在 `Executor._live_reference_int()` 在**发单那一刻**取 `market.snapshot(symbol).mid`
+（公开盘口，无鉴权），把整数 tick 作为 `limit_price_int` 传给 `build_entry_order` /
+`build_exit_order`，滑点仍然按 `worst_price_int` 施加。要点：
+
+* **入场**有偏离闸：mid 与信号价相差 >3%（`DEFAULT_LIVE_REF_MAX_DEVIATION`）视为脏数据，
+  退回信号价并落 `live_quote_rejected`；取不到报价 → `live_quote_failed` + 退回信号价，
+  **不阻断开仓**（锚的选择不是交易前提）。
+* **离场**（信号平仓/止损离场）**不设偏离闸** —— 减仓单必须追着现在的价格走，宁可滑点更大
+  也不能因为「离收盘价太远」而放弃退出。
+* 定仓/止损距离仍按 `plan.entry_price`（信号价）算，口径不变；变的只是「订单能接受多差的价格」。
+
 ### 3.2 受理 ≠ 成交（`LIGHTER_FILL_CONFIRM_S`）
 
 Lighter 的 `POST /sendTx` 返回 `code=200` 只表示**进了 sequencer**；`/tx?by=hash` 的
