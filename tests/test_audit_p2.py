@@ -146,6 +146,19 @@ class AdoptTests(Base):
         self.assertEqual(self.store.open_positions(), [])
         self.assertFalse(any(k == "entry_adopted" for k, _ in self.alerts))
 
+    def test_opposite_side_position_is_not_adopted(self):
+        """认领守卫：与未成交信号**反向**的仓位不许认领（方向错了记账就是灾难）。"""
+        ex = FakeExchange()
+        self.executor = self.make_executor(exchange=ex, fill_confirm_s=0)
+        self.reader.exchange = ex
+        self._log_not_filled()
+        ex.positions[BTC] = {"side": -1, "qty_int": 300000, "market_id": 1,
+                             "size_decimals": 5}
+        self.market.feeds[BTC] = bars_result(quiet_bars(400))
+        self.run_tick()
+        self.assertEqual(self.store.open_positions(), [])
+        self.assertTrue(any(k == "entry_adopt_skipped" for k, _ in self.alerts))
+
 
 class CoiRetryTests(Base):
     def test_retry_after_entry_not_filled_uses_a_fresh_coi(self):
@@ -260,6 +273,28 @@ class MigrateVersionInTxnTests(unittest.TestCase):
             s2 = StateStore(path)
             self.assertEqual(s2.migrate(), SCHEMA_VERSION)   # 老库重开=已是最新
             s2.close()
+
+
+class LeftoverStopCancelTests(Base):
+    def test_online_exit_cancels_the_resting_stop(self):
+        """P3：在线离场成交后，仍挂在交易所的止损单必须被撤掉（不咬下一笔开仓）。"""
+        bars = stop_hit_bars()
+        self.market.feeds[BTC] = bars_result(bars, unclosed=())
+        row = self.seed_position(entry_price_int=1120, stop_price_int=1050, bar_ms=T0,
+                                 qty_int=415600)
+        coi = coi_of(BTC, T0, "stop")
+        stop = SimpleNamespace(order_id="999", client_order_index=coi, market_id=1,
+                               symbol=BTC, reduce_only=True, trigger_price_int=1050,
+                               qty_int=415600, status="resting", order_expiry_ms=0)
+        self.exchange.positions[BTC] = {"side": 1, "qty_int": 415600, "market_id": 1}
+        self.exchange.orders = [stop]
+        self.market.mids[BTC] = 103.0          # 带内（1.9%），离场正常走 mid 锚
+        self.executor = self.make_executor(fill_confirm_s=0)
+        self.run_tick()
+        row2 = self.store.position(int(row["id"]))
+        self.assertEqual(row2["state"], "CLOSED")
+        self.assertIn({"market_id": 1, "order_index": 999}, self.exchange.cancels,
+                      "残留止损必须被撤")
 
 
 if __name__ == "__main__":                                     # pragma: no cover

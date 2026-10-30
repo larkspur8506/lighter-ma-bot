@@ -217,6 +217,8 @@ class FakeExchange:
                             client_order_index=coi, tx_hash=f"0xentry{int(bar_ms)}")
 
     async def place_stop(self, plan, *, bar_ms=None, client_order_index=None, **kw):
+        if "stop" in self.raise_on:
+            raise RuntimeError("boom in place_stop")
         if "stop" in self.reject:
             return self.reject["stop"]
         # 显式 coi 优先（止损守护的补挂/换单会传一个「本次尝试」的新键）
@@ -251,6 +253,8 @@ class FakeExchange:
     async def place_exit(self, *, symbol, market_id, side, qty_int, price_decimals,
                          exit_price, bar_ms=None, client_order_index=None,
                          limit_price_int=None):
+        if "exit" in self.raise_on:
+            raise RuntimeError("boom in place_exit")
         if "exit" in self.reject:
             return self.reject["exit"]
         self.exits.append({"symbol": symbol, "side": int(side), "qty_int": int(qty_int),
