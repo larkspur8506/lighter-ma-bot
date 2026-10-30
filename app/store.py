@@ -1617,6 +1617,24 @@ class StateStore:
     def event_count(self) -> int:
         return int(self._scalar("SELECT COUNT(*) AS n FROM events", default=0) or 0)
 
+    def count_events_since(self, kind: str, *, symbol: Optional[str] = None,
+                           since_ts: float = 0.0) -> int:
+        """某类事件自 `since_ts` 起（**含**）的数量；`symbol` 给了就按标的过滤。
+
+        grace 结案的轮次计数用：计数必须落在库里而不是执行器实例上 —— 生产 `_tick()`
+        每轮新建 Executor，实例字段跨不过 tick（`_grace_seen` 就栽在这，2026-10-30）。
+        事件本身带时间戳与标的，正好当持久计数器。
+        """
+        if symbol is not None:
+            n = self._scalar(
+                "SELECT COUNT(*) AS n FROM events WHERE kind=? AND symbol=? AND ts>=?",
+                (str(kind), str(symbol), float(since_ts)), default=0)
+        else:
+            n = self._scalar(
+                "SELECT COUNT(*) AS n FROM events WHERE kind=? AND ts>=?",
+                (str(kind), float(since_ts)), default=0)
+        return int(n or 0)
+
     # ------------------------------------------------------------ 面板 / 自检
 
     def panel_snapshot(self, *, ts: Optional[float] = None, trade_limit: int = 20,

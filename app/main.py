@@ -573,7 +573,7 @@ def max_signal_age_minutes(env: Optional[Mapping[str, str]] = None) -> float:
         value = float(str(raw).strip()) if str(raw).strip() else 30.0
     except ValueError:
         return 30.0
-    if value != value:                  # nan
+    if not math.isfinite(value):        # nan / ±inf（"inf"、"1e999" 按脏值处理，别静默关闸）
         return 30.0
     return value if value >= 0 else 30.0
 

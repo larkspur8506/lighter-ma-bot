@@ -158,6 +158,13 @@ DEFAULT_FILL_POLL_INTERVAL_S = 1.5
 #: `grace` 连续多少轮仍未结案就作废幽灵仓（tick 间隔 30 分钟 ⇒ 默认 2 轮 = 约 1 小时）。
 DEFAULT_GRACE_TICKS = 2
 
+#: grace 仍未结案的轮次记录（事件种类）。计数必须**落在库里**而不是执行器实例上：
+#: 生产 `_tick()` 每轮新建 Executor，实例字段跨不过 tick —— 旧实现把 `_grace_seen`
+#: 挂在实例上，单测拿同一个实例连跑两轮所以全绿，线上 `seen` 恒为 1，自动作废
+#: 一次都没触发过（2026-10-30 复审发现）。事件天然持久、重启安全，顺便给面板
+#: 一条「幽灵仓仍未结案」的可追审计 trail。
+GRACE_PENDING_EVENT = "grace_unsettled"
+
 #: 实时参考价与「计划价」允许的最大偏离。超过它就把实时报价当不可信（错标的/脏盘口），
 #: 退回计划价并落事件 —— 宁可用旧锚，也不拿一个离谱的价格去下真单。
 DEFAULT_LIVE_REF_MAX_DEVIATION = 0.03
@@ -1419,10 +1426,10 @@ class Executor:
         #: `fill_confirm_s=0` = 只读一次（测试用）。
         self.fill_confirm_s = max(0.0, float(fill_confirm_s))
         self.fill_poll_interval_s = max(0.0, float(fill_poll_interval_s))
-        #: 对账 `grace` 的结案门槛：连续这么多轮仍「本地有仓 / 交易所空且无成交」→ 作废幽灵仓。
+        #: 对账 `grace` 的结案门槛：累计这么多轮仍「本地有仓 / 交易所空且无成交」→ 作废
+        #: 幽灵仓。计数落在 `events` 表（见 GRACE_PENDING_EVENT），跨实例、跨重启。
         #: 成交回报里能找到真实平仓成交时，第一轮就按 stop/exit 结案（不看这个计数）。
         self.grace_ticks = max(1, int(grace_ticks))
-        self._grace_seen: Dict[int, int] = {}
         #: 实时参考价的偏离闸（见 `DEFAULT_LIVE_REF_MAX_DEVIATION`）。
         self.live_ref_max_deviation = max(0.0, float(live_ref_max_deviation))
         #: 信号时效闸（2026-10-30）：只允许在「信号 bar 收盘后 N 分钟内」建仓。
@@ -2155,16 +2162,17 @@ class Executor:
             return ()
         stamp = float(self.clock() if now_s is None else now_s)
         settled: List[Mapping[str, Any]] = []
+        seen_pids: set = set()
         for issue in report.issues:
             if str(issue.severity) != SEVERITY_GRACE or not issue.symbol:
                 continue
             pid = int((issue.detail or {}).get("position_id") or 0)
+            if pid in seen_pids:      # 同一 pid 本轮只结一次：多类 grace issue 不叠加计数
+                continue
+            seen_pids.add(pid)
             row = self.store.position(pid) if pid else None
             if row is None:
-                self._grace_seen.pop(pid, None)
                 continue
-            seen = self._grace_seen.get(pid, 0) + 1
-            self._grace_seen[pid] = seen
             trades = await self._recent_trades()
             fill = _closing_fill(row, trades or ())
             if fill is not None:
@@ -2181,7 +2189,6 @@ class Executor:
                                   "qty": float(fill["qty"]), "pnl": float(fill["pnl"]),
                                   "trade_ids": list(fill["trade_ids"]),
                                   "evidence": "trades_reports_close"})
-                self._grace_seen.pop(pid, None)
                 settled.append({"position_id": pid, "action": "settled", "kind": kind,
                                 "exit_price_int": int(fill["price_int"]),
                                 "pnl": float(fill["pnl"]),
@@ -2189,6 +2196,12 @@ class Executor:
                 continue
             opened_at = float(row.get("opened_at") or 0.0)
             provable = trades is not None and _trades_cover(trades, opened_at)
+            # 计数从 events 表来：之前各轮没结案时写的 grace_unsettled（按 symbol +
+            # opened_at 界定，不会串到别的仓位），加上本轮。**累计**口径即可（不要求
+            # 严格连续）——作废判据的三样（交易所空仓 / 成交窗口盖得住生命周期 / 无已
+            # 确认成交）每一轮都独立成立，连续与否不影响安全性。
+            seen = self.store.count_events_since(
+                GRACE_PENDING_EVENT, symbol=issue.symbol, since_ts=opened_at) + 1
             if provable and seen >= self.grace_ticks:
                 result = self.store.void_position(
                     pid, reason="no_fill", ts=stamp,
@@ -2204,9 +2217,16 @@ class Executor:
                                   int(result.get("removed_trade_rows") or 0)})
                 self._alert("position_voided",
                             f"{issue.symbol} 本地有仓但交易所从未成交 —— 已作废该仓位行")
-                self._grace_seen.pop(pid, None)
                 settled.append({"position_id": pid, "action": "voided", "reason": "no_fill"})
                 continue
+            # 本轮没结案：落一条 grace_unsettled —— 它既是持久计数（跨实例、跨重启），
+            # 也是面板上可追的审计 trail。读不到成交回报时尤其要留痕（"查不到" ≠ "没有"）。
+            self._event(GRACE_PENDING_EVENT,
+                        f"{issue.symbol}: grace issue still unsettled "
+                        f"({seen}/{self.grace_ticks} ticks)",
+                        symbol=issue.symbol,
+                        data={"position_id": pid, "seen": seen,
+                              "grace_ticks": self.grace_ticks, "provable": provable})
             if not provable:
                 logger.warning("%s: grace cannot be settled yet — trades window does not "
                                "cover the position (opened_at=%.0f)", issue.symbol, opened_at)
