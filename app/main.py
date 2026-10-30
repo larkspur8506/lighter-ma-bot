@@ -576,6 +576,10 @@ def max_signal_age_minutes(env: Optional[Mapping[str, str]] = None) -> float:
         return 30.0
     if not math.isfinite(value):        # nan / ±inf（"inf"、"1e999" 按脏值处理，别静默关闸）
         return 30.0
+    if 0 < value < 1:
+        # 「30 秒」这类超小数只能是脏数据：`age_min > limit` 恒真 → 每个开仓永远 skip
+        # （只有 per-tick 事件、无告警、status 仍 ok，实测复现）。退回默认，别静默冻住开仓。
+        return 30.0
     return value if value >= 0 else 30.0
 
 
