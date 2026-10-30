@@ -610,14 +610,19 @@ class StateStore:
         每个版本的 DDL 与 `PRAGMA user_version` **在同一个事务里**提交 —— 迁移中断不会
         留下「表加了列但版本号没动」的库（下次会重复 ALTER 而失败），也不会留下
         「版本号动了但列没加」的库（下次会跳过迁移）。
-        """
+
+        版本号**在事务内读**（对抗审查 P3，2026-10-30）：两个进程同时首次开库时，
+        事务外读到的 `user_version` 可能已过期 —— 后进者在事务里重读会看到前者刚提交
+        的版本，直接跳过已做完的迁移，而不是拿着旧版本号再 ALTER 一遍撞 duplicate column。
+        """                                     # noqa: E501
         with self._lock:
-            current = self.schema_version
-            if current > SCHEMA_VERSION:
+            original = self.schema_version          # 只用于返回值（调用方要「原版本」）
+            if original > SCHEMA_VERSION:
                 raise SchemaError(
-                    f"database schema version {current} is newer than this code "
+                    f"database schema version {original} is newer than this code "
                     f"({SCHEMA_VERSION}) — refusing to run against a newer database"
                 )
+            current = original
             while current < SCHEMA_VERSION:
                 target = current + 1
                 statements = MIGRATIONS.get(target)
@@ -625,6 +630,19 @@ class StateStore:
                     raise MigrationError(f"no migration registered for version {target}")
                 try:
                     self.conn.execute("BEGIN IMMEDIATE")
+                    # 事务内重读：另一个进程可能刚把库迁好（BEGIN IMMEDIATE 排队等到了
+                    # 写锁，轮到我们时版本可能已经前进）——按最新版本决定做不做这条迁移。
+                    current = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+                    if current >= target:
+                        # 已经被别的进程做掉了：空提交，直接进入下一版判断。
+                        self.conn.execute("COMMIT")
+                        continue
+                    if current > SCHEMA_VERSION:
+                        self.conn.execute("COMMIT")
+                        raise SchemaError(
+                            f"database schema version {current} is newer than this code "
+                            f"({SCHEMA_VERSION}) — refusing to run against a newer database"
+                        )
                     for statement in statements:
                         self.conn.execute(statement)
                     self.conn.execute(f"PRAGMA user_version={int(target)}")
@@ -639,7 +657,7 @@ class StateStore:
                     ) from exc
                 logger.info("[store] migrated %s -> v%d", self.path, target)
                 current = target
-            return current
+            return original
 
     # ------------------------------------------------------------ 事务
 
@@ -1017,6 +1035,92 @@ class StateStore:
         """止损成交（= `record_exit(kind="stop")`，语义别名，避免调用方拼字符串）。"""
         kwargs.pop("kind", None)
         return self.record_exit(position_id, kind="stop", **kwargs)
+
+    def book_partial_exit(self, position_id: int, *, exit_qty_int: int,
+                          exit_price_int: int, realized_pnl: Optional[float] = None,
+                          fee: float = 0.0, fee_token: Optional[str] = None,
+                          fill_id: Optional[str] = None, reason: str = "partial_exit",
+                          ts: Optional[float] = None) -> Dict[str, Any]:
+        """部分成交的离场：记一笔 exit 腿 + 把仓位缩到剩余量（**一个事务**）。
+
+        对抗审查 P2（2026-10-30）：IOC 离场部分成交时 `_confirm_position_closed`
+        只会看到「仓位还在」→ abort 回 OPEN，但本地 `qty_int` 仍是原值。后果链：
+        `_guard_stops` 的数量闸 `pos.qty != expected_qty → continue` 永久弃管该仓 ——
+        止损 ≤28 天到期被交易所废单后**无人补挂 = 裸仓**；pnl 口径也全错。
+
+        记账口径（与 audit() 的不变式对齐）：
+        - `trades` 加一行 `kind='exit'`（qty = 本腿成交量，价格/pnl 来自交易所成交回报，
+          拿不到时按本地价差口径兜底并落事件说明）；
+        - `positions.qty_int/qty` 缩到剩余量；
+        - **entry 腿行同步缩到剩余量** —— `entry_qty_mismatch` 比对的是「entry 腿合计
+          == positions.qty」，不同步就会从这次起永远报不一致。原量记在事件 data 里。
+        """
+        exit_int = _int(exit_qty_int, "exit_qty_int")
+        px_int = _int(exit_price_int, "exit_price_int")
+        if exit_int <= 0 or px_int <= 0:
+            raise StoreError(f"partial exit needs positive qty/price, got {exit_int}/{px_int}")
+        stamp = now() if ts is None else _finite(ts, default=now())
+        day = utc_day(stamp)
+        with self.write_transaction() as conn:
+            row = conn.execute("SELECT * FROM positions WHERE id=?", (int(position_id),)).fetchone()
+            if row is None:
+                raise StoreError(f"position {position_id} not found")
+            record = dict(row)
+            state = str(record["state"])
+            if state not in OPEN_STATES:
+                raise InvalidTransition(
+                    f"position {position_id} is {state} — partial exit needs an open position")
+            row_qty = int(record["qty_int"] or 0)
+            remaining = row_qty - exit_int
+            if remaining <= 0:
+                raise StoreError(
+                    f"exit qty {exit_int} >= position qty {row_qty} — this is a full close, "
+                    f"use record_exit/record_stop instead")
+            price_dec = _int(record["price_decimals"], "price_decimals")
+            exit_f = _price_float(px_int, price_dec) or 0.0
+            leg_qty_f = _qty_float(exit_int, price_dec)
+            entry_f = float(record["entry_price"] or 0.0)
+            side_i = int(record["side"])
+            gross = (exit_f - entry_f) * leg_qty_f * side_i
+            fee_total = _finite(fee, default=0.0) or 0.0
+            pnl = _finite(realized_pnl)
+            pnl_source = "exchange"
+            if pnl is None:
+                pnl = gross - fee_total
+                pnl_source = "local_price_diff"
+            trade_id, inserted = self._insert_trade_row(conn, dict(
+                ts=stamp, symbol=str(record["symbol"]), side=-side_i, price=exit_f,
+                price_int=px_int, qty=leg_qty_f, qty_int=exit_int,
+                fee=fee_total, fee_token=fee_token, kind="exit",
+                order_id=None, fill_id=fill_id, position_id=int(position_id),
+                realized_pnl=pnl, bar_ms=record.get("bar_ms"), raw=None,
+                client_order_index=None,
+            ))
+            remaining_f = _qty_float(remaining, price_dec)
+            conn.execute("UPDATE positions SET qty_int=?, qty=?, updated_at=? WHERE id=?",
+                         (remaining, remaining_f, stamp, int(position_id)))
+            entry_legs = conn.execute(
+                "SELECT id FROM trades WHERE position_id=? AND kind='entry'",
+                (int(position_id),)).fetchall()
+            if len(entry_legs) != 1:
+                raise StoreError(
+                    f"position {position_id} has {len(entry_legs)} entry legs — "
+                    f"cannot rebase the entry qty safely, refusing the partial booking")
+            conn.execute(
+                "UPDATE trades SET qty_int=?, qty=? WHERE id=?",
+                (remaining, remaining_f, int(entry_legs[0]["id"])))
+            self._bump_counter(conn, day, entries=0, realized_pnl=pnl)
+            self._log_event(conn, kind="partial_exit", symbol=str(record["symbol"]),
+                            message=(f"{record['symbol']} partial exit {exit_int}/{row_qty} "
+                                     f"@ {exit_f:g} pnl {pnl:+.4f} ({pnl_source}); "
+                                     f"position rebased to {remaining}"),
+                            data={"position_id": int(position_id), "exit_qty_int": exit_int,
+                                  "original_qty_int": row_qty, "remaining_qty_int": remaining,
+                                  "exit_price_int": px_int, "realized_pnl": pnl,
+                                  "pnl_source": pnl_source, "reason": reason}, ts=stamp)
+            return {"position_id": int(position_id), "trade_id": trade_id,
+                    "remaining_qty_int": remaining, "realized_pnl": pnl,
+                    "pnl_source": pnl_source}
 
     def record_trade(self, *, symbol: str, side: int, price: float, qty: float, kind: str,
                      price_int: Optional[int] = None, qty_int: Optional[int] = None,

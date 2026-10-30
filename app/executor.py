@@ -91,7 +91,7 @@ from app.lifecycle import (ACTION_ENTRY, ACTION_EXIT, ACTION_SKIP, ACTION_STOP,
 from app.risk import RiskLimits, RiskState
 from app.sizing import OrderPlan, SizingConfig, from_int_qty, to_int_price
 from app.state import StateAssembler
-from app.store import OPEN_STATES, StateStore
+from app.store import OPEN_STATES, StateStore, _qty_float
 
 __all__ = [
     "BLOCK_CIRCUIT_OPEN", "BLOCK_RECONCILE",
@@ -117,6 +117,8 @@ EXECUTOR_STAGE = "executor"
 #: 阻断开仓的三种理由（落到 `Decision.rejections[].code`，面板/日志按它聚合）。
 BLOCK_RECONCILE = "reconcile_blocked"              # 对账发现不一致（fail-closed）
 BLOCK_CIRCUIT_OPEN = "circuit_open"                # 连续失败熔断
+#: 信号时效闸的默认上限（分钟）。直接构造 Executor 时的垃圾值（nan/inf/负数）退到这里。
+SIGNAL_AGE_DEFAULT_MIN = 30.0
 STALE_SIGNAL_CODE = "stale_signal"                 # 信号 bar 已过期（时效闸）
 
 #: 一根 bar 的长度（毫秒）。与 `app.market.BAR_MS` 同一口径（4h）—— 这里单独写一份是
@@ -635,10 +637,15 @@ def _trades_cover(trades: Sequence["ExchangeTrade"], opened_at: float) -> bool:
 
 
 def _closing_fill(row: Mapping[str, Any], trades: Sequence["ExchangeTrade"], *,
-                  tolerance_s: float = 60.0) -> Optional[Dict[str, Any]]:
+                  backward_tolerance_s: float = 2.0) -> Optional[Dict[str, Any]]:
     """在成交回报里找「平掉这个仓位」的那几笔（方向相反、时间在开仓之后、数量够）。
 
     找到 ⇒ 返回加权均价（整数 tick）、逐笔盈亏合计与成交 id；数量不足 99% 则不算结案。
+
+    时间判据（对抗审查 P2，2026-10-30）：平仓成交必须发生在 `opened_at` **之后**
+    （只留 2s 时钟漂移容差）。旧版允许 `opened_at` 前 60s —— 同标的上一个仓位的平仓
+    成交（止损离线成交 → grace 结案 → 同轮开出新仓，间隔恰在容差内）会被算到新仓
+    头上：新仓被按别人的价格/pnl 结案，前仓亏损双计（函数级已复现）。
     """
     symbol = str(row.get("symbol") or "").strip().upper()
     side = int(row.get("side") or 0)
@@ -650,7 +657,7 @@ def _closing_fill(row: Mapping[str, Any], trades: Sequence["ExchangeTrade"], *,
     closing_side = -side
     fills = [t for t in trades
              if t.symbol == symbol and int(t.side) == closing_side
-             and float(t.ts) + tolerance_s >= opened_at]
+             and float(t.ts) >= opened_at - backward_tolerance_s]
     if not fills:
         return None
     total = sum(t.qty for t in fills)
@@ -1434,7 +1441,15 @@ class Executor:
         self.live_ref_max_deviation = max(0.0, float(live_ref_max_deviation))
         #: 信号时效闸（2026-10-30）：只允许在「信号 bar 收盘后 N 分钟内」建仓。
         #: `0` = 关闭；负数按 0 处理（显式关闭比「负窗口把开仓全挡死」安全）。
-        self.max_signal_age_min = max(0.0, float(max_signal_age_min))
+        _age_raw = float(max_signal_age_min)
+        if not math.isfinite(_age_raw):
+            # nan/inf 不是「关闭」是「垃圾」—— nan 会让 `age > limit` 恒 False（静默关闸，
+            # 实测 `max(0.0, nan) == 0.0`）。装配层（main）已挡，这里是深度防御：
+            # 垃圾值退回默认 30（fail-closed 到「有闸」，不是「无闸」）。
+            self.max_signal_age_min = SIGNAL_AGE_DEFAULT_MIN
+        else:
+            # 负数按 0 处理（既有语义：显式关闭比「负窗口把开仓全挡死」安全）。
+            self.max_signal_age_min = max(0.0, _age_raw)
         self._sleep = sleeper if sleeper is not None else asyncio.sleep
         self.alert = alert
         self.clock = clock
@@ -1524,6 +1539,9 @@ class Executor:
         # ①a 超龄 CLOSING 收尸（对抗审查 P1-1 的 tick 级兜底）：放在止损守护之前 ——
         #     abort 回 OPEN 的行，本轮的 _guard_stops 才能重新管到它的保护单。
         await self._reap_stale_closing(account, now_s)
+        # ①a.2 迟到成交的入场认领（对抗审查 P2-3）：放在守护之前 —— 认领出的行本轮就被
+        #     _guard_stops 补上止损，不让真实仓位裸到下一轮。
+        await self._adopt_unbooked_entries(account, now_s)
         # ①b 止损守护（2026-10-29）：先补保护、再对账 —— 缺止损就补挂、临期就换单。
         #     放在对账之前是刻意的：刚补上的止损不该再触发一次「缺止损」的封锁/告警。
         #     **只加保护**：不动仓位、不改信号、不碰离场判定。
@@ -1774,7 +1792,13 @@ class Executor:
             raise ExecutorError(f"{decision.symbol}: entry intent without an OrderPlan")
         bar_ms = int(decision.bar_ms or 0)
         symbol = str(plan.symbol)
-        entry_coi = client_order_index(symbol, bar_ms, "entry")
+        # entry coi 按 (symbol, bar) 确定性推导 = 崩溃重放的幂等键。但「受理未成交」之后
+        # 的重试若复用同一个 coi，会被交易所以 duplicate 拒掉 → 白吃失败计数，3 次可误开
+        # 熔断（对抗审查 P3）。有 not_filled 记录的 bar，重试 coi 掺尝试序号；
+        # 崩溃重放的幂等保护由 adopt（认领路径）接住——成交迟到下一轮会被记回账。
+        attempt = self._entry_attempt_index(symbol, bar_ms)
+        entry_coi = (client_order_index(symbol, bar_ms, "entry") if not attempt
+                     else client_order_index(symbol, bar_ms, f"entry#{attempt}"))
         stop_coi = client_order_index(symbol, bar_ms, "stop")
 
         if self.margin_isolated:
@@ -1790,9 +1814,11 @@ class Executor:
         entry_ref = await self._live_reference_int(
             symbol, int(plan.price_decimals), plan_price=float(plan.entry_price),
             label="entry")
-        order = await self._place(self.exchange.place_entry(plan, bar_ms=bar_ms,
-                                                           limit_price_int=entry_ref),
-                                  label=f"{symbol} entry")
+        order = await self._place(
+            self.exchange.place_entry(plan, bar_ms=bar_ms,
+                                      client_order_index=entry_coi,
+                                      limit_price_int=entry_ref),
+            label=f"{symbol} entry")
         if not self._accepted(order):
             return self._reject(symbol, decision, order, label="entry")
 
@@ -1813,7 +1839,17 @@ class Executor:
                     data={"qty_int": int(plan.qty_int), "notional": float(plan.notional),
                           "tx_hash": order.tx_hash, "code": order.code,
                           "entry_coi": entry_coi,
-                          "waited_s": float(self.fill_confirm_s)})
+                          "waited_s": float(self.fill_confirm_s),
+                          # 认领（adopt）需要的冻结信号参数：下一轮读到迟到的真实仓位时，
+                          # 按这组参数补记账（数量以交易所为准）。一笔信号冻结一份。
+                          "bar_ms": bar_ms, "side": int(plan.side),
+                          "entry_price_int": to_int_price(float(plan.entry_price),
+                                                          int(plan.price_decimals)),
+                          "stop_price_int": int(plan.stop_price_int),
+                          "price_decimals": int(plan.price_decimals),
+                          "size_decimals": int(plan.size_decimals),
+                          "market_id": int(plan.market_id),
+                          "equity_at_entry": float(self._equity or 0.0)})
                 self._alert("entry_not_filled",
                             f"{symbol} 开仓单被受理但**没有成交**（账上未记仓、未挂止损）")
                 return SymbolOutcome(
@@ -1957,9 +1993,13 @@ class Executor:
             self.lifecycle.begin_close(pid, reason=kind, bar_ms=bar_ms,
                                        ts=float(self.clock()))
         try:
-            # 离场同样锚实时 mid，但**不设偏离闸**：减仓单必须追着现在的市场价格走。
+            # 离场锚实时 mid + **很宽**的偏离闸（5%，对抗审查 P2-4）：正常行情永远追着
+            # mid 走（减仓单必须追市价）；只有 mid 相对信号参考价偏出带宽（脏数据/串价）
+            # 才退回计划价并留痕。取舍：真实跳空（mid 对、计划价旧）被闸拒绝时，本轮可能
+            # 零成交、下轮重试 —— 止损单仍在位兜底，比无脑信一个坏 mid 安全。
             exit_ref = await self._live_reference_int(
-                symbol, price_decimals, plan_price=None, max_deviation=0.0, label=kind)
+                symbol, price_decimals, plan_price=float(decision.exit_price or 0.0),
+                max_deviation=self.EXIT_REF_MAX_DEVIATION, label=kind)
             order = await self._place(
                 self.exchange.place_exit(symbol=symbol, market_id=int(row.get("market_id") or 0),
                                          side=int(row.get("side") or 0),
@@ -1997,6 +2037,19 @@ class Executor:
                     exit_price_int=exit_price_int, error=exc)
                 raise
             if not closed:
+                # 部分成交优先（对抗审查 P2）：仓位还在但数量变小 = 离场成交了一部分。
+                # 不处理的话本地 qty 停在原值，`_guard_stops` 的数量闸会永久弃管该仓
+                # （止损到期被废单后无人补挂 = 裸仓），pnl 口径也全错。
+                if await self._settle_partial_exit(pid=pid, row=row, symbol=symbol,
+                                                   account=account):
+                    return SymbolOutcome(
+                        symbol=symbol, action=decision.action, bar_ms=bar_ms,
+                        reason=(f"{kind} partially filled — exit leg booked, position "
+                                f"rebased to the exchange qty; stop guard resumes"),
+                        decision=decision.as_dict(), order=order.as_dict(), filled=False,
+                        ok=False,
+                        detail={"position_id": pid, "kind": kind, "partial": True,
+                                "exit_price_int": exit_price_int})
                 self.lifecycle.abort_close(pid, reason=f"{kind}_not_filled", ts=float(self.clock()))
                 self._event(
                     "exit_not_filled",
@@ -2016,6 +2069,9 @@ class Executor:
         transition = self.lifecycle.complete_close(
             pid, exit_price_int=exit_price_int, kind=kind, reason=kind, bar_ms=bar_ms,
             ts=float(self.clock()))
+        # 离场已成交 → 撤掉仍在位的 reduce-only 止损单（对抗审查 P3）：多余的一张没有
+        # 仓位可减（无害但脏），而且会咬下一笔同标的开仓。撤不掉只留痕，不影响结案。
+        await self._cancel_leftover_stop(row, account)
         self._event(kind, f"{symbol} closed ({kind}) @ {decision.exit_price}",
                     symbol=symbol, data={"position_id": pid, "bar_ms": bar_ms,
                                          "exit_price_int": exit_price_int,
@@ -2323,6 +2379,216 @@ class Executor:
                         f"还没有结果且交易所仍有仓 —— 已回退 OPEN：止损守护恢复接管，"
                         f"下一轮重新评估离场。")
 
+    async def _settle_partial_exit(self, *, pid: int, row: Mapping[str, Any],
+                                   symbol: str, account: ExchangeAccount) -> bool:
+        """离场单部分成交的当场结账（对抗审查 P2，2026-10-30）。返回 True = 已处理。
+
+        判据：交易所仍有仓、数量**小于**本地行（缩量 = 离场成交了一部分）。处理：
+        ① `store.book_partial_exit` 一个事务记下已成交的离场腿 + 仓位缩到交易所实际量
+           （entry 腿同步缩，保住 `entry_qty_mismatch` 不变式）；pnl 用交易所成交回报，
+           拿不到按本地价差兜底；
+        ② 撤掉数量已不符的旧止损单、按剩余量重挂（走 `_replace_stop`，带可见性确认；
+           失败交下一轮 `_guard_stops` 补——此时数量闸已经对得上，守护不再弃管）；
+        ③ abort_close 回 OPEN，下一轮正常重判离场。
+        只处理「缩量」：数量没变（纯零成交）走既有的 abort + exit_not_filled 路径；
+        数量变大属于异常（人工加仓），交对账报 blocker，不在这里猜。
+        """
+        size_decimals = int(row.get("size_decimals") or 0)
+        row_qty = int(row.get("qty_int") or 0)
+        # **重新读一次交易所**：传进来的 account 是本轮 tick 开头的快照，而部分成交恰恰
+        # 发生在那次读数之后 —— 拿旧快照判断缩量永远是「数量没变」。
+        try:
+            snap = await self.reader.read()
+        except Exception as exc:                              # noqa: BLE001 - 读不到按未知处理
+            self._event("partial_exit_skipped",
+                        f"{symbol}: partial-exit exchange read failed "
+                        f"({type(exc).__name__}) — falling back to the zero-fill path",
+                        symbol=symbol, data={"position_id": pid,
+                                             "error": str(exc)[:200]})
+            return False
+        pos = snap.position_for(symbol)
+        if pos is None:
+            return False
+        ex_qty = _qty_int_from_decimal(pos.qty, size_decimals)
+        if not (0 < ex_qty < row_qty):
+            return False
+        delta = row_qty - ex_qty
+        # 价格与 pnl 用交易所成交回报（begin_close 之后的反向腿）；拿不到退计划价。
+        trades = await self._recent_trades()
+        began = float(row.get("updated_at") or row.get("opened_at") or 0.0)
+        legs = [t for t in (trades or ())
+                if t.symbol == symbol and int(t.side) == -int(row.get("side") or 0)
+                and float(t.ts) >= began - 2.0]
+        leg_qty = sum(t.qty for t in legs)
+        if leg_qty + 1e-12 >= _qty_float(delta, size_decimals) * 0.99:
+            px_int = int(round(sum(t.qty * t.price for t in legs) / leg_qty
+                               * (10 ** size_decimals))) if leg_qty else 0
+            leg_pnl = sum(float(t.pnl or 0.0) for t in legs)
+            fill_id = ",".join(str(t.trade_id) for t in legs if t.trade_id) or None
+        else:
+            px_int, leg_pnl, fill_id = 0, None, None
+        if px_int <= 0:
+            px_int = to_int_price(float(row.get("stop_price_int") or 0) /
+                                  (10 ** size_decimals), size_decimals) if row.get("stop_price_int") else 0
+        if px_int <= 0:
+            self._event("partial_exit_skipped",
+                        f"{symbol}: partial exit detected but no usable price — "
+                        f"falling back to the zero-fill path", symbol=symbol,
+                        data={"position_id": pid, "exchange_qty_int": ex_qty,
+                              "row_qty_int": row_qty})
+            return False
+        self.store.book_partial_exit(pid, exit_qty_int=delta, exit_price_int=px_int,
+                                     realized_pnl=leg_pnl, fill_id=fill_id,
+                                     reason="exit_partial")
+        self._alert("partial_exit",
+                    f"【Lighter】{symbol} 离场单部分成交（{delta}/{row_qty}）—— 已记离场腿、"
+                    f"仓位按交易所实际量改账（剩 {ex_qty}），止损守护恢复接管。")
+        # 旧止损单数量已不符：撤掉再按剩余量重挂（撤不掉也无妨——多余的 reduce-only
+        # 没有仓位可减；重挂失败交下一轮守护补挂）。
+        await self._cancel_leftover_stop(row, account)
+        shrunk = dict(row)
+        shrunk["qty_int"] = ex_qty
+        placed = await self._replace_stop(shrunk, reason="partial_exit")
+        if placed is None:
+            self._event("partial_exit",
+                        f"{symbol}: stop re-place after partial exit failed — "
+                        f"the guard will backfill it next tick", symbol=symbol,
+                        data={"position_id": pid, "remaining_qty_int": ex_qty})
+        self.lifecycle.abort_close(pid, reason="exit_partial", ts=float(self.clock()))
+        return True
+
+    async def _cancel_leftover_stop(self, row: Mapping[str, Any],
+                                    account: ExchangeAccount) -> None:
+        """撤掉该仓位**仍在位**的止损挂单（离场成交后调用；只留痕、绝不抛）。"""
+        coi_text = str(row.get("stop_order_id") or "")
+        if not coi_text.startswith("coi:") or not coi_text[4:].isdigit():
+            return
+        coi = int(coi_text[4:])
+        live = next((o for o in (account.orders or ())
+                     if int(getattr(o, "client_order_index", 0) or 0) == coi), None)
+        if live is None:
+            return                                  # 已经不在场上（成交/被撤）
+        order_id = str(getattr(live, "order_id", "") or "")
+        if not order_id.isdigit():
+            return                                  # 拿不到交易所单号 → 留给对账/看护
+        try:
+            res = await self.exchange.cancel_order(market_id=int(row.get("market_id") or 0),
+                                                   order_index=int(order_id))
+            if not self._accepted(res):
+                self._event("stop_cancel_failed",
+                            f"{coi_text[0:12]}…: 残留止损撤销失败（{res.error or res.kind}）",
+                            symbol=str(row.get("symbol") or ""),
+                            data={"order_index": int(order_id), "coi": coi,
+                                  "error": res.error or res.kind})
+        except Exception as exc:                              # noqa: BLE001 - 只留痕
+            self._event("stop_cancel_failed",
+                        f"残留止损撤销异常：{type(exc).__name__}: {exc}",
+                        symbol=str(row.get("symbol") or ""),
+                        data={"coi": coi, "error": f"{type(exc).__name__}: {exc}"[:200]})
+
+    def _entry_attempt_index(self, symbol: str, bar_ms: int) -> int:
+        """同 bar 的入场尝试序号（`entry_not_filled` 次数，从 events 表数——持久、跨实例）。
+
+        entry 的 coi 按 (symbol, bar) 确定性推导是为了崩溃重放幂等；但「受理未成交」
+        之后的重试若仍用同一个 coi，会被交易所以 duplicate 拒掉 → 白吃失败计数，
+        3 次可误开熔断（对抗审查 P3）。有 not_filled 记录的 bar，重试 coi 掺尝试序号：
+        重放的幂等保护由 adopt（认领路径）接住。
+        """
+        try:
+            rows = self.store.events(limit=50, kind="entry_not_filled")
+        except Exception:                                     # noqa: BLE001
+            return 0
+        seen = 0
+        for r in rows:
+            if str(r.get("symbol") or "").upper() != str(symbol).upper():
+                continue
+            try:
+                data = json.loads(r.get("data") or "{}")
+            except (TypeError, ValueError) as exc:            # noqa: BLE001 - 脏事件行跳过
+                logger.debug("could not parse event data (%s): %s", exc, r.get("id"))
+                continue
+            if int((data or {}).get("bar_ms") or 0) == int(bar_ms):
+                seen += 1
+        return seen
+
+    async def _adopt_unbooked_entries(self, account: ExchangeAccount, now_s: float) -> None:
+        """entry_not_filled 之后的自动认领（对抗审查 P2-3，2026-10-30）。
+
+        「受理未成交」只说明 12s 确认窗内没读到仓位；传播延迟/极端行情下窗口外才出现的
+        真实仓位过去只有一条告警、无人保护。这里补上：该标的**没有本地行**、且窗口内
+        有 entry_not_filled 记录时，把交易所仓位按事件里冻结的信号参数记账（数量以
+        交易所为准、方向/数量对不上只告警不认领）；止损由紧接着的 `_guard_stops`
+        补挂（行里已带 stop_price_int）。人工仓（没有 entry_not_filled 记录）绝不认领。
+        """
+        if self.dry_run:
+            return
+        local_symbols = {str(r.get("symbol") or "").upper()
+                         for r in self.store.open_positions()}
+        try:
+            events = self.store.events(limit=50, kind="entry_not_filled") or []
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning("adopt: could not read entry_not_filled events: %s", exc)
+            return
+        recent: Dict[str, dict] = {}
+        for r in events:
+            sym = str(r.get("symbol") or "").upper()
+            if sym in local_symbols or float(r.get("ts") or 0.0) < now_s - self.ADOPT_WINDOW_S:
+                continue
+            try:
+                data = json.loads(r.get("data") or "{}")
+            except (TypeError, ValueError) as exc:            # noqa: BLE001 - 脏事件行跳过
+                logger.debug("could not parse event data (%s): %s", exc, r.get("id"))
+                continue
+            if sym not in recent:                             # events 按 ts DESC，第一条最新
+                recent[sym] = data
+        for pos in account.positions:
+            symbol = str(getattr(pos, "symbol", "") or "").upper()
+            if not symbol or symbol in local_symbols:
+                continue
+            data = recent.get(symbol)
+            if data is None:
+                continue                                      # 人工仓/久远仓：只告警不认领
+            qty_int = _qty_int_from_decimal(pos.qty, int(data.get("size_decimals") or 0))
+            planned = int(data.get("qty_int") or 0)
+            if int(getattr(pos, "side", 0) or 0) != int(data.get("side") or 0):
+                self._alert("entry_adopt_skipped",
+                            f"【Lighter】{symbol} 出现与未成交信号**反向**的交易所仓位 —— "
+                            f"不认领，请人工核对。")
+                continue
+            if qty_int <= 0 or (planned and qty_int > planned):
+                self._alert("entry_adopt_skipped",
+                            f"【Lighter】{symbol} 出现 {qty_int} 的交易所仓位，超出/对不上"
+                            f"未成交信号的计划量（{planned}）—— 不认领，请人工核对。")
+                continue
+            try:
+                self.store.record_entry(
+                    symbol, int(data.get("side") or 1),
+                    qty_int=qty_int, size_decimals=int(data.get("size_decimals") or 0),
+                    entry_price_int=int(data.get("entry_price_int") or 0),
+                    price_decimals=int(data.get("price_decimals") or 0),
+                    stop_price_int=int(data.get("stop_price_int") or 0),
+                    bar_ms=int(data.get("bar_ms") or 0),
+                    market_id=int(data.get("market_id") or 0),
+                    entry_order_id=(f"coi:{data.get('entry_coi')}"
+                                    if data.get("entry_coi") else None),
+                    stop_order_id=None,
+                    equity_at_entry=float(data.get("equity_at_entry") or self._equity or 0.0))
+            except Exception as exc:                          # noqa: BLE001
+                self._event("entry_adopt_failed",
+                            f"{symbol}: adopt booking failed: {type(exc).__name__}: {exc}",
+                            symbol=symbol, data={"error": str(exc)[:200]})
+                continue
+            self._event("entry_adopted",
+                        f"{symbol}: late-filling entry adopted from the exchange read "
+                        f"(qty {qty_int}) — the stop guard will back the stop this tick",
+                        symbol=symbol,
+                        data={"qty_int": qty_int, "planned_qty_int": planned,
+                              "bar_ms": int(data.get("bar_ms") or 0),
+                              "entry_coi": data.get("entry_coi")})
+            self._alert("entry_adopted",
+                        f"【Lighter】{symbol} 的开仓单其实成交了（确认窗后才出现）—— "
+                        f"已自动补记账（{qty_int}），止损单由守护在本轮补挂。")
+
     async def _recent_trades(self) -> Optional[Tuple[ExchangeTrade, ...]]:
         """最近的成交回报；读不到 → `None`（**绝不**当成「没有成交」）。"""
         fn = getattr(self.reader, "trades", None)
@@ -2441,6 +2707,12 @@ class Executor:
     #: 60 分钟 ≈ 2 个 tick —— 快速路径的异常收尸（_recover_close_after_error）之外的漏网
     #:（确认窗内进程被杀、收尸读数也失败）由 _reap_stale_closing 兜住。
     CLOSING_STALE_S: float = 3600.0
+    #: 离场锚的偏离闸（对抗审查 P2-4）：正常行情永远追实时 mid；只有 mid 相对信号参考价
+    #: 偏出这个带宽（多半是脏数据/串价）才退回计划价并留痕。止损单仍在位兜底。
+    EXIT_REF_MAX_DEVIATION: float = 0.05
+    #: entry_not_filled 之后的「认领窗口」：这笔信号开出后多久内，交易所出现的同向仓位
+    #: 还能被自动认领（补记账 + 交止损守护补保护）。超窗只告警（怕认领到人工仓）。
+    ADOPT_WINDOW_S: float = 7200.0
     #: 挂完新单后等它出现在 activeOrders 的轮询（实测传播 0.8~1.5s，上限给到 ~6s）
     STOP_VERIFY_ATTEMPTS: int = 4
     STOP_VERIFY_INTERVAL_S: float = 1.5
@@ -2513,12 +2785,16 @@ class Executor:
             return None
 
         visible = await self._wait_stop_visible(coi)
-        if old is not None and not visible:
-            # 换单的**红线**：新单没确认在位就绝不撤旧单（否则可能两头落空 = 裸奔）。
+        if not visible:
+            # 新止损单没确认在位就**绝不**往下走：换单场景撤旧单 = 两头落空（裸奔）；
+            # 补挂（missing）场景把未确认的新单喂给对账 = 「止损在位」的假象 —— 受理后
+            # 一直没真挂上的话，每轮循环「补挂完成」而对账永不报（对抗审查 P3）。
+            # 未确认的新单留在交易所无害（reduce-only），下一轮 match/补挂自愈。
             self._event("stop_guard_unverified",
-                        f"{symbol}: 新止损单已受理但未在活挂单里看到，保留旧单等待下一轮",
+                        f"{symbol}: 新止损单已受理但未在活挂单里看到，不把它喂给对账"
+                        + ("，保留旧单等待下一轮" if old is not None else ""),
                         symbol=symbol, data={"reason": reason, "coi": coi,
-                                             "old_coi": old.client_order_index})
+                                             "old_coi": getattr(old, "client_order_index", None)})
             return None
 
         expiry_ms = res.order_expiry_ms or 0

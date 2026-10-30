@@ -198,7 +198,8 @@ class FakeExchange:
             raise RuntimeError("boom in place_entry")
         if "entry" in self.reject:
             return self.reject["entry"]
-        coi = coi_of(plan.symbol, int(bar_ms), "entry")
+        coi = (int(client_order_index) if client_order_index is not None
+               else coi_of(plan.symbol, int(bar_ms), "entry"))
         self.entries.append({"symbol": plan.symbol, "side": plan.side,
                              "qty_int": plan.qty_int, "market_id": plan.market_id,
                              "bar_ms": int(bar_ms), "coi": coi,
@@ -1703,19 +1704,33 @@ class LiveReferencePriceTests(Base):
         self.assertIsNone(self.exchange.entries[0]["limit_price_int"])
         self.assertIn("live_quote_rejected", [e["kind"] for e in self.events()])
 
-    def test_exit_bound_uses_the_live_mid_without_a_deviation_guard(self):
-        """减仓单必须追着现在的价格走：离得再远也不许退回止损价/收盘价。"""
+    def test_exit_bound_uses_the_live_mid_within_the_wide_gate(self):
+        """离场锚带 5% 宽偏离闸（对抗审查 P2-4）：带内照样追实时 mid。"""
         bars = stop_hit_bars()
         self.market.feeds[BTC] = bars_result(bars, unclosed=())
         self.seed_position(entry_price_int=1120, stop_price_int=1050, bar_ms=T0,
                            qty_int=415600)
         self.exchange.positions[BTC] = {"side": 1, "qty_int": 415600, "market_id": 1}
         self.exchange.orders = []
-        self.market.mids[BTC] = 96.0           # 比止损价 105 低 8.6%
+        self.market.mids[BTC] = 103.0          # 比止损价 105 低 1.9%（带内）
         ex = self.make_executor(fill_confirm_s=0)
         self.run_tick(ex)
-        self.assertEqual(self.exchange.exits[0]["limit_price_int"], 960)
+        self.assertEqual(self.exchange.exits[0]["limit_price_int"], 1030)
         self.assertNotIn("live_quote_rejected", [e["kind"] for e in self.events()])
+
+    def test_exit_falls_back_when_the_mid_is_wildly_off(self):
+        """mid 相对信号参考价偏出 5% 带宽（脏数据/串价）→ 退回计划价并留痕。"""
+        bars = stop_hit_bars()
+        self.market.feeds[BTC] = bars_result(bars, unclosed=())
+        self.seed_position(entry_price_int=1120, stop_price_int=1050, bar_ms=T0,
+                           qty_int=415600)
+        self.exchange.positions[BTC] = {"side": 1, "qty_int": 415600, "market_id": 1}
+        self.exchange.orders = []
+        self.market.mids[BTC] = 96.0           # 比止损价 105 低 8.6%（带外）
+        ex = self.make_executor(fill_confirm_s=0)
+        self.run_tick(ex)
+        self.assertIsNone(self.exchange.exits[0]["limit_price_int"])
+        self.assertIn("live_quote_rejected", [e["kind"] for e in self.events()])
 
 
 # --------------------------------------------------------------------------- 信号时效闸
