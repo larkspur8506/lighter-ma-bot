@@ -9,6 +9,13 @@
 * **可选（有文档化默认值）**：`LIGHTER_ENVIRONMENT=mainnet`、`DB_PATH=./data/state.db`、
   `DB_URL`（空则从 `DB_PATH` 推导）、`RISK_PCT=0.01`、`HOST=0.0.0.0`、`PORT=8100`、
   `LIGHTER_PROXY_URL`（空 = 直连；判定与注入见 `app.proxy` / `docs/PROXY.md`）。
+* **可选且**由 `app.notify` **自己读**：`WECHAT_WEBHOOK_URL` / `TELEGRAM_BOT_TOKEN` /
+  `TELEGRAM_CHAT_ID`（键名与 HL 侧一致）。三个**都不是必填项**：缺哪个渠道就跳过哪个，
+  三个全缺 = 通知整体 no-op（执行器只打日志，与接入前一致）。这里只把它们登记进
+  `OPTIONAL_KEYS` 并写明默认空串 —— 它们**绝不能**进 `REQUIRED_KEYS`，否则一次
+  「今天不想收推送」的清空操作就会让进程拒绝启动（通知是旁路，不是交易前置条件）。
+  读值的实现留在 `app.notify`（与 `LIGHTER_LEVERAGE` 等由 `sizing`/`risk` 直接读的键
+  同一形状），避免把「推送凭据」和「交易凭据」的失败语义混成一条。
 * **secret**：`LIGHTER_API_PRIVATE_KEY`、`ADMIN_TOKEN`（以及可能带凭据的 `DB_URL`）在
   `repr()` / `str()` / `public()` 里全部脱敏。异常消息只报**变量名**，绝不带回值 ——
   否则一个 PK 格式错误就会把私钥抄进日志和通知。
@@ -28,6 +35,8 @@ from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from app.market import BASE_URLS, DEFAULT_ENVIRONMENT
+from app.notify import (TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
+                        WECHAT_WEBHOOK_ENV)
 from app.proxy import PROXY_ENV_KEY, ProxyConfigError, parse_proxy_url, redact_proxy_url
 
 __all__ = [
@@ -54,7 +63,10 @@ IDENTITY_KEYS = (ACCOUNT_INDEX_KEY, API_KEY_INDEX_KEY, API_PRIVATE_KEY_KEY, L1_A
 REQUIRED_KEYS = IDENTITY_KEYS + (ADMIN_TOKEN_KEY,)
 SECRET_KEYS = (API_PRIVATE_KEY_KEY, ADMIN_TOKEN_KEY)
 OPTIONAL_KEYS = (ENVIRONMENT_KEY, DB_PATH_KEY, DB_URL_KEY, RISK_PCT_KEY, HOST_KEY,
-                 PORT_KEY, PROXY_ENV_KEY)
+                 PORT_KEY, PROXY_ENV_KEY,
+                 # 通知（`app.notify` 自己读）：登记为**可选**，默认空串 = 该渠道不启用。
+                 # 三个全缺 = no-op；缺一个只跳过那一个渠道。
+                 WECHAT_WEBHOOK_ENV, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV)
 
 DEFAULTS: Dict[str, str] = {
     ENVIRONMENT_KEY: DEFAULT_ENVIRONMENT,
@@ -62,6 +74,9 @@ DEFAULTS: Dict[str, str] = {
     RISK_PCT_KEY: "0.01",
     HOST_KEY: "0.0.0.0",
     PORT_KEY: "8100",
+    WECHAT_WEBHOOK_ENV: "",
+    TELEGRAM_BOT_TOKEN_ENV: "",
+    TELEGRAM_CHAT_ID_ENV: "",
 }
 
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
