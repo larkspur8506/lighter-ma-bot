@@ -1604,6 +1604,27 @@ class GraceSettlementTests(Base):
         self.assertEqual(self.store.audit(), [])
         self.assertEqual(len(second.grace_settlements), 1)
 
+    def test_grace_void_survives_executor_rebuild(self):
+        """生产形状回归：`_tick()` 每轮**新建** Executor，计数必须跨实例。
+
+        旧实现把 `_grace_seen` 挂在实例上 —— 单测拿同一个实例连跑两轮所以全绿，
+        线上每轮新实例 `seen` 恒为 1，自动作废在生产里一次都没触发过（2026-10-30
+        复审发现）。现在计数落在 events 表：第二个实例必须能接着第一轮的计数作废。
+        """
+        row = self._phantom()
+        first = self.run_tick(self.make_executor(fill_confirm_s=0, grace_ticks=2))
+        self.assertEqual(self.store.position(int(row["id"]))["state"], "OPEN",
+                         "第一轮只累计，不动手")
+        self.assertEqual(len(self.events("grace_unsettled")), 1,
+                         "第一轮没结案必须落一条 grace_unsettled（持久计数 + 审计 trail）")
+
+        second = self.run_tick(self.make_executor(fill_confirm_s=0, grace_ticks=2))
+        after = self.store.position(int(row["id"]))
+        self.assertEqual(after["state"], "CLOSED")
+        self.assertEqual(after["exit_reason"], "no_fill")
+        self.assertIn("position_voided", [e["kind"] for e in self.events()])
+        self.assertEqual(len(second.grace_settlements), 1)
+
     def test_grace_settles_a_real_stop_fill_from_trades(self):
         row = self._phantom()
         trade = executor.ExchangeTrade(
@@ -1821,6 +1842,14 @@ class SignalAgeGateTests(Base):
                          60.0)
         self.assertEqual(main.max_signal_age_minutes({"LIGHTER_MAX_SIGNAL_AGE_MIN": "-5"}), 30.0)
         self.assertEqual(main.max_signal_age_minutes({"LIGHTER_MAX_SIGNAL_AGE_MIN": "abc"}),
+                         30.0)
+        # "inf"/"1e999"：float() 能解析但不是有限数 —— 静默放行等于把闸门关掉，
+        # 必须按脏值退回 30（2026-10-30 复审补的边角）。
+        self.assertEqual(main.max_signal_age_minutes({"LIGHTER_MAX_SIGNAL_AGE_MIN": "inf"}),
+                         30.0)
+        self.assertEqual(main.max_signal_age_minutes({"LIGHTER_MAX_SIGNAL_AGE_MIN": "1e999"}),
+                         30.0)
+        self.assertEqual(main.max_signal_age_minutes({"LIGHTER_MAX_SIGNAL_AGE_MIN": "-inf"}),
                          30.0)
 
 
