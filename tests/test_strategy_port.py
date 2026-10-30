@@ -30,6 +30,11 @@ Test data is generated in-process: no network, no fixture files, no temporary
 directories. Signals are asserted against the strategy's own public API
 (`scan`, `compute_indicators`, `squeeze_flags`, `evaluate_entry`), which is
 what the rest of the bot will call.
+
+> **策略 v2（2026-10-30）**: `STOP_MAX` 0.10 → 0.035 是一次**有意的规则升版**，
+> 不是修 bug。文件仍然逐字节冻结，`FROZEN_SHA256`/`FROZEN_BYTES` 已按新文件重录；
+> 止损距离超过 3.5% 的入场不再产生信号，因此夹具与快照里的入场几何随之收窄
+> （价格跳空改小，仍是同一套「平台 → 跳空破位」构造），断言强度不变。
 """
 
 from __future__ import annotations
@@ -48,12 +53,13 @@ from tests import reference_strategy as reference
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 STRATEGY_PATH = ROOT / "app" / "strategy.py"
 
-# Recorded when the file was copied out of `crypto-ma-alert`:
-#   sha256sum app/strategy.py  ->  8682667…
+# Recorded when the file was copied out of `crypto-ma-alert`, and re-recorded
+# for strategy v2 (2026-10-30, STOP_MAX 0.10 -> 0.035):
+#   sha256sum app/strategy.py  ->  482405e…
 # Both are pinned: a 1-byte change that happens to keep the length (rare) is
 # still caught by the hash; a hash collision is not a threat model here.
-FROZEN_SHA256 = "868266752317212c24a8dcdd4937c775944d24035846ffba86805f34b22ece07"
-FROZEN_BYTES = 25962
+FROZEN_SHA256 = "482405e23017312ba94bb0bc2ce7077ae9ba1cc42b2ffaf39e2420f9cff35e34"
+FROZEN_BYTES = 26097
 
 BAR_MS = 4 * 3600 * 1000
 T0 = 1_600_000_000_000        # 2020-09-13T12:26:40Z, an arbitrary 4h-grid origin
@@ -82,10 +88,10 @@ def plateau_breakout_bars() -> List[strategy.Bar]:
     * 420 bars around 100 with the oscillation *contracting*, so `band` keeps
       making new lows and the 250-bar 20th percentile is met for a long run
       (a squeeze cannot exist before bar 369 — 250 window + 120 warmup).
-    * a 4.2% gap up at bar 420: close is above the previous bar's six-mean
+    * a 2.7% gap up at bar 420: close is above the previous bar's six-mean
       max while the means are still at the old level -> long, stop distance
-      ~4% (inside [1.5%, 10%]).
-    * 320 bars around 104.2 so the squeeze can re-form, then a 8% gap down at
+      ~2.6% (inside [1.5%, 3.5%]).
+    * 320 bars around 102.7 so the squeeze can re-form, then a 3.1% gap down at
       bar 740 with close below SMA200 -> short.
 
     Two signals, one per side, at known indices — enough to pin the entry and
@@ -99,7 +105,7 @@ def plateau_breakout_bars() -> List[strategy.Bar]:
         open_ = 100.0 * (1 + prev_amp / 100.0 * math.sin((i - 1) / 5.0)) if i else close
         bars.append(_bar(len(bars), open_, close))
 
-    for leg_level, leg_len in ((104.2, 320), (95.8, 60)):
+    for leg_level, leg_len in ((102.7, 320), (99.6, 60)):
         for k in range(leg_len):
             close = leg_level * (1 + 0.0002 * math.sin(k / 4.0))
             open_ = bars[-1].close if k == 0 else leg_level * (1 + 0.0002 * math.sin((k - 1) / 4.0))
@@ -312,7 +318,7 @@ class ReferenceParityTest(unittest.TestCase):
         判据在 `evaluate_entry`：`close < ma_min[i-1]` 破位后，还必须
         `close < SMA200[i]`；SMA200 缺失（预热不足）同样拒绝（fail-closed）。
         这里用最小可读的数据直接钉住三种情形：过滤成立 / 收盘在 MA200 上方被挡 /
-        MA200 算不出来被挡。止损距离用 2.5% 确保不会因为 [1.5%, 10%] 而误判。
+        MA200 算不出来被挡。止损距离用 ~3.2% 确保不会因为 [1.5%, 3.5%] 而误判。
         """
         from app.strategy import Bar, evaluate_entry, REGIME_MA
 
@@ -321,7 +327,7 @@ class ReferenceParityTest(unittest.TestCase):
                     close=100.0, volume=1.0) for i in range(3)]
         bars[2] = Bar(open_ms=2 * BAR_MS, open=100.0, high=101.0, low=96.0,
                       close=97.0, volume=1.0)          # 收盘 97 < 下轨 99 → 破位
-        base = {"ma_max": [None, 101.0, 102.5], "ma_min": [None, 99.0, 97.0],
+        base = {"ma_max": [None, 101.0, 100.2], "ma_min": [None, 99.0, 97.0],
                 "band": [None, 0.02, 0.03], "sma200": [None, 90.0, 90.0]}
 
         def run(sma200: float = 90.0, ma_min_prev: float = 99.0):
@@ -335,7 +341,7 @@ class ReferenceParityTest(unittest.TestCase):
         self.assertIsNone(allowed, "收盘 97 高于 SMA200 90，做空必须被挡")
         below = run(sma200=120.0)             # 收盘 97 < 120 → 过滤成立
         self.assertIsNotNone(below, "收盘 97 低于 SMA200 120，应给出做空信号")
-        self.assertEqual((below.side, round(below.stop_dist, 4)), (-1, 0.0567))
+        self.assertEqual((below.side, round(below.stop_dist, 4)), (-1, 0.033))
         missing = run(sma200=None)            # 预热不足 → fail-closed
         self.assertIsNone(missing, "SMA200 未算出时不得做空")
 
@@ -354,22 +360,32 @@ class FrozenSnapshotTest(unittest.TestCase):
     # (bar_index, bar_open_ms, side, entry_price, stop_price) — verified against
     # crypto-ma-alert/app/strategy.py AND tests/reference_strategy.py before
     # being written down. Do not regenerate these from the code under test.
+    # v2 (2026-10-30, STOP_MAX 0.10 -> 0.035): both literals still land inside
+    # [1.5%, 3.5%] (2.61% / 3.09%), so the snapshot moved only where the
+    # fixture geometry moved; the values were re-taken with both
+    # implementations standing on the same rule text and agreeing pairwise.
     EXPECTED_PLATEAU = (
-        (420, T0 + 420 * BAR_MS, 1, 104.2, 100.03379333333334),
-        (740, T0 + 740 * BAR_MS, -1, 95.8, 104.13085333333333),
+        (420, T0 + 420 * BAR_MS, 1, 102.7, 100.02129333333333),
+        (740, T0 + 740 * BAR_MS, -1, 99.6, 102.67501250000001),
     )
     EXPECTED_PLATEAU_DIGEST = (
-        "d524b786dc8d02c940861e4e93f793ad0c92d4b3db92316555916848473517b4"
+        "2ea752086f80d4e52755ba9eae30e54e9a81da589165aa56ba617dac97f2f547"
     )
 
-    # Seeded walk (seed=11): 33 consecutive long signals, bars 666..698. The
-    # digest covers every signal's (index, open_ms, side, entry, stop) exactly,
-    # so a change in any one of them fails without listing all 33 rows.
-    EXPECTED_WALK_11_COUNT = 33
+    # Seeded walk (seed=11): 25 long signals between bars 666 and 694 (v2: the
+    # entries beyond the 3.5% stop cap drop out, and the surviving run is no
+    # longer contiguous — 683 和 687–689 落在那条上限之外). The digest covers
+    # every signal's (index, open_ms, side, entry, stop) exactly, so a change in
+    # any one of them fails without listing all 25 rows.
+    EXPECTED_WALK_11_COUNT = 25
+    EXPECTED_WALK_11_INDICES = (
+        666, 667, 668, 669, 670, 671, 672, 673, 674, 675, 676, 677, 678, 679,
+        680, 681, 682, 684, 685, 686, 690, 691, 692, 693, 694,
+    )
     EXPECTED_WALK_11_FIRST = (666, T0 + 666 * BAR_MS, 1, 121.3621, 117.89595166666666)
-    EXPECTED_WALK_11_LAST = (698, T0 + 698 * BAR_MS, 1, 123.6346, 118.75354999999999)
+    EXPECTED_WALK_11_LAST = (694, T0 + 694 * BAR_MS, 1, 122.7155, 118.63518083333334)
     EXPECTED_WALK_11_DIGEST = (
-        "0635d963aa64cc24ec7ba6c968afb9c8933347287e82da5643c472026b6055e9"
+        "9dc51ad7bd35497c4acba7549ee290adb08e4da09085c9723d9a10d63a8d2aee"
     )
 
     @staticmethod
@@ -394,7 +410,7 @@ class FrozenSnapshotTest(unittest.TestCase):
         signals = strategy.scan(walk_bars(11), symbol="SYN", sides=(1, -1))
         self.assertEqual(len(signals), self.EXPECTED_WALK_11_COUNT)
         self.assertEqual([s.bar_index for s in signals],
-                         list(range(666, 666 + self.EXPECTED_WALK_11_COUNT)))
+                         list(self.EXPECTED_WALK_11_INDICES))
         self.assertEqual(_signal_tuples(signals)[0][:5], self.EXPECTED_WALK_11_FIRST)
         self.assertEqual(_signal_tuples(signals)[-1][:5], self.EXPECTED_WALK_11_LAST)
         self.assertEqual(self._digest(signals), self.EXPECTED_WALK_11_DIGEST)

@@ -27,7 +27,8 @@ nothing. Two independent things are therefore asserted in the test module:
   six-mean min (and close < SMA200) -> short
 - fill / entry price = next bar's open
 - stop = *this* bar's six-mean min (long) / max (short); the stop distance must
-  land inside [1.5%, 10%] or the signal is dropped
+  land inside [1.5%, 3.5%] or the signal is dropped (v2, 2026-10-30: the upper
+  bound moved 10% -> 3.5%; this file tracks `app/strategy.py`'s rule text)
 
 **Never edit this file to make a failing test pass.** If it disagrees with
 `app/strategy.py`, `app/strategy.py` is the thing under test and the frozen
@@ -45,7 +46,7 @@ BAND_WINDOW = 250
 BAND_QUANTILE = 0.20
 MIN_SQUEEZE_BARS = 6
 STOP_MIN = 0.015
-STOP_MAX = 0.10
+STOP_MAX = 0.035            # v2（2026-10-30）与 app/strategy.py 同口径
 REGIME_MA = 200
 
 

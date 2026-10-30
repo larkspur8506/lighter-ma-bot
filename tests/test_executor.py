@@ -60,16 +60,17 @@ BTC_INFO = spec(BTC).as_market_info()          # pdec=1 / sdec=5
 ETH_INFO = spec("ETH").as_market_info()
 
 # 冻结引擎在 `plateau_breakout_bars()` 上的第一个信号：bar 420（做多）。
-# 手算参考（equity=10000、risk_pct=1.33%、BTC）：
-#   入场参考价 = bars[421].open = 104.2
+# 手算参考（equity=10000、risk_pct=1.33%、BTC；v2 夹具把跳空收到 2.7%，
+# 使止损距离 2.61% 落在 [1.5%, 3.5%] 之内）：
+#   入场参考价 = bars[421].open = 102.7
 #   止损       = ma_min@419 → 对齐到 1 位小数（多单 ceil）= 100.1 → stop_price_int = 1001
-#   数量       = 10000 × 1.33% ÷ (104.2 − 100.1) = 32.43902… → floor 到 5 位 = 3243902
+#   数量       = 10000 × 1.33% ÷ (102.7 − 100.1) = 51.15384… → floor 到 5 位 = 5115384
 FULL = plateau_breakout_bars()
 SIGNAL_BARS = FULL[:421]                       # 最后一根已收盘 bar = 420 = 信号 bar
 NEXT_BAR = FULL[421]                           # 正在形成的 bar：open = 入场参考价
-ENTRY_REF = 104.2
-PLAN_QTY_INT = 3_243_902
-ENTRY_PRICE_INT = 1042                         # to_int_price(104.2, 1)
+ENTRY_REF = 102.7
+PLAN_QTY_INT = 5_115_384
+ENTRY_PRICE_INT = 1027                         # to_int_price(102.7, 1)
 STOP_PRICE_INT = 1001                          # to_int_price(100.1, 1)
 
 
@@ -457,7 +458,7 @@ class NormalTickTests(Base):
         self.assertEqual(row["side"], 1)
         self.assertEqual(row["qty_int"], PLAN_QTY_INT)
         self.assertEqual(row["size_decimals"], 5)
-        self.assertEqual(row["entry_price_int"], ENTRY_PRICE_INT)       # 104.2 → 1042
+        self.assertEqual(row["entry_price_int"], ENTRY_PRICE_INT)       # 102.7 → 1027
         self.assertEqual(row["stop_price_int"], STOP_PRICE_INT)
         self.assertEqual(row["bar_ms"], SIGNAL_BARS[-1].open_ms)
         self.assertEqual(row["entry_order_id"],
@@ -1653,18 +1654,19 @@ class LiveReferencePriceTests(Base):
     """
 
     def test_entry_bound_uses_the_live_mid_not_the_bar_close(self):
-        # 信号价 104.2（bar close），发单时 mid 已经跑到 106.0
-        self.market.mids[BTC] = 106.0
+        # 信号价 102.7（bar close），发单时 mid 已经跑到 105.0（+2.2%，仍在 3% 脏数据
+        # 闸门之内，否则会走 `live_quote_rejected` 退回信号价）
+        self.market.mids[BTC] = 105.0
         ex = self.make_executor(fill_confirm_s=0)
         self.run_tick(ex)
 
         sent = self.exchange.entries[0]
-        self.assertEqual(sent["limit_price_int"], 1060, "锚必须是实时 mid 的整数 tick")
+        self.assertEqual(sent["limit_price_int"], 1050, "锚必须是实时 mid 的整数 tick")
         self.assertNotEqual(sent["limit_price_int"], ENTRY_PRICE_INT,
-                            "不能再用 bar 收盘（104.2）当锚")
+                            "不能再用 bar 收盘（102.7）当锚")
         # 真正发出去的最差价 = mid × (1+30bp)，买侧向上取整
         from app.exchange import DEFAULT_ENTRY_SLIPPAGE_BPS, worst_price_int
-        self.assertEqual(worst_price_int(1060, DEFAULT_ENTRY_SLIPPAGE_BPS, is_ask=False), 1064)
+        self.assertEqual(worst_price_int(1050, DEFAULT_ENTRY_SLIPPAGE_BPS, is_ask=False), 1054)
 
     def test_entry_falls_back_to_the_bar_close_when_the_quote_fails(self):
         self.market.snapshot_error = RuntimeError("book exploded")
@@ -1676,7 +1678,7 @@ class LiveReferencePriceTests(Base):
 
     def test_wild_quote_is_rejected(self):
         """实时价离信号价 >3% ⇒ 当脏数据，退回信号价（不许拿离谱价格下真单）。"""
-        self.market.mids[BTC] = 120.0          # 信号价 104.2 → +15%
+        self.market.mids[BTC] = 120.0          # 信号价 102.7 → +17%
         ex = self.make_executor(fill_confirm_s=0)
         self.run_tick(ex)
         self.assertIsNone(self.exchange.entries[0]["limit_price_int"])

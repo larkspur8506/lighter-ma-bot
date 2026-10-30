@@ -76,7 +76,7 @@ API = MAINNET_API
 CANDLES_URL = f"{API}/candles"           # kept for anyone grepping the endpoint
 DETAILS_URL = f"{API}/orderBookDetails"
 
-STOP_MIN, STOP_MAX = 0.015, 0.10
+STOP_MIN, STOP_MAX = 0.015, 0.035    # v2（2026-10-30）与 `app.strategy` 同一组常数；两处都写死，改一处必须同步另一处
 DEFAULT_SYMBOLS = "BTC,ETH,SOL"
 
 

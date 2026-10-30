@@ -42,14 +42,14 @@ BAR_MS = 4 * 3600 * 1000
 T0 = 1_600_000_000_000            # 任意 4h 栅格原点（与真实数据的 t 同量级）
 BTC_INFO = spec("BTC").as_market_info()      # pdec=1 / sdec=5 / mif=200 / min_quote=10
 
-# 手算参考（equity=10000、BTC）
-#   止损距离 = 104.2 − 100.0338 = 4.1662
-#   数量     = 10000 × 1.33% ÷ 4.1662 = 31.928 … → 精度 floor 后见 plan 断言
+# 手算参考（equity=10000、BTC；策略 v2 夹具：跳空 2.7%，止损距离 2.6083%）
+#   止损距离 = 102.7 − 100.0213 = 2.6787 → 对齐后 102.7 − 100.1 = 2.6
+#   数量     = 10000 × 1.33% ÷ 2.6 = 51.153846… → 精度 floor 后见 plan 断言
 # 下面这些数字来自 `strategy.scan(plateau_breakout_bars())` 的真实信号（见
 # `EntryDecisionTests.test_real_signal_produces_an_entry_intent_with_exact_numbers`）。
-PLAN_QTY_INT = 3243902            # 32.43902 @ size_decimals=5
-PLAN_NOTIONAL = 3380.145884       # 32.43902 × 104.2
-# 风险额 = 32.43902 × (104.2 − 100.1) = 132.999982（floor 之后略小于目标 133）
+PLAN_QTY_INT = 5115384            # 51.15384 @ size_decimals=5
+PLAN_NOTIONAL = 5253.499368       # 51.15384 × 102.7
+# 风险额 = 51.15384 × (102.7 − 100.1) = 132.999984（floor 之后略小于目标 133）
 
 
 # --------------------------------------------------------------------------- 夹具
@@ -209,8 +209,8 @@ class EntryDecisionTests(StoreCase):
     def test_real_signal_produces_an_entry_intent_with_exact_numbers(self):
         bars, sig = real_signal()
         self.assertEqual((sig.bar_index, sig.side), (420, 1))
-        self.assertAlmostEqual(sig.entry_price, 104.2, places=10)
-        self.assertAlmostEqual(sig.stop_price, 100.03379333333334, places=10)
+        self.assertAlmostEqual(sig.entry_price, 102.7, places=10)
+        self.assertAlmostEqual(sig.stop_price, 100.02129333333333, places=10)
 
         d = lifecycle.decide_entry(sig, equity=10000.0, market_info=BTC_INFO,
                                    risk_state=risk_state(), bars=bars, i=sig.bar_index)
@@ -220,15 +220,15 @@ class EntryDecisionTests(StoreCase):
         self.assertEqual(d.rejections, ())
         self.assertEqual(d.bar_ms, sig.bar_open_ms)
         self.assertEqual(d.side, 1)
-        # 定仓：10000 × 1.33% ÷ 4.1662 → 数量 floor 到 5 位小数 → × 104.2
+        # 定仓：10000 × 1.33% ÷ 2.6 → 数量 floor 到 5 位小数 → × 102.7
         self.assertEqual(d.qty_int, PLAN_QTY_INT)
-        self.assertAlmostEqual(d.plan.base_qty, 32.43902, places=8)
+        self.assertAlmostEqual(d.plan.base_qty, 51.15384, places=8)
         self.assertAlmostEqual(d.notional, PLAN_NOTIONAL, places=6)
-        self.assertAlmostEqual(d.plan.risk_amount, 132.999982, places=6)
+        self.assertAlmostEqual(d.plan.risk_amount, 132.999984, places=6)
         self.assertEqual(d.plan.stop_price, 100.1)                   # 多单止损 ceil 到 1 位小数
         self.assertEqual(d.plan.stop_price_int, 1001)
         self.assertEqual(d.plan.leverage, 5.0)
-        self.assertAlmostEqual(d.plan.margin, 676.0291768, places=6)
+        self.assertAlmostEqual(d.plan.margin, 1050.6998736, places=6)
         self.assertEqual(d.detail["stage"], "approved")
 
     def test_sizing_runs_before_risk_and_risk_sees_the_sized_notional(self):
@@ -251,7 +251,7 @@ class EntryDecisionTests(StoreCase):
             d = lifecycle.decide_entry(sig, equity=10000.0, market_info=BTC_INFO,
                                        risk_state=risk_state(), bars=bars, i=sig.bar_index)
         self.assertEqual(d.action, lifecycle.ACTION_ENTRY)
-        self.assertEqual(calls, [("sizing", "BTC"), ("risk", 3380.145884)])
+        self.assertEqual(calls, [("sizing", "BTC"), ("risk", 5253.499368)])
 
     def test_sizing_rejection_skips_risk_entirely(self):
         """sizing 先跑：它拒了就没有名义可问，risk 根本不该被调用（更不该放行）。"""
@@ -266,9 +266,9 @@ class EntryDecisionTests(StoreCase):
         self.assertEqual(len(d.rejections), 1)
         rej = d.rejections[0]
         self.assertEqual(rej.stage, lifecycle.STAGE_SIZING)
-        self.assertEqual(rej.code, REJECT_BELOW_MIN_QUOTE)     # 3.38 名义 < min_quote 10
+        self.assertEqual(rej.code, REJECT_BELOW_MIN_QUOTE)     # 5.25 名义 < min_quote 10
         self.assertIn("min_quote_amount", rej.detail)
-        self.assertAlmostEqual(rej.detail["notional"], 3.379206, places=6)
+        self.assertAlmostEqual(rej.detail["notional"], 5.253105, places=6)
 
     def test_daily_loss_limit_blocks_new_entries(self):
         """当日亏 10%（> 5% 上限）→ 拒开仓，理由结构化。"""
@@ -283,8 +283,8 @@ class EntryDecisionTests(StoreCase):
         self.assertEqual(d.rejections[0].detail["equity"], 9000.0)
         # 定仓本身是成功的（plan 保留给面板看），只是被风控挡下
         self.assertIsNotNone(d.plan)
-        self.assertEqual(d.qty_int, 2919512)          # 9000 × 1.33% ÷ 4.1662 → floor(…,5)
-        self.assertAlmostEqual(float(d.notional or 0.0), 3042.131504, places=6)
+        self.assertEqual(d.qty_int, 4603846)          # 9000 × 1.33% ÷ 2.6 → floor(…,5)
+        self.assertAlmostEqual(float(d.notional or 0.0), 4728.149842, places=6)
 
     def test_drawdown_kill_blocks_new_entries(self):
         """TWR 回撤 30% = 1.33% 档的熔断线 → 拒开仓。"""
@@ -664,11 +664,11 @@ class RoundTripTests(StoreCase):
         self.assertEqual(row["bar_ms"], d.bar_ms)
 
         sig_bar = int(row["bar_ms"])
-        bars = flat_bars(sig_bar, 45, 104.2)                  # 与入场同价的平盘
-        bars[44] = strategy.Bar(open_ms=sig_bar + 44 * BAR_MS, open=104.2, high=104.7,
+        bars = flat_bars(sig_bar, 45, 102.7)                  # 与入场同价的平盘
+        bars[44] = strategy.Bar(open_ms=sig_bar + 44 * BAR_MS, open=102.7, high=103.2,
                                 low=101.9, close=102.0)       # 102 > 止损 100.1，只破 SMA20
         ind = strategy.compute_indicators(bars)
-        self.assertAlmostEqual(ind["sma20"][44], 104.09, places=9)   # (19×104.2+102)/20
+        self.assertAlmostEqual(ind["sma20"][44], 102.665, places=9)   # (19×102.7+102)/20
 
         exit_decision = self.lc.decide("BTC", bars, ind=ind, equity=10000.0,
                                        market_info=BTC_INFO, risk_state=risk_state())
@@ -681,12 +681,12 @@ class RoundTripTests(StoreCase):
         closed = self.store.position(pid)
         self.assertEqual(closed["state"], "CLOSED")
         self.assertEqual(closed["exit_price_int"], 1020)              # 1 位小数 → 102.0
-        # pnl = (102 − 104.2) × 32.43902 = −71.365844
-        self.assertAlmostEqual(closed["net_pnl"], -71.365844, places=6)
+        # pnl = (102 − 102.7) × 51.15384 = −35.807688
+        self.assertAlmostEqual(closed["net_pnl"], -35.807688, places=6)
         self.assertEqual(closed["exit_reason"], "exit")
 
         legs = [(t["kind"], t["price"]) for t in reversed(self.store.trades())]
-        self.assertEqual(legs, [("entry", 104.2), ("exit", 102.0)])
+        self.assertEqual(legs, [("entry", 102.7), ("exit", 102.0)])
         self.assertEqual(self.lc.state("BTC"), lifecycle.IDLE)
         self.assertEqual(self.store.audit(), [])                      # T5 的不变式全过
         self.assertEqual(len(self.transition_events()), 3)
@@ -695,8 +695,8 @@ class RoundTripTests(StoreCase):
         _d, _tr, row = self.enter(ts=1760000000.0)
         pid = int(row["id"])
         sig_bar = int(row["bar_ms"])
-        bars = flat_bars(sig_bar, 45, 104.2)
-        bars[44] = strategy.Bar(open_ms=sig_bar + 44 * BAR_MS, open=104.2, high=104.7,
+        bars = flat_bars(sig_bar, 45, 102.7)
+        bars[44] = strategy.Bar(open_ms=sig_bar + 44 * BAR_MS, open=102.7, high=103.2,
                                 low=99.5, close=100.0)        # low 99.5 ≤ 止损 100.1
         ind = strategy.compute_indicators(bars)
         d = self.lc.decide("BTC", bars, ind=ind, equity=10000.0, market_info=BTC_INFO,
@@ -706,8 +706,8 @@ class RoundTripTests(StoreCase):
         closed = self.store.position(pid)
         self.assertEqual(closed["exit_price_int"], 1001)             # 止损价 100.1
         self.assertEqual(closed["exit_reason"], "stop")
-        # pnl = (100.1 − 104.2) × 32.43902 = −132.999982
-        self.assertAlmostEqual(closed["net_pnl"], -132.999982, places=6)
+        # pnl = (100.1 − 102.7) × 51.15384 = −132.999984
+        self.assertAlmostEqual(closed["net_pnl"], -132.999984, places=6)
         self.assertEqual([t["kind"] for t in reversed(self.store.trades())], ["entry", "stop"])
         self.assertEqual(self.store.audit(), [])
 
