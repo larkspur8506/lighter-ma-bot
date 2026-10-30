@@ -107,6 +107,8 @@ testnet → 300）；本模块显式传 `LIGHTER_ENVIRONMENT` 对应的值之后
 ========================================================================
 
 * **入场 = MARKET + IOC，`price` = 最差可接受价**（PLAN 差异表「IO limit + 滑点上限」）。
+  锚（参考价）由调用方用 `limit_price_int` 传：**执行器传下单那一刻的实时 mid**；
+  缺省才是 `plan.entry_price`（上一根 bar 的收盘，会滞后 3~4 分钟）。
   Lighter 的 `ORDER_TYPE_MARKET` 语义就是「在 `price` 以内立即成交，成交不了的部分撤掉」
   （docs `api/orders`：taker 单的 `price` 是 worst acceptable price）。用 MARKET/IOC
   而不是 GTT limit 的理由：这是**信号触发的追价单**，留着挂单会让系统在下一根 bar
@@ -750,11 +752,16 @@ def build_exit_order(*, symbol: str, market_id: int, side: int, qty_int: int,
                      price_decimals: int, exit_price: float, now_ms: int,
                      bar_ms: Optional[int] = None,
                      slippage_bps: int = DEFAULT_EXIT_SLIPPAGE_BPS,
-                     client_order_index: Optional[int] = None) -> OrderSpec:
+                     client_order_index: Optional[int] = None,
+                     limit_price_int: Optional[int] = None) -> OrderSpec:
     """信号离场单：MARKET + IOC + **reduce_only**（只减仓，永不反手）。
 
     `side` 是**持仓**方向（+1 多），订单方向自动取反（卖平多）。这一点很容易写错，
     所以参数名用 `side` 而不是 `is_ask`，并在这里显式换算。
+
+    `limit_price_int` = **参考价**（整数 tick）：给了就用它算最差价，否则用 `exit_price`。
+    2026-10-30 起执行器传的是**下单那一刻的实时 mid**（`exit_price` 是上一根 bar 的收盘，
+    4h 级别，离发单已有几分钟 ⇒ 拿它当锚会把滑点带宽吃光，和入场同一个坑）。
     """
     if side not in (1, -1):
         raise ValueError(f"side must be +1 or -1, got {side!r}")
@@ -762,7 +769,9 @@ def build_exit_order(*, symbol: str, market_id: int, side: int, qty_int: int,
     qty = _check_int(qty_int, "qty_int", minimum=1)
     mid = _check_int(market_id, "market_id", minimum=0)
     bps = _check_int(slippage_bps, "slippage_bps", minimum=0)
-    base = price_int_from_float(exit_price, int(price_decimals))
+    base = (limit_price_int if limit_price_int is not None
+            else price_int_from_float(exit_price, int(price_decimals)))
+    base = _check_int(base, "limit_price_int", minimum=1)
     coi = _resolve_coi(client_order_index, symbol, bar_ms, now, "exit")
     order_side = -side                                  # 多单平仓 = 卖出
     return OrderSpec(
@@ -1483,13 +1492,14 @@ class ExchangeClient:
     async def place_exit(self, *, symbol: str, market_id: int, side: int, qty_int: int,
                          price_decimals: int, exit_price: float,
                          bar_ms: Optional[int] = None,
-                         client_order_index: Optional[int] = None) -> OrderResult:
-        """信号平仓（reduce_only + MARKET/IOC）。"""
+                         client_order_index: Optional[int] = None,
+                         limit_price_int: Optional[int] = None) -> OrderResult:
+        """信号平仓（reduce_only + MARKET/IOC）。`limit_price_int` = 参考价（实时 mid）。"""
         spec = build_exit_order(
             symbol=symbol, market_id=market_id, side=side, qty_int=qty_int,
             price_decimals=price_decimals, exit_price=exit_price, now_ms=self._now_ms(),
             bar_ms=bar_ms, slippage_bps=self.exit_slippage_bps,
-            client_order_index=client_order_index)
+            client_order_index=client_order_index, limit_price_int=limit_price_int)
         return await self._submit(spec)
 
     async def cancel_all(self, market_id: int) -> OrderResult:

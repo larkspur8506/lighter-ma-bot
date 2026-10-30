@@ -111,6 +111,22 @@ class FakeMarket:
         self.feeds = dict(feeds)
         self.calls = []
         self.fail_on = set()
+        #: `snapshot()` 用：symbol -> 实时 mid（不给 = 没有 snapshot 方法，执行器退回计划价）
+        self.mids = {}
+        self.snapshot_error = None
+        self.snapshot_calls = []
+
+    def snapshot(self, symbol, **kwargs):
+        from types import SimpleNamespace
+        self.snapshot_calls.append(symbol)
+        if self.snapshot_error is not None:
+            raise self.snapshot_error
+        mid = self.mids.get(str(symbol).upper())
+        if mid is None:
+            return SimpleNamespace(symbol=symbol, mid=None, price=None, best_bid=None,
+                                   best_ask=None)
+        return SimpleNamespace(symbol=symbol, mid=float(mid), price=float(mid),
+                               best_bid=float(mid) - 0.05, best_ask=float(mid) + 0.05)
 
     def bars(self, symbol, *, now_ms=None, **kwargs):
         self.calls.append(symbol)
@@ -185,7 +201,8 @@ class FakeExchange:
         coi = coi_of(plan.symbol, int(bar_ms), "entry")
         self.entries.append({"symbol": plan.symbol, "side": plan.side,
                              "qty_int": plan.qty_int, "market_id": plan.market_id,
-                             "bar_ms": int(bar_ms), "coi": coi})
+                             "bar_ms": int(bar_ms), "coi": coi,
+                             "limit_price_int": kw.get("limit_price_int")})
         if not self.dry_run and "entry" not in self.no_fill:
             # dry-run 什么也没发 → 交易所侧不产生仓位；
             # `no_fill` = tx executed 但零成交（2026-10-30 线上事故的形态）
@@ -231,11 +248,13 @@ class FakeExchange:
         return result if removed else result
 
     async def place_exit(self, *, symbol, market_id, side, qty_int, price_decimals,
-                         exit_price, bar_ms=None, client_order_index=None):
+                         exit_price, bar_ms=None, client_order_index=None,
+                         limit_price_int=None):
         if "exit" in self.reject:
             return self.reject["exit"]
         self.exits.append({"symbol": symbol, "side": int(side), "qty_int": int(qty_int),
-                           "exit_price": float(exit_price), "bar_ms": int(bar_ms)})
+                           "exit_price": float(exit_price), "bar_ms": int(bar_ms),
+                           "limit_price_int": limit_price_int})
         if "exit" not in self.no_fill:          # no_fill：受理了但仓位还在
             self.positions.pop(symbol, None)
             self.orders = [o for o in self.orders if o.symbol != symbol]
@@ -1624,6 +1643,58 @@ class GraceSettlementTests(Base):
         self.assertIn("trades_unavailable", [e["kind"] for e in self.events()])
 
 
+
+
+class LiveReferencePriceTests(Base):
+    """最差价的锚 = 下单那一刻的实时 mid（对齐 HL 的 slippage_limit 口径）。
+
+    2026-10-30 的对照：同一根信号，HL 用「实时 mid ± 0.3%」⇒ 以 99.446 成交（比收盘价
+    差 39bp）；Lighter 用「4h 收盘 ± 0.3%」= 99.535，而市价已 99.1 ⇒ 零成交。
+    """
+
+    def test_entry_bound_uses_the_live_mid_not_the_bar_close(self):
+        # 信号价 104.2（bar close），发单时 mid 已经跑到 106.0
+        self.market.mids[BTC] = 106.0
+        ex = self.make_executor(fill_confirm_s=0)
+        self.run_tick(ex)
+
+        sent = self.exchange.entries[0]
+        self.assertEqual(sent["limit_price_int"], 1060, "锚必须是实时 mid 的整数 tick")
+        self.assertNotEqual(sent["limit_price_int"], ENTRY_PRICE_INT,
+                            "不能再用 bar 收盘（104.2）当锚")
+        # 真正发出去的最差价 = mid × (1+30bp)，买侧向上取整
+        from app.exchange import DEFAULT_ENTRY_SLIPPAGE_BPS, worst_price_int
+        self.assertEqual(worst_price_int(1060, DEFAULT_ENTRY_SLIPPAGE_BPS, is_ask=False), 1064)
+
+    def test_entry_falls_back_to_the_bar_close_when_the_quote_fails(self):
+        self.market.snapshot_error = RuntimeError("book exploded")
+        ex = self.make_executor(fill_confirm_s=0)
+        self.run_tick(ex)
+        self.assertIsNone(self.exchange.entries[0]["limit_price_int"])
+        self.assertIn("live_quote_failed", [e["kind"] for e in self.events()])
+        self.assertEqual(len(self.store.open_positions()), 1, "报价失败不许阻断开仓")
+
+    def test_wild_quote_is_rejected(self):
+        """实时价离信号价 >3% ⇒ 当脏数据，退回信号价（不许拿离谱价格下真单）。"""
+        self.market.mids[BTC] = 120.0          # 信号价 104.2 → +15%
+        ex = self.make_executor(fill_confirm_s=0)
+        self.run_tick(ex)
+        self.assertIsNone(self.exchange.entries[0]["limit_price_int"])
+        self.assertIn("live_quote_rejected", [e["kind"] for e in self.events()])
+
+    def test_exit_bound_uses_the_live_mid_without_a_deviation_guard(self):
+        """减仓单必须追着现在的价格走：离得再远也不许退回止损价/收盘价。"""
+        bars = stop_hit_bars()
+        self.market.feeds[BTC] = bars_result(bars, unclosed=())
+        self.seed_position(entry_price_int=1120, stop_price_int=1050, bar_ms=T0,
+                           qty_int=415600)
+        self.exchange.positions[BTC] = {"side": 1, "qty_int": 415600, "market_id": 1}
+        self.exchange.orders = []
+        self.market.mids[BTC] = 96.0           # 比止损价 105 低 8.6%
+        ex = self.make_executor(fill_confirm_s=0)
+        self.run_tick(ex)
+        self.assertEqual(self.exchange.exits[0]["limit_price_int"], 960)
+        self.assertNotIn("live_quote_rejected", [e["kind"] for e in self.events()])
 
 if __name__ == "__main__":                                        # pragma: no cover
     unittest.main()

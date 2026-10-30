@@ -152,6 +152,10 @@ DEFAULT_FILL_POLL_INTERVAL_S = 1.5
 #: `grace` 连续多少轮仍未结案就作废幽灵仓（tick 间隔 30 分钟 ⇒ 默认 2 轮 = 约 1 小时）。
 DEFAULT_GRACE_TICKS = 2
 
+#: 实时参考价与「计划价」允许的最大偏离。超过它就把实时报价当不可信（错标的/脏盘口），
+#: 退回计划价并落事件 —— 宁可用旧锚，也不拿一个离谱的价格去下真单。
+DEFAULT_LIVE_REF_MAX_DEVIATION = 0.03
+
 
 # ------------------------------------------------------------------ 异常
 
@@ -1359,6 +1363,7 @@ class Executor:
                  fill_confirm_s: float = DEFAULT_FILL_CONFIRM_S,
                  fill_poll_interval_s: float = DEFAULT_FILL_POLL_INTERVAL_S,
                  grace_ticks: int = DEFAULT_GRACE_TICKS,
+                 live_ref_max_deviation: float = DEFAULT_LIVE_REF_MAX_DEVIATION,
                  sleeper: Optional[Callable[[float], Awaitable[None]]] = None,
                  alert: Optional[Callable[[str, str], Any]] = None,
                  clock: Callable[[], float] = time.time,
@@ -1406,6 +1411,8 @@ class Executor:
         #: 成交回报里能找到真实平仓成交时，第一轮就按 stop/exit 结案（不看这个计数）。
         self.grace_ticks = max(1, int(grace_ticks))
         self._grace_seen: Dict[int, int] = {}
+        #: 实时参考价的偏离闸（见 `DEFAULT_LIVE_REF_MAX_DEVIATION`）。
+        self.live_ref_max_deviation = max(0.0, float(live_ref_max_deviation))
         self._sleep = sleeper if sleeper is not None else asyncio.sleep
         self.alert = alert
         self.clock = clock
@@ -1687,7 +1694,12 @@ class Executor:
             if not self._accepted(mode):
                 return self._reject(symbol, decision, mode, label="margin mode")
 
-        order = await self._place(self.exchange.place_entry(plan, bar_ms=bar_ms),
+        # 最差价的锚 = **下单那一刻的实时 mid**（不是 4h 收盘，见 _live_reference_int）
+        entry_ref = await self._live_reference_int(
+            symbol, int(plan.price_decimals), plan_price=float(plan.entry_price),
+            label="entry")
+        order = await self._place(self.exchange.place_entry(plan, bar_ms=bar_ms,
+                                                           limit_price_int=entry_ref),
                                   label=f"{symbol} entry")
         if not self._accepted(order):
             return self._reject(symbol, decision, order, label="entry")
@@ -1809,13 +1821,16 @@ class Executor:
         if str(row.get("state")).upper() == OPEN:
             self.lifecycle.begin_close(pid, reason=kind, bar_ms=bar_ms,
                                        ts=float(self.clock()))
+        # 离场同样锚实时 mid，但**不设偏离闸**：减仓单必须追着现在的市场价格走。
+        exit_ref = await self._live_reference_int(
+            symbol, price_decimals, plan_price=None, max_deviation=0.0, label=kind)
         order = await self._place(
             self.exchange.place_exit(symbol=symbol, market_id=int(row.get("market_id") or 0),
                                      side=int(row.get("side") or 0),
                                      qty_int=int(row.get("qty_int") or 0),
                                      price_decimals=price_decimals,
                                      exit_price=float(decision.exit_price or 0.0),
-                                     bar_ms=bar_ms),
+                                     bar_ms=bar_ms, limit_price_int=exit_ref),
             label=f"{symbol} {kind}")
         if not self._accepted(order):
             # 离场被拒 → 显式回退 CLOSING → OPEN（绝不静默把仓位当平掉）
@@ -1930,6 +1945,59 @@ class Executor:
     #     说 hold，幽灵仓就**永远**留着，占仓位槽、面板显示有仓、每轮报「止损未覆盖」。
     #     现在每个 grace 都当场结案：成交回报里有真实平仓成交 → 按 stop/exit 结案；
     #     确实一笔成交都没有（且成交窗口覆盖得住）→ 连续 N 轮后作废仓位行。
+
+    async def _live_reference_int(self, symbol: str, price_decimals: int, *,
+                                  plan_price: Optional[float] = None,
+                                  max_deviation: Optional[float] = None,
+                                  label: str = "entry") -> Optional[int]:
+        """下单那一刻的**实时 mid**（整数 tick）—— 订单最差价的锚。
+
+        为什么不再拿 bar 收盘当锚（2026-10-30 HL/Lighter 对照实测）：HL 的 IOC 限价是
+        `实时 mid × (1±0.3%)`，同样的 30bp 是**真滑点容忍度**；我们原先用「上一根 4h 收盘」
+        当锚，而 tick 在收盘后 3~4 分钟才发单 —— 这段漂移（实测 p90=18bp、max=58bp）先吃掉
+        带宽，剩下的容忍度是负的 ⇒ IOC 零成交。同一根信号：HL 20:03:20 以 99.446 成交
+        （比收盘价差 39bp），Lighter 20:03:51 要求 ≥99.535 而市价 99.1 ⇒ 一笔没成。
+
+        取不到/不可信（偏离 `max_deviation` 超过阈值）时返回 `None`：调用方退回计划价，
+        **不阻断**交易 —— 这只是锚的选择，不是交易前提。
+        """
+        snapshot_fn = getattr(self.market, "snapshot", None)
+        if snapshot_fn is None:
+            return None
+        try:
+            snap = await asyncio.to_thread(snapshot_fn, symbol)
+        except Exception as exc:                                  # noqa: BLE001 - 降级
+            self._event("live_quote_failed",
+                        f"{symbol}: live quote for the {label} is unavailable "
+                        f"({type(exc).__name__}: {exc}) — falling back to the bar close",
+                        symbol=symbol, data={"error": f"{type(exc).__name__}: {exc}",
+                                             "label": label})
+            return None
+        raw = getattr(snap, "mid", None)
+        if raw is None:
+            raw = getattr(snap, "price", None)
+        try:
+            mid = float(raw)
+        except (TypeError, ValueError):
+            mid = 0.0
+        if mid <= 0:
+            self._event("live_quote_failed",
+                        f"{symbol}: live quote for the {label} is not a positive price "
+                        f"({raw!r}) — falling back to the bar close",
+                        symbol=symbol, data={"raw": repr(raw), "label": label})
+            return None
+        limit = self.live_ref_max_deviation if max_deviation is None else max_deviation
+        if plan_price and plan_price > 0 and limit > 0:
+            deviation = abs(mid - float(plan_price)) / float(plan_price)
+            if deviation > limit:
+                self._event("live_quote_rejected",
+                            f"{symbol}: live mid {mid:g} is {deviation * 100:.2f}% away from "
+                            f"the signal price {float(plan_price):g} — falling back to it",
+                            symbol=symbol,
+                            data={"mid": mid, "plan_price": float(plan_price),
+                                  "deviation": deviation, "limit": limit, "label": label})
+                return None
+        return to_int_price(mid, int(price_decimals))
 
     async def _confirm_entry_fill(self, *, symbol: str, side: int, size_decimals: int,
                                   qty_int: int, timeout_s: float) -> Optional[int]:
