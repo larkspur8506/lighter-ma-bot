@@ -894,5 +894,56 @@ class PanelSnapshotTests(StoreTestCase):
             self.assertNotIn(token, source, f"app/store.py must not reference {token}")
 
 
+
+class VoidPositionTests(StoreTestCase):
+    """`void_position`：作废「本地有仓、交易所从未成交」的幽灵仓（2026-10-30 事故）。"""
+
+    def _phantom(self):
+        """一条本地开仓行 + 一行**未经成交回报确认**的开仓成交（fill_id 为空）。"""
+        result = self.store.record_entry(**entry_plan())
+        pid = int(result.position_id)
+        rows = self.store.trades(limit=5)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["fill_id"])
+        return pid
+
+    def test_void_closes_the_row_and_drops_unconfirmed_trades(self):
+        pid = self._phantom()
+        self.assertEqual(self.store.daily_counter(DAY)["trades_today"], 1)
+
+        out = self.store.void_position(pid, reason="no_fill", ts=TS + 60)
+        self.assertTrue(out.get("voided"))
+
+        row = self.store.position(pid)
+        self.assertEqual(row["state"], "CLOSED")
+        self.assertEqual(row["exit_reason"], "no_fill")
+        self.assertEqual(int(row["qty_int"]), 0)
+        self.assertEqual(row["closed_at"], TS + 60)
+        self.assertEqual(self.store.trade_count(), 0, "从未发生的成交必须删掉")
+        self.assertEqual(self.store.daily_counter(DAY)["trades_today"], 0,
+                         "计数行必须跟着事实回退")
+        kinds = [e["kind"] for e in self.store.events(limit=10)]
+        self.assertIn("position_voided", kinds)
+        self.assertEqual(self.store.audit(), [], "作废后账务不变式必须干净")
+
+    def test_void_refuses_when_the_exchange_confirmed_a_fill(self):
+        """有交易所成交回报（fill_id 非空）的仓位**绝不能**作废 —— 那是造假。"""
+        pid = self._phantom()
+        self.store.conn.execute("UPDATE trades SET fill_id='37135831346' WHERE position_id=?",
+                                (pid,))
+        self.store.conn.commit()
+        with self.assertRaises(StoreError):
+            self.store.void_position(pid, reason="no_fill", ts=TS + 60)
+        self.assertEqual(self.store.position(pid)["state"], "OPEN")
+        self.assertEqual(self.store.trade_count(), 1, "拒绝时必须原样回滚")
+
+    def test_void_is_idempotent(self):
+        pid = self._phantom()
+        self.store.void_position(pid, reason="no_fill", ts=TS + 60)
+        again = self.store.void_position(pid, reason="no_fill", ts=TS + 90)
+        self.assertTrue(again.idempotent)
+        self.assertEqual(self.store.position(pid)["state"], "CLOSED")
+
+
 if __name__ == "__main__":                                        # pragma: no cover
     unittest.main()

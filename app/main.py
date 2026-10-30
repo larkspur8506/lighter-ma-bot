@@ -509,6 +509,34 @@ def stop_guard_on(env: Optional[Mapping[str, str]] = None) -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def fill_confirm_seconds(env: Optional[Mapping[str, str]] = None) -> float:
+    """开仓后等「账户里真的出现仓位」的窗口（秒），默认 12（`LIGHTER_FILL_CONFIRM_S`）。
+
+    `sendTx` 的 code=200 只表示进了 sequencer，IOC 单可能「执行成功但零成交」——
+    开仓必须等到交易所侧真的出现仓位才记账（2026-10-30 幽灵仓事故的直接修法）。
+    `0` = 只读一次（立刻判）。负数/脏值退回默认。
+    """
+    raw = (env if env is not None else os.environ).get("LIGHTER_FILL_CONFIRM_S", "")
+    try:
+        value = float(str(raw).strip()) if str(raw).strip() else 12.0
+    except ValueError:
+        return 12.0
+    return value if value >= 0 else 12.0
+
+
+def grace_ticks(env: Optional[Mapping[str, str]] = None) -> int:
+    """`grace` 连续多少轮仍未结案就作废幽灵仓，默认 2（`LIGHTER_GRACE_TICKS`）。
+
+    成交回报里能找到真实平仓成交时**第一轮**就按 stop/exit 结案，不看这个计数。
+    """
+    raw = (env if env is not None else os.environ).get("LIGHTER_GRACE_TICKS", "")
+    try:
+        value = int(str(raw).strip()) if str(raw).strip() else 2
+    except ValueError:
+        return 2
+    return value if value >= 1 else 2
+
+
 def merge_accepted_stops(cache: PanelCache, report: Any) -> int:
     """把本轮「交易所已受理」的止损单并进面板的挂单缓存；返回并入张数。
 
@@ -1709,7 +1737,9 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
         executor = Executor(store=store, market=market, exchange=exchange, reader=reader,
                             symbols=symbols, limits=_limits(), alert=None,
                             stop_guard=stop_guard_on(),
-                            margin_isolated=isolated_margin_on())
+                            margin_isolated=isolated_margin_on(),
+                            fill_confirm_s=fill_confirm_seconds(),
+                            grace_ticks=grace_ticks())
         report = await executor.run_once()
         record_tick_outcomes(store, report, ts=time.time())
         # 面板复用本轮取到的 K 线：不额外取数、且与决策用同一份序列（含同一个起点）

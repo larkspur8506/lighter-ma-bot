@@ -1118,8 +1118,22 @@ class Panel:
         else:
             warnings.append("没有挂单数据源 —— 交易所侧状态记「未知」（不显示「在」）")
 
+        # 交易所侧「有没有这个标的的仓」—— 决定「止损没挂」还是「根本没有仓」。
+        # 2026-10-30 线上：入场单只被受理、从未成交 ⇒ 本地有仓、交易所空仓、止损自然也
+        # 挂不上，面板却报「止损未覆盖」；那不是缺止损，是缺仓位。两者必须分开说。
+        positions_known = self.sources.positions is not None and orders_known
+        exchange_positions: Dict[str, Any] = {}
+        if positions_known:
+            try:
+                exchange_positions = {str(k).upper(): v
+                                      for k, v in dict(self.sources.positions() or {}).items()}
+            except Exception as exc:                      # noqa: BLE001
+                positions_known = False
+                warnings.append(f"持仓 provider 失败: {type(exc).__name__}: {exc}")
+
         rows = list(store.open_positions())
         out: List[Dict[str, Any]] = []
+        not_on_exchange: List[str] = []
         for row in rows:
             symbol = str(_row_get(row, "symbol") or "").upper()
             stop = _finite(_row_get(row, "stop_price"))
@@ -1151,7 +1165,13 @@ class Panel:
             order_qty = None
             expiry_ts = _finite(_row_get(row, "stop_expiry_ts"))
             days_left = None if expiry_ts is None else round((expiry_ts - now) / 86400.0, 1)
-            if stop is None:
+            if positions_known and symbol not in exchange_positions:
+                # 交易所没有这个仓：入场很可能从未成交（或已被强平/手平）。
+                # 这里**不**报「止损未覆盖」——补一张 reduce-only 止损只是给不存在的仓挂单。
+                status, protected = "no_position", False
+                note = ("本地有仓、交易所**无仓**（入场很可能从未成交）"
+                        "—— 不是止损问题，等 tick 结案")
+            elif stop is None:
                 status, protected = "missing", False
                 note = "止损价缺失（仓位裸奔）"
             elif not orders_known:
@@ -1179,6 +1199,8 @@ class Panel:
                     if days_left is not None and days_left <= 7:
                         note += (f" · 止损将在 {days_left:g} 天后到期（系统会自动换单）"
                                  if days_left > 0 else " · 止损已过到期时刻（等下一轮补挂）")
+            if status == "no_position":
+                not_on_exchange.append(symbol)
             out.append({
                 "symbol": symbol, "position_id": _row_get(row, "id"),
                 "side": int(_row_get(row, "side") or 0),
@@ -1190,11 +1212,16 @@ class Panel:
                 "checked_at": now, "note": note,
                 "expires_at": expiry_ts, "days_left": days_left,
             })
-        uncovered = [r["symbol"] for r in out if not r["protected"]]
+        uncovered = [r["symbol"] for r in out
+                     if not r["protected"] and r["exchange_status"] != "no_position"]
         if uncovered:
             warnings.append("止损未确认覆盖: " + ", ".join(uncovered))
+        if not_on_exchange:
+            warnings.append("本地有仓但交易所无仓（未成交/已平仓，等 tick 结案）: "
+                            + ", ".join(not_on_exchange))
         return {"as_of": now, "stops": out, "orders_known": orders_known,
-                "uncovered": uncovered, "all_protected": not uncovered,
+                "uncovered": uncovered, "not_on_exchange": not_on_exchange,
+                "all_protected": not uncovered and not not_on_exchange,
                 "warnings": warnings, "degraded": bool(warnings)}
 
     # ---------------------------------------------------------------- ④ 盈亏曲线
@@ -1944,7 +1971,8 @@ def _stops_html(block: Mapping[str, Any]) -> str:
     for row in block.get("stops") or ():
         status = str(row.get("exchange_status"))
         label = {"present": "在", "missing": "不在", "partial": "数量不足",
-                 "mismatch": "不是 reduce-only", "unknown": "未知"}.get(status, status)
+                 "mismatch": "不是 reduce-only", "unknown": "未知",
+                 "no_position": "无仓位"}.get(status, status)
         css = "pos" if row.get("protected") else "bad"
         checked = _finite(row.get("checked_at"))
         rows.append(
