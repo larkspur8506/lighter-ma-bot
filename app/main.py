@@ -554,6 +554,30 @@ def grace_ticks(env: Optional[Mapping[str, str]] = None) -> int:
     return value if value >= 1 else 2
 
 
+def max_signal_age_minutes(env: Optional[Mapping[str, str]] = None) -> float:
+    """信号时效窗（分钟），默认 30（`LIGHTER_MAX_SIGNAL_AGE_MIN`，`0` = 关闭）。
+
+    只允许在「信号 bar 收盘后 N 分钟内」建仓。tick 固定在 :03/:33，所以 30 分钟等于
+    「**只有 4h 收盘后的第一轮**能开仓」。超龄不当失败：当轮不建仓、落
+    `entry_skipped_stale_signal` 事件，离场/止损/熔断一律不受影响。
+
+    为什么是 30：实测（Lighter SOL 1m，14 天 84 个 4h 边界，相对 bar 收盘价的漂移）
+    +3 分钟 p50 8.3bp / p90 19.3bp / 超 30bp 占 5%；+33 分钟 p50 20.8bp / p90 63.5bp /
+    超 30bp 占 **36%**；+63 分钟 p50 24.8bp / p90 73.0bp / 超 30bp 占 45%。也就是说
+    第二轮的漂移中位数是第一轮的 2.5 倍，超过三成的信号会吃掉整个 30bp 滑点带宽。
+
+    空 = 30；`0` = 关闭；负数/脏值退回 30（脏配置宁可保守，不要静默关掉闸门）。
+    """
+    raw = (env if env is not None else os.environ).get("LIGHTER_MAX_SIGNAL_AGE_MIN", "")
+    try:
+        value = float(str(raw).strip()) if str(raw).strip() else 30.0
+    except ValueError:
+        return 30.0
+    if value != value:                  # nan
+        return 30.0
+    return value if value >= 0 else 30.0
+
+
 def merge_accepted_stops(cache: PanelCache, report: Any) -> int:
     """把本轮「交易所已受理」的止损单并进面板的挂单缓存；返回并入张数。
 
@@ -1760,7 +1784,8 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
                             stop_guard=stop_guard_on(),
                             margin_isolated=isolated_margin_on(),
                             fill_confirm_s=fill_confirm_seconds(),
-                            grace_ticks=grace_ticks())
+                            grace_ticks=grace_ticks(),
+                            max_signal_age_min=max_signal_age_minutes())
         report = await executor.run_once()
         record_tick_outcomes(store, report, ts=time.time())
         # 面板复用本轮取到的 K 线：不额外取数、且与决策用同一份序列（含同一个起点）

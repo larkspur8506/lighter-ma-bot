@@ -42,7 +42,7 @@ from app.executor import (BLOCK_CIRCUIT_OPEN, BLOCK_RECONCILE, ISSUE_ORDERS_UNAV
                           ExchangeAccount, ExchangeOrder, ExchangePosition,
                           LighterAccountReader, ReconcileIssue, ReaderError, match_stop_order,
                           reconcile)
-from app.lifecycle import ACTION_ENTRY, ACTION_HOLD, ACTION_SKIP, ACTION_STOP
+from app.lifecycle import ACTION_ENTRY, ACTION_EXIT, ACTION_HOLD, ACTION_SKIP, ACTION_STOP
 from app.market import BarsResult
 from app.risk import RiskLimits
 from app.sizing import SizingConfig
@@ -1695,6 +1695,134 @@ class LiveReferencePriceTests(Base):
         self.run_tick(ex)
         self.assertEqual(self.exchange.exits[0]["limit_price_int"], 960)
         self.assertNotIn("live_quote_rejected", [e["kind"] for e in self.events()])
+
+
+# --------------------------------------------------------------------------- 信号时效闸
+
+
+class SignalAgeGateTests(Base):
+    """信号时效闸（2026-10-30）：只允许「信号 bar 收盘后 N 分钟内」建仓。
+
+    夹具的日历：最后一根已收盘 bar = `SIGNAL_BARS[-1]`，`Base.now_ms()` 落在它收盘后
+    **1 分钟**，所以在默认 30 分钟窗口内。要造超龄必须显式把 now 往后挪（`tick_at`）。
+    """
+
+    def tick_at(self, minutes_after_close, *, ex=None):
+        """在「信号 bar 收盘后 N 分钟」跑一轮。"""
+        import asyncio
+        now_ms = (SIGNAL_BARS[-1].open_ms + BAR_MS
+                  + int(round(float(minutes_after_close) * 60_000)))
+        return asyncio.run((ex or self.executor).run_once(now_ms=now_ms))
+
+    def test_stale_entry_is_downgraded_to_skip_and_places_no_order(self):
+        ex = self.make_executor(fill_confirm_s=0)            # 默认 30 分钟窗口
+        report = self.tick_at(45, ex=ex)
+
+        # ① 决策被降级成 skip，带结构化原因
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.action, ACTION_SKIP)
+        self.assertIn("stale_signal", outcome.decision["codes"])
+        # ② 一张单都没发、一本账都没记
+        self.assertEqual(self.exchange.entries, [])
+        self.assertEqual(self.exchange.stops, [])
+        self.assertEqual(self.store.open_positions(), [])
+        self.assertEqual(self.store.trade_count(), 0)
+        # ③ 不算失败、不熔断、本轮仍然 ok
+        self.assertEqual(report.status, "ok")
+        self.assertTrue(report.ok)
+        self.assertEqual(ex.failures, 0)
+        self.assertFalse(ex.circuit_open)
+
+        # ④ 事件落库（面板/排查的入口）
+        events = self.events("entry_skipped_stale_signal")
+        self.assertEqual(len(events), 1)
+        data = json.loads(events[0]["data"])
+        self.assertEqual(data["symbol"], BTC)
+        self.assertEqual(data["bar_ms"], SIGNAL_BARS[-1].open_ms)
+        self.assertAlmostEqual(data["age_min"], 45.0, places=3)
+        self.assertEqual(data["limit_min"], 30.0)
+
+    def test_fresh_entry_still_executes_inside_the_default_window(self):
+        ex = self.make_executor(max_signal_age_min=30, fill_confirm_s=0)
+        report = self.tick_at(29, ex=ex)
+
+        self.assertEqual(report.outcomes[0].action, ACTION_ENTRY)
+        self.assertEqual(len(self.exchange.entries), 1)
+        self.assertEqual(len(self.store.open_positions()), 1)
+        self.assertEqual(self.events("entry_skipped_stale_signal"), [])
+
+    def test_the_window_edge_is_inclusive(self):
+        """年龄 = 30 分钟（等于窗口）放行；31 分钟拦下。"""
+        ex = self.make_executor(max_signal_age_min=30)
+        bar_ms = SIGNAL_BARS[-1].open_ms
+        close_ms = bar_ms + BAR_MS
+        self.assertEqual(ex._signal_age_exceeded(bar_ms, close_ms + 30 * 60_000),
+                         (False, 30.0))
+        exceeded, age_min = ex._signal_age_exceeded(bar_ms, close_ms + 31 * 60_000)
+        self.assertTrue(exceeded)
+        self.assertAlmostEqual(age_min, 31.0, places=6)
+
+    def test_zero_disables_the_gate(self):
+        """`0` = 关闭：3 小时前的 bar 照常建仓（线上事故那种形态不再被拦）。"""
+        ex = self.make_executor(max_signal_age_min=0, fill_confirm_s=0)
+        report = self.tick_at(180, ex=ex)
+
+        self.assertEqual(report.outcomes[0].action, ACTION_ENTRY)
+        self.assertEqual(len(self.exchange.entries), 1)
+        self.assertEqual(self.store.trade_count(), 1)
+        self.assertEqual(self.events("entry_skipped_stale_signal"), [])
+
+    def test_a_negative_window_is_stored_as_off(self):
+        self.assertEqual(self.make_executor(max_signal_age_min=-5).max_signal_age_min, 0.0)
+
+    def test_stop_is_never_blocked_by_a_stale_bar(self):
+        """离场永远放行：5 小时前的 bar 照样把止损打出去。"""
+        import asyncio
+        bars = stop_hit_bars()
+        self.market.feeds[BTC] = bars_result(bars, unclosed=())
+        self.seed_position(entry_price_int=1120, stop_price_int=1050, bar_ms=T0,
+                           qty_int=415600)
+        self.exchange.positions[BTC] = {"side": 1, "qty_int": 415600, "market_id": 1}
+        self.exchange.orders = []
+        ex = self.make_executor(fill_confirm_s=0)             # 默认 30 分钟
+        now_ms = bars[-1].open_ms + BAR_MS + 5 * 3600 * 1000
+        report = asyncio.run(ex.run_once(now_ms=now_ms))
+
+        self.assertEqual(report.outcomes[0].action, ACTION_STOP)
+        self.assertEqual(len(self.exchange.exits), 1)
+        self.assertEqual(self.store.open_positions(), [])
+        self.assertEqual(self.events("entry_skipped_stale_signal"), [])
+
+    def test_signal_exit_is_never_blocked_by_a_stale_bar(self):
+        import asyncio
+        bars = stop_hit_bars()
+        self.market.feeds[BTC] = bars_result(bars, unclosed=())
+        # 止损放到 90（够不着）⇒ 最后一根走「收盘跌破 SMA20」的信号离场
+        self.seed_position(entry_price_int=1120, stop_price_int=900, bar_ms=T0,
+                           qty_int=415600)
+        self.exchange.positions[BTC] = {"side": 1, "qty_int": 415600, "market_id": 1}
+        self.exchange.orders = []
+        ex = self.make_executor(fill_confirm_s=0)
+        now_ms = bars[-1].open_ms + BAR_MS + 5 * 3600 * 1000
+        report = asyncio.run(ex.run_once(now_ms=now_ms))
+
+        self.assertEqual(report.outcomes[0].action, ACTION_EXIT)
+        self.assertEqual(len(self.exchange.exits), 1)
+        self.assertEqual(self.events("entry_skipped_stale_signal"), [])
+
+    def test_max_signal_age_minutes_reads_the_env(self):
+        """默认 30 / `0` 关闭 / 负数与脏值退回 30（脏配置不许静默关掉闸门）。"""
+        from app import main
+        self.assertEqual(main.max_signal_age_minutes({}), 30.0)
+        self.assertEqual(main.max_signal_age_minutes({"LIGHTER_MAX_SIGNAL_AGE_MIN": ""}), 30.0)
+        self.assertEqual(main.max_signal_age_minutes({"LIGHTER_MAX_SIGNAL_AGE_MIN": "0"}), 0.0)
+        self.assertEqual(main.max_signal_age_minutes({"LIGHTER_MAX_SIGNAL_AGE_MIN": "45"}), 45.0)
+        self.assertEqual(main.max_signal_age_minutes({"LIGHTER_MAX_SIGNAL_AGE_MIN": " 60 "}),
+                         60.0)
+        self.assertEqual(main.max_signal_age_minutes({"LIGHTER_MAX_SIGNAL_AGE_MIN": "-5"}), 30.0)
+        self.assertEqual(main.max_signal_age_minutes({"LIGHTER_MAX_SIGNAL_AGE_MIN": "abc"}),
+                         30.0)
+
 
 if __name__ == "__main__":                                        # pragma: no cover
     unittest.main()

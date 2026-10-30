@@ -40,6 +40,10 @@ run_once(now_ms)
 │
 ├─ 7. 执行器闸门：action == 'entry' 且 blocks 非空 → 降级成 skip(code=blocks[0])
 │
+├─ 7b. 信号时效闸：action == 'entry' 且 bar 收盘已超 N 分钟
+│      → 降级成 skip(code='stale_signal') + 落 entry_skipped_stale_signal（**不算失败**；
+│        离场/止损不经过这里，见 §3.3）
+│
 ├─ 8. 执行
 │     ├─ entry：place_entry → place_stop → lifecycle.apply_entry（记仓位 + 开仓腿）
 │     ├─ exit ：begin_close(OPEN→CLOSING) → place_exit → complete_close(→CLOSED)
@@ -216,6 +220,43 @@ bar 的收盘价**，而 tick 在 bar 收盘后 ~3 分钟才跑 —— 价格若
   落 `exit_not_filled` + 报警（这一侧更危险：记成 CLOSED 就是裸仓）。
 
 `0` = 只读一次（离线测试用）。这条是**观测与记账**的护栏，不改任何策略/定仓口径。
+
+### 3.3 信号时效闸（`LIGHTER_MAX_SIGNAL_AGE_MIN`，默认 30 分钟）
+
+信号是拿「**最后一根已收盘 4h bar**」判的，而这根 bar 收盘后 4 小时内每一轮 tick 都会
+重判**同一根** bar。正常情况第一轮（收盘后 ~3 分钟，tick 在 :03/:33）就建仓了；但那一轮
+若被挡（对账阻断 / 熔断 / 取数失败 / 仓位槽被幽灵仓占着），等仓位槽空出来时，机器人会拿
+一根已经过期几小时的 bar 建仓 —— 这不是假设：**2026-10-30 实盘，20:00 那根 bar 的信号
+在 03:03 才执行（晚了 3 小时）**，虽然那次价格恰好没跑，但这是规则外的偏差。
+
+⇒ 只允许在「信号 bar **收盘时刻**（`bar_ms + 4h`）之后 N 分钟内」建仓（`_run_tick` 里
+顺序是：决策 → **时效闸** → 执行）。`N` = `LIGHTER_MAX_SIGNAL_AGE_MIN`，默认 **30**，
+`0` = 关闭。
+
+为什么是 30 分钟：实测（Lighter SOL 1m K 线，14 天 84 个 4h 边界，相对 bar 收盘价的漂移）
+
+| 距收盘 | p50 | p90 | 漂移 > 30bp 的比例 |
+|---|---|---|---|
+| +3 分钟（第一轮） | 8.3bp | 19.3bp | 5% |
+| +33 分钟（第二轮） | 20.8bp | 63.5bp | **36%** |
+| +63 分钟（第三轮） | 24.8bp | 73.0bp | 45% |
+
+第二轮的中位漂移是第一轮的 2.5 倍，超过三分之一的信号会整个吃掉 30bp 的滑点带宽（见
+3.1.2 与 `LIGHTER_ENTRY_SLIPPAGE_BPS`）。30 分钟正好等于「收盘后第一轮」的边界。
+
+**语义边界**（写死，别顺手扩大）：
+
+* 只拦 `action='entry'`：`exit` / `stop` 永远放行 —— 闸门再严也不能锁死亏损仓；
+* **不算失败**：当轮不建仓而已，不抛异常、不计连续失败、不开熔断，`TickReport.status`
+  仍是 `ok`，`blocked_entries` 里也没有它；
+* 降级方式与 `_apply_entry_guard` 一致：`entry` → 显式 `skip`，`from_state` 不变，
+  `rejections` 里追加一条 `stage='executor' / code='stale_signal'`（`detail` 带
+  `bar_ms` / `age_min` / `limit_min`），并落事件 `entry_skipped_stale_signal`；
+* 边界是**闭区间**：年龄 == 30 分钟放行，> 30 分钟才拦；
+* `bar_ms` 缺失（理论上不会：决策一定带 bar）时**不拦** —— 拦截需要证据，不猜。
+
+回滚：`.env` 里设 `LIGHTER_MAX_SIGNAL_AGE_MIN=0` 即退回「每轮都可以建仓」的旧行为，
+不需要改代码。
 
 ---
 

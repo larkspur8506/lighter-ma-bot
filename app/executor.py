@@ -14,7 +14,7 @@
       → 记权益点（DD / 日初权益的输入）
       → 取 K 线（剔未收盘 + 新鲜度校验）/ 算指标 / 判最后一根 bar 的信号
       → 装配 RiskState（DB + 交易所并集）
-      → 逐标的：决策 → 发单 → 记账
+      → 逐标的：决策 → **信号时效闸**（超龄的 entry 降级成 skip）→ 发单 → 记账
       → 失败计数 / 熔断
 
 为什么先对账再动手
@@ -95,7 +95,8 @@ from app.store import OPEN_STATES, StateStore
 
 __all__ = [
     "BLOCK_CIRCUIT_OPEN", "BLOCK_RECONCILE",
-    "DEFAULT_MAX_CONSECUTIVE_FAILURES", "EXECUTOR_STAGE",
+    "DEFAULT_MAX_CONSECUTIVE_FAILURES", "DEFAULT_MAX_SIGNAL_AGE_MIN", "EXECUTOR_STAGE",
+    "SIGNAL_BAR_MS", "STALE_SIGNAL_CODE",
     "ISSUE_ORDERS_UNAVAILABLE", "ISSUE_POSITION_MISSING", "ISSUE_POSITION_UNKNOWN",
     "ISSUE_QTY_MISMATCH", "ISSUE_SIDE_MISMATCH", "ISSUE_STOP_ORDER_MISSING",
     "ISSUE_CODES", "SEVERITY_DANGER", "SEVERITY_GRACE", "SEVERITY_WARN",
@@ -116,6 +117,11 @@ EXECUTOR_STAGE = "executor"
 #: 阻断开仓的三种理由（落到 `Decision.rejections[].code`，面板/日志按它聚合）。
 BLOCK_RECONCILE = "reconcile_blocked"              # 对账发现不一致（fail-closed）
 BLOCK_CIRCUIT_OPEN = "circuit_open"                # 连续失败熔断
+STALE_SIGNAL_CODE = "stale_signal"                 # 信号 bar 已过期（时效闸）
+
+#: 一根 bar 的长度（毫秒）。与 `app.market.BAR_MS` 同一口径（4h）—— 这里单独写一份是
+#: 为了不让本模块依赖取数层（`app.views` 也是这么做的）。
+SIGNAL_BAR_MS = 4 * 3600 * 1000
 
 #: 连续失败阈值：达到就熔断（不再尝试下单）。默认 3 —— 一次 tick 最多 3 个动作，
 #: 3 次连续硬失败几乎不可能是瞬时抖动。
@@ -155,6 +161,11 @@ DEFAULT_GRACE_TICKS = 2
 #: 实时参考价与「计划价」允许的最大偏离。超过它就把实时报价当不可信（错标的/脏盘口），
 #: 退回计划价并落事件 —— 宁可用旧锚，也不拿一个离谱的价格去下真单。
 DEFAULT_LIVE_REF_MAX_DEVIATION = 0.03
+
+#: 信号时效窗（分钟）：只允许在「信号 bar 收盘后」这么多分钟内建仓。`0` = 关闭。
+#: tick 固定在 :03/:33，30 分钟 ⇒ 实际上只有收盘后**第一轮**能开仓（第二次机会要等
+#: 下一根 bar）。理由见 `docs/EXECUTOR.md` 3.3 的实测漂移数据。
+DEFAULT_MAX_SIGNAL_AGE_MIN = 30.0
 
 
 # ------------------------------------------------------------------ 异常
@@ -1364,6 +1375,7 @@ class Executor:
                  fill_poll_interval_s: float = DEFAULT_FILL_POLL_INTERVAL_S,
                  grace_ticks: int = DEFAULT_GRACE_TICKS,
                  live_ref_max_deviation: float = DEFAULT_LIVE_REF_MAX_DEVIATION,
+                 max_signal_age_min: float = DEFAULT_MAX_SIGNAL_AGE_MIN,
                  sleeper: Optional[Callable[[float], Awaitable[None]]] = None,
                  alert: Optional[Callable[[str, str], Any]] = None,
                  clock: Callable[[], float] = time.time,
@@ -1413,6 +1425,9 @@ class Executor:
         self._grace_seen: Dict[int, int] = {}
         #: 实时参考价的偏离闸（见 `DEFAULT_LIVE_REF_MAX_DEVIATION`）。
         self.live_ref_max_deviation = max(0.0, float(live_ref_max_deviation))
+        #: 信号时效闸（2026-10-30）：只允许在「信号 bar 收盘后 N 分钟内」建仓。
+        #: `0` = 关闭；负数按 0 处理（显式关闭比「负窗口把开仓全挡死」安全）。
+        self.max_signal_age_min = max(0.0, float(max_signal_age_min))
         self._sleep = sleeper if sleeper is not None else asyncio.sleep
         self.alert = alert
         self.clock = clock
@@ -1557,6 +1572,9 @@ class Executor:
             decision, block_code = self._apply_entry_guard(decision, blocks=tuple(blocks))
             if block_code:
                 blocked_entries.append(symbol)
+            # 决策 → **时效闸** → 执行（顺序即语义）。只降级 `entry`：离场/止损永远放行，
+            # 超龄不当失败（不改 `_failures`、不进 `blocked_entries`、不写 `status=error`）。
+            decision = self._apply_signal_age_guard(decision, stamp_ms)
             try:
                 outcome = await self._execute(symbol, decision, feed, account)
             except Exception as exc:                              # noqa: BLE001 - 必须留痕
@@ -1662,6 +1680,70 @@ class Executor:
             reason=f"entry blocked by the executor ({code})",
             detail={**dict(decision.detail), "blocked": True, "blocks": list(blocks)})
         return guarded, code
+
+    def _signal_age_exceeded(self, bar_ms: Optional[int], now_ms: int) -> Tuple[bool, float]:
+        """信号 bar 距今是否已经超出时效窗；返回 `(是否超龄, 实际年龄/分钟)`。
+
+        bar 的**收盘时刻** = `bar_ms + 4h`（`bar_ms` 是开盘时刻，与 `app.market.BAR_MS`
+        同口径）。年龄按收盘时刻算、不按开盘时刻算 —— 信号只有在收盘后才成立。
+
+        * `max_signal_age_min == 0` → 永远 `False`（闸门关闭）；
+        * `bar_ms` 缺失（理论上不会：`_decide` 一定带 bar）→ `False`：拦截需要证据，
+          没有 bar 就**不猜**；这条不会静默，`_apply_signal_age_guard` 也不会落事件；
+        * `now_ms` 早于收盘（时钟回拨/测试造数）→ 年龄按 0 算，不拦。
+        """
+        limit = self.max_signal_age_min
+        if limit <= 0:
+            return False, 0.0
+        start = int(bar_ms or 0)
+        if start <= 0:
+            return False, 0.0
+        age_ms = max(0, int(now_ms) - (start + SIGNAL_BAR_MS))
+        age_min = age_ms / 60_000.0
+        return age_min > limit, age_min
+
+    def _apply_signal_age_guard(self, decision: Decision, now_ms: int) -> Decision:
+        """信号时效闸（2026-10-30）：超龄的 `entry` 意图**降级成显式 skip**。
+
+        为什么需要：信号是拿「最后一根已收盘 4h bar」判的，而这根 bar 收盘后 4 小时内每一
+        轮 tick 都会重判同一根 bar。正常情况第一轮（收盘后 ~3 分钟）就建仓了；但那一轮若被
+        挡（对账阻断 / 熔断 / 取数失败 / 仓位槽被幽灵仓占着），等仓位槽空出来时就会拿一根
+        已经过期几小时的 bar 建仓 —— 实盘发生过：20:00 的信号在 03:03 才执行。
+
+        语义边界（写死在这里，别顺手扩大）：
+
+        * **只拦 `entry`**：`exit` / `stop` / `hold` / `skip` 原样返回 —— 离场永远放行；
+        * **不算失败**：不抛异常、不改 `_failures`、不进 `blocked_entries`、`status` 仍是
+          `ok`；只落 `entry_skipped_stale_signal` 事件 + 一条 `stale_signal` rejection。
+        """
+        if decision.action != ACTION_ENTRY:
+            return decision
+        if self.max_signal_age_min <= 0:
+            return decision
+        bar_ms = int(decision.bar_ms or 0)
+        exceeded, age_min = self._signal_age_exceeded(bar_ms, now_ms)
+        if not exceeded:
+            return decision
+        limit = float(self.max_signal_age_min)
+        symbol = decision.symbol
+        self._event(
+            "entry_skipped_stale_signal",
+            f"{symbol}: signal bar closed {age_min:.1f} min ago "
+            f"(limit {limit:g} min) — entry skipped",
+            symbol=symbol,
+            data={"symbol": symbol, "bar_ms": bar_ms,
+                  "age_min": round(age_min, 3), "limit_min": limit})
+        return replace(
+            decision, action=ACTION_SKIP, to_state=decision.from_state,
+            rejections=decision.rejections + (
+                Rejection(stage=EXECUTOR_STAGE, code=STALE_SIGNAL_CODE,
+                          message=(f"stale signal: the bar closed {age_min:.1f} min ago, "
+                                   f"over the {limit:g} min entry window"),
+                          detail={"original_action": ACTION_ENTRY, "bar_ms": bar_ms,
+                                  "age_min": round(age_min, 3), "limit_min": limit}),),
+            reason=f"stale signal ({age_min:.1f} min > {limit:g} min)",
+            detail={**dict(decision.detail), "stale_signal": True,
+                    "age_min": round(age_min, 3), "limit_min": limit})
 
     # ---------------------------------------------------------------- 执行
 
