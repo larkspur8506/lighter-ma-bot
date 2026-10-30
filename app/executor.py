@@ -1939,6 +1939,8 @@ class Executor:
             attempts = 1
         else:
             attempts = int(timeout_s / interval) + 1
+        best = 0
+        previous: Optional[int] = None
         for attempt in range(max(1, attempts)):
             snapshot = await self.reader.read()
             pos = snapshot.position_for(symbol)
@@ -1949,10 +1951,19 @@ class Executor:
                         f"entry intent {int(side):+d} — refusing to book it")
                 got = _qty_int_from_decimal(pos.qty, size_decimals)
                 if got > 0:
-                    return got
+                    # 部分成交会「长」：数量还在变就继续等，连续两次一致才算落定。
+                    # 用最大观测值记账（宁可少买不可多买，但也不能记少了让止损盖不住）。
+                    best = max(best, got)
+                    if previous is not None and got == previous:
+                        return best
+                    previous = got
+                if attempt + 1 < attempts:
+                    await self._sleep(interval)
+                    continue
+                break
             if attempt + 1 < attempts:
                 await self._sleep(interval)
-        return None
+        return best or None
 
     async def _confirm_position_closed(self, *, symbol: str, timeout_s: float) -> bool:
         """等账户里该标的的仓**真的不见**；超时 `False`。

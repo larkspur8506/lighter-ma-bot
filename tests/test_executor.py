@@ -1471,6 +1471,50 @@ class EntryFillVerificationTests(Base):
         self.assertIn("entry_partial_fill", [e["kind"] for e in self.events()])
         self.assertEqual(self.store.audit(), [])
 
+    def test_fill_qty_is_taken_after_it_settles(self):
+        """部分成交会「长」：连续两次读数一致才算落定，记账用最大值。"""
+        from app.executor import ExchangeAccount, ExchangePosition
+
+        def account(qty_int):
+            qty = Decimal(qty_int).scaleb(-5)
+            return ExchangeAccount(
+                equity=10_000.0, as_of=NOW_S,
+                positions=(ExchangePosition(symbol=BTC, side=1, qty=qty, qty_str=str(qty)),),
+                orders=())
+
+        class ScriptedReader:
+            def __init__(self, seq):
+                self.seq = list(seq)
+                self.reads = 0
+
+            async def read(self):
+                value = self.seq[min(self.reads, len(self.seq) - 1)]
+                self.reads += 1
+                return value
+
+        class ZeroSleeper:
+            async def __call__(self, _seconds):
+                return None
+
+        ex = self.make_executor(fill_confirm_s=3.0, fill_poll_interval_s=1.0,
+                                sleeper=ZeroSleeper())
+        ex.reader = ScriptedReader([account(100_000), account(100_000),
+                                    account(250_000), account(PLAN_QTY_INT)])
+        import asyncio as _asyncio
+        got = _asyncio.run(ex._confirm_entry_fill(
+            symbol=BTC, side=1, size_decimals=5, qty_int=PLAN_QTY_INT, timeout_s=3.0))
+        self.assertEqual(got, 100_000, "连续两次一致就该落定，不必等满窗口")
+
+        ex.reader = ScriptedReader([account(100_000), account(250_000)])
+        got = _asyncio.run(ex._confirm_entry_fill(
+            symbol=BTC, side=1, size_decimals=5, qty_int=PLAN_QTY_INT, timeout_s=1.0))
+        self.assertEqual(got, 250_000, "窗口内数量在长 → 记最大值")
+
+        ex.reader = ScriptedReader([ExchangeAccount(equity=10_000.0, as_of=NOW_S)])
+        got = _asyncio.run(ex._confirm_entry_fill(
+            symbol=BTC, side=1, size_decimals=5, qty_int=PLAN_QTY_INT, timeout_s=0))
+        self.assertIsNone(got, "没有仓位 = 没成交")
+
     def test_dry_run_does_not_wait_for_a_fill(self):
         """dry-run 本来就不会在交易所产生仓位 —— 不能因此把模拟盘锁死。"""
         self.exchange.dry_run = True
