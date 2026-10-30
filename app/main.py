@@ -16,8 +16,9 @@ import 边界（评审会看这一条）
 
 模块级 import 里**没有** `app.exchange`、没有 `app.executor`、没有 `lighter`：
 本模块只 `import app.views`（面板）、`app.dd`（回撤）、`app.risk`、`app.watchdog`、
-`app.store`。也就是说：一个没有凭据的部署（面板 / 演练 / 预览）能把这个进程完整跑
-起来，而**私钥路径根本不在 import 图里**。
+`app.store`，以及 `app.notify`（推送出口，纯 stdlib：只有 urllib/threading）。也就是说：
+一个没有凭据的部署（面板 / 演练 / 预览）能把这个进程完整跑起来，而**私钥路径根本不在
+import 图里**。
 
 会碰到 `app.exchange` 的只有两处，import 都写在函数体内部、只在运行时按需加载：
 `POST /admin/flatten` 的默认实现（:func:`_default_flatten`）与调度器的 tick runner
@@ -82,7 +83,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequ
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
-from app import views, watchdog
+from app import notify, views, watchdog
 from app.dd import DdError, DrawdownGuard
 from app.risk import RiskLimits
 from app.store import StateStore
@@ -1779,8 +1780,14 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
         store = box["store"]
         if store is None:
             store = box["store"] = StateStore.from_config(config)
+        # 通知出口：与 HL 侧同渠道、同 env 键名（WECHAT_WEBHOOK_URL /
+        # TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID）。三个 env 全缺 → None，执行器
+        # `_alert` 退回「只打日志」，行为与接入前逐字节一致（要静默就清空 env，
+        # 不引入新开关）。构造是纯内存操作（不发网络），HTTP 在 `app.notify` 的
+        # daemon 线程里跑，所以这里**不给 tick 主路径加任何延迟**。
         executor = Executor(store=store, market=market, exchange=exchange, reader=reader,
-                            symbols=symbols, limits=_limits(), alert=None,
+                            symbols=symbols, limits=_limits(),
+                            alert=notify.notifier_from_env(),
                             stop_guard=stop_guard_on(),
                             margin_isolated=isolated_margin_on(),
                             fill_confirm_s=fill_confirm_seconds(),

@@ -1868,6 +1868,24 @@ class Executor:
             stop_order=stop.as_dict(), filled=True, ok=stop_ok,
             detail={"position_id": transition.position_id, "entry_coi": entry_coi,
                     "stop_coi": stop_coi, "stop_ok": stop_ok})
+        if stop_ok:
+            # 成功开仓也推送（2026-10-30 接入）：事件表里有记录，但人不在面板前就看不见；
+            # 此前只有**失败**类会 `_alert`，所以「开了仓」这件事在手机上完全没有痕迹。
+            # 只在止损在位时发 —— 止损没挂上的路径已经有 `stop_order_failed` 告警，
+            # 那条更该看，不该被一条「开仓成功」混淆（那正是裸仓时刻）。
+            # 价格用**交易所口径**整数还原：成交参考价 = 下单时锚定的实时 mid 限价
+            # （`entry_ref`，交易所实际收到的那个价格）；取不到实时报价时它会是 None
+            # （见 `_live_reference_int`：那时发单用的是计划价），所以退回计划价整数 ——
+            # 告警里**不许**因此炸掉整张开仓单（fail-open）。
+            ref_int = (entry_ref if entry_ref is not None
+                       else to_int_price(float(plan.entry_price), int(plan.price_decimals)))
+            ref_price = ref_int / (10.0 ** int(plan.price_decimals))
+            side_text = "多" if int(plan.side) == 1 else "空"
+            self._alert(
+                "entry",
+                f"【Lighter】开仓 {symbol} {side_text} {plan.base_qty:g} @ {ref_price:g}"
+                f" ｜ 止损 {plan.stop_price:g} ｜ 风险 {float(plan.risk_amount):.2f}U"
+                + ("（dry-run）" if self.dry_run else ""))
         if not stop_ok:
             self._failures += 1
             self._maybe_open_circuit()
@@ -1954,11 +1972,37 @@ class Executor:
                     symbol=symbol, data={"position_id": pid, "bar_ms": bar_ms,
                                          "exit_price_int": exit_price_int,
                                          "dry_run": bool(self.dry_run)})
+        # 离场成功也推送（2026-10-30 接入）：`kind` 沿用事件表的既有词汇（exit / stop），
+        # 不新增 kind。价格用交易所口径整数还原（止损离场 = 仓位里冻结的止损价，信号离场
+        # = 决策价 floor 到 tick）；逐笔 pnl 从 trades 表回读（store 已经把「交易所净额
+        # 优先、本地价差兜底」算好了，这里**不复刻**那套公式）。
+        exit_price = exit_price_int / (10.0 ** price_decimals)
+        pnl = self._closed_pnl(pid, kind=kind)
+        pnl_text = "—" if pnl is None else f"{pnl:+.2f}U"
+        self._alert(
+            kind,
+            f"【Lighter】离场 {symbol} {kind} @ {exit_price:g} ｜ pnl {pnl_text}"
+            + ("（dry-run）" if self.dry_run else ""))
         return SymbolOutcome(symbol=symbol, action=decision.action, bar_ms=bar_ms,
                              reason=f"{kind} filled", decision=decision.as_dict(),
                              order=order.as_dict(), filled=True,
                              detail={"position_id": pid,
                                      "exit_price_int": exit_price_int})
+
+    def _closed_pnl(self, position_id: int, *, kind: str) -> Optional[float]:
+        """平仓腿的已实现盈亏（`trades` 表回读）。读不到 → `None`，绝不影响平仓本身。
+
+        为什么不在这里重算 `(exit-entry)*qty*side`：`store.record_exit()` 已经处理好了
+        「交易所净额优先 / 本地价差兜底」，并在 `events` 里标了 `pnl_source`。告警里再
+        算一遍就是第二份公式 —— 两份口径迟早对不上（2026-10-30 那次 `net_pnl` 与面板
+        打架就是这一类问题）。回读一条刚写的行远比维护两份公式便宜。
+        """
+        try:
+            rows = self.store.trades(limit=1, position_id=int(position_id), kind=str(kind))
+        except Exception as exc:                                  # noqa: BLE001 - 纯展示
+            logger.warning("could not read the closed pnl for the alert: %s", exc)
+            return None
+        return _opt_float(rows[0].get("realized_pnl")) if rows else None
 
     def _stop_fill_evidence(self, row: Mapping[str, Any], account: ExchangeAccount) -> bool:
         """止损成交的**正面证据**：该标的在交易所已无仓，且我们挂的止损单也不在了。
@@ -2193,6 +2237,15 @@ class Executor:
                                 "exit_price_int": int(fill["price_int"]),
                                 "pnl": float(fill["pnl"]),
                                 "position_id_after": transition.position_id})
+                # 离线结案也是**真实成交**（人可能开着手机等这一条）：与在线离场同一格式，
+                # 但必须注明「离线结案」—— 否则分不清「机器人自己平的」和「止损/人工在
+                # 交易所成交、本地只是事后认账」。价格与 pnl 都来自成交回报（交易所口径）。
+                settle_price = int(fill["price_int"]) / (
+                    10.0 ** int(row.get("price_decimals") or 0))
+                self._alert(
+                    "stop_fill_settled",
+                    f"【Lighter】止损成交（离线结案）{issue.symbol} {kind} @ "
+                    f"{settle_price:g} ｜ pnl {float(fill['pnl']):+.2f}U")
                 continue
             opened_at = float(row.get("opened_at") or 0.0)
             provable = trades is not None and _trades_cover(trades, opened_at)
