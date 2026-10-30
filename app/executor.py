@@ -1919,6 +1919,15 @@ class Executor:
                         f"settled as a stop fill", symbol=symbol,
                         data={"position_id": pid, "exit_price_int": exit_price_int,
                               "evidence": "flat_and_stop_gone"})
+            # 结案也要推送（2026-10-30 审查 B1）：这条分支此前只落 `events`，可它恰恰是
+            # 「止损已在交易所成交、本地事后认账」—— 钱已经动了，人却要翻面板才知道。
+            # 文案与 grace 结案共用 `_settled_close_alert()`（按 kind 措辞）；
+            # 价格取仓位冻结的止损价（与在线止损离场同一口径），pnl 从 trades 表回读。
+            self._alert("stop_fill_settled",
+                        self._settled_close_alert(
+                            symbol=symbol, kind=kind,
+                            price=exit_price_int / (10.0 ** price_decimals),
+                            pnl=self._closed_pnl(pid, kind="stop")))
             return SymbolOutcome(
                 symbol=symbol, action=ACTION_STOP, bar_ms=bar_ms,
                 reason="stop fill confirmed by the exchange read — settled",
@@ -2003,6 +2012,20 @@ class Executor:
             logger.warning("could not read the closed pnl for the alert: %s", exc)
             return None
         return _opt_float(rows[0].get("realized_pnl")) if rows else None
+
+    def _settled_close_alert(self, *, symbol: str, kind: str, price: float,
+                             pnl: Optional[float]) -> str:
+        """**离线结案**（交易所在先成交、本地事后认账）的告警文案 —— 措辞按 `kind`。
+
+        为什么不能一律写「止损成交」（2026-10-30 审查 M2）：grace 结案的 kind 既有
+        `stop`（止损在交易所被打掉）也有 `exit`（信号离场 / 人工平仓）。一律报止损
+        会把「信号平仓」说成「止损打掉」—— 而这两件事在手机上要做的判断恰好相反
+        （前者该怀疑信号、后者该查单/查保证金）。措辞与事件 kind 保持一一对应。
+        """
+        label = "止损成交" if str(kind) == "stop" else "平仓成交"
+        pnl_text = "—" if pnl is None else f"{pnl:+.2f}U"
+        return (f"【Lighter】{label}（离线结案）{symbol} {kind} @ {price:g}"
+                f" ｜ pnl {pnl_text}")
 
     def _stop_fill_evidence(self, row: Mapping[str, Any], account: ExchangeAccount) -> bool:
         """止损成交的**正面证据**：该标的在交易所已无仓，且我们挂的止损单也不在了。
@@ -2240,12 +2263,13 @@ class Executor:
                 # 离线结案也是**真实成交**（人可能开着手机等这一条）：与在线离场同一格式，
                 # 但必须注明「离线结案」—— 否则分不清「机器人自己平的」和「止损/人工在
                 # 交易所成交、本地只是事后认账」。价格与 pnl 都来自成交回报（交易所口径）。
+                # 措辞按 kind（止损成交 / 平仓成交），见 `_settled_close_alert()`。
                 settle_price = int(fill["price_int"]) / (
                     10.0 ** int(row.get("price_decimals") or 0))
-                self._alert(
-                    "stop_fill_settled",
-                    f"【Lighter】止损成交（离线结案）{issue.symbol} {kind} @ "
-                    f"{settle_price:g} ｜ pnl {float(fill['pnl']):+.2f}U")
+                self._alert("stop_fill_settled",
+                            self._settled_close_alert(
+                                symbol=str(issue.symbol), kind=kind,
+                                price=settle_price, pnl=float(fill["pnl"])))
                 continue
             opened_at = float(row.get("opened_at") or 0.0)
             provable = trades is not None and _trades_cover(trades, opened_at)
