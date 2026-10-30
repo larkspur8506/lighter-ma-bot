@@ -1521,6 +1521,9 @@ class Executor:
         # ① 交易所真相（失败即整轮停手：没有读数就没有对账结论）
         account = await self.reader.read()
         self.last_account = account
+        # ①a 超龄 CLOSING 收尸（对抗审查 P1-1 的 tick 级兜底）：放在止损守护之前 ——
+        #     abort 回 OPEN 的行，本轮的 _guard_stops 才能重新管到它的保护单。
+        await self._reap_stale_closing(account, now_s)
         # ①b 止损守护（2026-10-29）：先补保护、再对账 —— 缺止损就补挂、临期就换单。
         #     放在对账之前是刻意的：刚补上的止损不该再触发一次「缺止损」的封锁/告警。
         #     **只加保护**：不动仓位、不改信号、不碰离场判定。
@@ -1829,8 +1832,24 @@ class Executor:
                                   "planned_qty_int": int(decision.plan.qty_int)
                                   if decision.plan is not None else None})
 
-        stop = await self._place(self.exchange.place_stop(plan, bar_ms=bar_ms),
-                                 label=f"{symbol} stop")
+        try:
+            stop = await self._place(self.exchange.place_stop(plan, bar_ms=bar_ms),
+                                     label=f"{symbol} stop")
+        except Exception as exc:                              # noqa: BLE001 - P1：异常并入「挂失败」
+            # 对抗审查（2026-10-30）：交易所拒单/网络错误是以**异常**抛出的
+            # （AmbiguousOrder / NonceConflict / 签名失败，见 exchange.py 的 raise 点），
+            # 过去会穿透到 tick 顶层、跳过下面的 apply_entry —— 交易所已持有真实仓位，
+            # 本地零记录、无止损，止损守护只遍历 store 行，永远补不上 = 裸仓。
+            # 拒单（ok=False 的 OrderResult）路径本来就会「照样记账 + 告警」；
+            # 异常路径并到同一条：记账与挂保护解耦，缺失的止损由下一轮 _guard_stops 补。
+            stop = OrderResult(ok=False, action="stop", kind="exception",
+                               error=f"{type(exc).__name__}: {exc}", symbol=symbol,
+                               market_id=int(plan.market_id), dry_run=False)
+            self._event("stop_order_exception",
+                        f"{symbol}: place_stop raised — booking the entry anyway",
+                        symbol=symbol,
+                        data={"error": f"{type(exc).__name__}: {exc}"[:300],
+                              "entry_coi": entry_coi, "stop_coi": stop_coi})
         stop_ok = self._accepted(stop)
         if not stop_ok:
             # 仓位已经开出来了但保护单没挂上：**照样记账**（真实敞口必须留痕），
@@ -1937,17 +1956,29 @@ class Executor:
         if str(row.get("state")).upper() == OPEN:
             self.lifecycle.begin_close(pid, reason=kind, bar_ms=bar_ms,
                                        ts=float(self.clock()))
-        # 离场同样锚实时 mid，但**不设偏离闸**：减仓单必须追着现在的市场价格走。
-        exit_ref = await self._live_reference_int(
-            symbol, price_decimals, plan_price=None, max_deviation=0.0, label=kind)
-        order = await self._place(
-            self.exchange.place_exit(symbol=symbol, market_id=int(row.get("market_id") or 0),
-                                     side=int(row.get("side") or 0),
-                                     qty_int=int(row.get("qty_int") or 0),
-                                     price_decimals=price_decimals,
-                                     exit_price=float(decision.exit_price or 0.0),
-                                     bar_ms=bar_ms, limit_price_int=exit_ref),
-            label=f"{symbol} {kind}")
+        try:
+            # 离场同样锚实时 mid，但**不设偏离闸**：减仓单必须追着现在的市场价格走。
+            exit_ref = await self._live_reference_int(
+                symbol, price_decimals, plan_price=None, max_deviation=0.0, label=kind)
+            order = await self._place(
+                self.exchange.place_exit(symbol=symbol, market_id=int(row.get("market_id") or 0),
+                                         side=int(row.get("side") or 0),
+                                         qty_int=int(row.get("qty_int") or 0),
+                                         price_decimals=price_decimals,
+                                         exit_price=float(decision.exit_price or 0.0),
+                                         bar_ms=bar_ms, limit_price_int=exit_ref),
+                label=f"{symbol} {kind}")
+        except Exception as exc:                              # noqa: BLE001 - P1：先收尸再上抛
+            # 对抗审查（2026-10-30）：begin_close 之后任何异常（place_exit 抛异常 /
+            # wait_for_tx 网络错误 / 脏 mid）过去会让行永久停在 CLOSING ——
+            # decide_exit 对 CLOSING 恒 hold、_guard_stops 跳过 CLOSING 行：
+            # 信号离场永不重试、止损 28 天到期被废单后无人补挂（裸仓）、
+            # 该标的被 duplicate_symbol 闸永久拒新仓。收尸后把异常原样上抛，
+            # 保持「未预期异常 → 停止本轮」的既有约定（此刻状态已一致）。
+            await self._recover_close_after_error(pid=pid, row=row, symbol=symbol,
+                                                  kind=kind, bar_ms=bar_ms,
+                                                  exit_price_int=exit_price_int, error=exc)
+            raise
         if not self._accepted(order):
             # 离场被拒 → 显式回退 CLOSING → OPEN（绝不静默把仓位当平掉）
             self.lifecycle.abort_close(pid, reason=f"{kind}_rejected", ts=float(self.clock()))
@@ -1955,8 +1986,16 @@ class Executor:
         # 成交确认（2026-10-30）：IOC 离场单也可能「tx executed 但零成交」。
         # 不确认就把仓位记 CLOSED = 本地以为空、交易所还持有且止损可能已失效 ⇒ 裸仓。
         if not self.dry_run:
-            closed = await self._confirm_position_closed(symbol=symbol,
-                                                         timeout_s=self.fill_confirm_s)
+            try:
+                closed = await self._confirm_position_closed(
+                    symbol=symbol, timeout_s=self.fill_confirm_s)
+            except Exception as exc:                          # noqa: BLE001 - P1：确认读数失败也先收尸
+                # `_confirm_position_closed` 里的 `reader.read()` 抛 ReaderError 同样是
+                # 「begin_close 之后」的异常——不收尸就是又一个 CLOSING 僵尸。
+                await self._recover_close_after_error(
+                    pid=pid, row=row, symbol=symbol, kind=kind, bar_ms=bar_ms,
+                    exit_price_int=exit_price_int, error=exc)
+                raise
             if not closed:
                 self.lifecycle.abort_close(pid, reason=f"{kind}_not_filled", ts=float(self.clock()))
                 self._event(
@@ -2207,6 +2246,83 @@ class Executor:
                 await self._sleep(interval)
         return False
 
+    async def _recover_close_after_error(self, *, pid: int, row: Mapping[str, Any],
+                                         symbol: str, kind: str, bar_ms: int,
+                                         exit_price_int: int, error: Exception) -> None:
+        """`begin_close` 之后任何异常的收尸（对抗审查 P1-1，2026-10-30）。
+
+        过去：begin_close → complete_close 之间的任何异常（交易所拒单是以**异常**抛出的、
+        wait_for_tx 网络错误、确认读数 ReaderError、脏 mid）会让行永久停在 CLOSING ——
+        decide_exit 对 CLOSING 恒 hold、_guard_stops 跳过 CLOSING 行：信号离场永不重试、
+        止损 28 天到期被废单后无人补挂（裸仓）、该标的被 duplicate_symbol 闸永久拒新仓。
+
+        收尸口径（两条路都不留 CLOSING）：
+        - 交易所已经没仓 → 按证据结案（价格用仓位冻结的止损价/计划价；本地口径 pnl，
+          事件里写明来源，事后可由 trades 复核）；
+        - 仍有仓或读不到 → `abort_close` 回 OPEN：止损单还在交易所挂着、守护继续续单，
+          下一轮重新评估离场。回 OPEN 只是本地状态，不动交易所任何挂单。
+        """
+        try:
+            flat = await self._confirm_position_closed(symbol=symbol, timeout_s=2.0)
+        except Exception as read_exc:                         # noqa: BLE001 - 读不到按未知处理
+            flat = False
+            self._event("closing_recovery",
+                        f"{symbol}: error-path exchange read failed "
+                        f"({type(read_exc).__name__}) — aborting to OPEN conservatively",
+                        symbol=symbol,
+                        data={"position_id": pid, "error": str(read_exc)[:200]})
+        data = {"position_id": pid, "kind": kind,
+                "error": f"{type(error).__name__}: {error}"[:300]}
+        if flat:
+            self.lifecycle.complete_close(pid, exit_price_int=exit_price_int, kind=kind,
+                                          reason=f"{kind}_error_settled", bar_ms=bar_ms,
+                                          ts=float(self.clock()))
+            self._event("closing_recovery",
+                        f"{symbol}: error after begin_close, but the exchange is already "
+                        f"flat — settled from evidence", symbol=symbol, data=data)
+            self._alert("closing_recovery",
+                        f"【Lighter】{symbol} 离场中途出错，但交易所已无仓 —— "
+                        f"已按证据结账（价格取冻结的{'止损' if kind == 'stop' else '计划'}价）。")
+            return
+        self.lifecycle.abort_close(pid, reason=f"{kind}_error", ts=float(self.clock()))
+        self._event("closing_recovery",
+                    f"{symbol}: error after begin_close — aborted back to OPEN "
+                    f"(position still on the exchange, stop guard resumes)",
+                    symbol=symbol, data=data)
+        self._alert("closing_recovery",
+                    f"【Lighter】{symbol} 离场中途出错（{type(error).__name__}），已回退 OPEN："
+                    f"交易所仓位与止损单原样保留，下一轮重试离场。请留意后续告警。")
+
+    async def _reap_stale_closing(self, account: ExchangeAccount, now_s: float) -> None:
+        """超龄 CLOSING 行的 tick 级兜底收尸（对抗审查 P1-1）。
+
+        快速路径的收尸在 `_recover_close_after_error`（异常当场处理）；这里兜的是
+        「收尸自己也失败」「12s 成交确认窗内进程被杀/容器重建」这类漏网。超过
+        `CLOSING_STALE_S`（60 分钟 ≈ 2 个 tick）还停在 CLOSING 且**交易所仍有仓**的行 →
+        `abort_close` 回 OPEN（守护恢复续单、下一轮重判离场）。交易所已无仓的 CLOSING
+        不在这里动——那是 grace 结案/作废机制（`_settle_grace_issues`）的地盘，等证据。
+        """
+        for row in self.store.open_positions():
+            if str(row.get("state") or "").upper() != "CLOSING":
+                continue
+            symbol = str(row.get("symbol") or "").upper()
+            pid = int(row.get("id") or 0)
+            updated = float(row.get("updated_at") or 0.0)
+            if updated <= 0 or now_s - updated < self.CLOSING_STALE_S:
+                continue
+            pos = account.position_for(symbol)
+            if pos is None or float(getattr(pos, "qty", 0) or 0) <= 0:
+                continue
+            self.lifecycle.abort_close(pid, reason="closing_stale", ts=now_s)
+            self._event("closing_recovery",
+                        f"{symbol}: CLOSING for {now_s - updated:.0f}s with the position "
+                        f"still on the exchange — aborted back to OPEN", symbol=symbol,
+                        data={"position_id": pid, "age_s": round(now_s - updated, 1)})
+            self._alert("closing_recovery",
+                        f"【Lighter】{symbol} 的平仓确认卡了 {int((now_s - updated) / 60)} 分钟"
+                        f"还没有结果且交易所仍有仓 —— 已回退 OPEN：止损守护恢复接管，"
+                        f"下一轮重新评估离场。")
+
     async def _recent_trades(self) -> Optional[Tuple[ExchangeTrade, ...]]:
         """最近的成交回报；读不到 → `None`（**绝不**当成「没有成交」）。"""
         fn = getattr(self.reader, "trades", None)
@@ -2321,6 +2437,10 @@ class Executor:
 
     #: 距到期多久开始换单。24h 给「连续两个 tick 失败」留出重试余量（tick 30 分钟一轮）。
     STOP_RENEW_BEFORE_S: float = 24 * 3600.0
+    #: CLOSING 行超过这个秒数还没结果就视为僵尸（对抗审查 P1-1）：tick 30 分钟一轮，
+    #: 60 分钟 ≈ 2 个 tick —— 快速路径的异常收尸（_recover_close_after_error）之外的漏网
+    #:（确认窗内进程被杀、收尸读数也失败）由 _reap_stale_closing 兜住。
+    CLOSING_STALE_S: float = 3600.0
     #: 挂完新单后等它出现在 activeOrders 的轮询（实测传播 0.8~1.5s，上限给到 ~6s）
     STOP_VERIFY_ATTEMPTS: int = 4
     STOP_VERIFY_INTERVAL_S: float = 1.5

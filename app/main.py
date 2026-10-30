@@ -1039,6 +1039,54 @@ def _warn(*messages: str) -> List[str]:
 
 # ================================================================== 默认 impl
 
+_SHARED_EXCHANGE_CLIENTS: Dict[Tuple[str, int], Any] = {}
+
+
+def _shared_exchange_client(config: Any, *, confirm_live: Optional[int] = None,
+                            extra: Optional[Mapping[str, Any]] = None) -> Any:
+    """进程级单例 `ExchangeClient`（对抗审查 P2-2，2026-10-30）。
+
+    每个实例持有**独立的** `NonceStream`（懒取一次交易所 next_nonce 后本地自增）。
+    过去 flatten 每次新建 client：tick 的单还在途（已签名未上链确认）时它向交易所
+    查到的 next_nonce 与 tick 已用的相同 → 互相 `nonce_conflict`，紧急清仓单被自己的
+    第二把 client 拒掉。tick 与 flatten 共用同一把 client 后这条并发路径消失。
+    键 = (environment, confirm_live)；生产单账户，实际最多一份。
+    """
+    key = (str(getattr(config, "environment", "") or ""), int(confirm_live or 0))
+    client = _SHARED_EXCHANGE_CLIENTS.get(key)
+    if client is None:
+        from app.exchange import ExchangeClient      # noqa: PLC0415 - 私钥模块懒加载
+        client = ExchangeClient.from_config(config, env=os.environ, dry_run=False,
+                                            confirm_live=confirm_live,
+                                            **(dict(extra or {})))
+        _SHARED_EXCHANGE_CLIENTS[key] = client
+    return client
+
+
+async def _flatten_confirm_flat(reader: Any, symbol: str, *, timeout_s: float = 15.0,
+                                interval_s: float = 1.0) -> bool:
+    """轮询账户读数直到该标的的仓位**真的**消失（对抗审查 P1-2：受理 ≠ 成交）。
+
+    读失败按「未确认」处理（fail-closed：不撤挂单）并重试到超时；超时返回 False，
+    由调用方把该标的标成 failed 并**保留**它的挂单（撤掉还在位的止损 = 制造裸仓）。
+    """
+    attempts = max(1, int(timeout_s / interval_s) + 1)
+    for attempt in range(attempts):
+        snap = None
+        try:
+            snap = await reader.read()
+        except Exception:                                     # noqa: BLE001 - 读失败 ≠ 没仓
+            snap = None
+        pos_for = getattr(snap, "position_for", None)
+        if callable(pos_for):
+            pos = pos_for(symbol)
+            if pos is None or float(getattr(pos, "qty", 0) or 0) <= 0:
+                return True
+        if attempt + 1 < attempts:
+            await asyncio.sleep(interval_s)
+    return False
+
+
 
 async def _default_flatten(store: Any, *, reason: str = "", by: str = "admin",
                            confirm_live: Optional[int] = None) -> Dict[str, Any]:
@@ -1068,13 +1116,24 @@ async def _default_flatten(store: Any, *, reason: str = "", by: str = "admin",
                 "error": f"凭据不可用，无法清仓: {type(exc).__name__}: {exc}",
                 "steps": []}
 
-    import app.exchange as exchange_module                    # noqa: PLC0415 - 见 docstring
-
     async def _run() -> Dict[str, Any]:
-        client = exchange_module.ExchangeClient.from_config(
-            config, env=os.environ, dry_run=False,
+        client = _shared_exchange_client(
+            config,
             confirm_live=config.account_index if confirm_live is None else confirm_live)
+        # 实时 mid 锚与成交确认（对抗审查 P1-2，2026-10-30）：与 tick 侧同一套组件。
+        # ① 过去用 4h 前的入场价 ±30bp 当清仓限价 —— 急跌/急拉超过 30bp 时（恰恰是
+        #    最需要清仓的时刻）限价落在簿的另一侧 → 零成交，却报 ok=true；
+        # ② 过去 `ok` 只取「进了 sequencer」，没有任何成交确认，随后无条件撤掉全部
+        #    挂单（包括仍在位的止损）—— 紧急按钮自己制造裸仓。
+        from app.executor import LighterAccountReader      # noqa: PLC0415 - 懒加载
+        from app.market import MarketClient                # noqa: PLC0415
+        from app.sizing import to_int_price                # noqa: PLC0415
+        market = MarketClient(config.environment)
+        reader = LighterAccountReader(base_url=config.base_url,
+                                      account_index=int(config.account_index),
+                                      auth_provider=lambda: client.auth.get())
         steps: List[Dict[str, Any]] = []
+        provisional: List[str] = []
         closed: List[str] = []
         for row in store.open_positions():
             symbol = str(row.get("symbol") or "").upper()
@@ -1085,11 +1144,24 @@ async def _default_flatten(store: Any, *, reason: str = "", by: str = "admin",
                 steps.append({"symbol": symbol, "ok": False,
                               "error": "缺少 market_id/qty_int，无法市价平仓"})
                 continue
+            # 锚实时 mid；取不到就退回入场价（=旧行为）并在 steps 里留痕
+            limit_ref: Optional[int] = None
+            try:
+                snap = await asyncio.to_thread(market.snapshot, symbol)
+                raw = getattr(snap, "mid", None) or getattr(snap, "price", None)
+                mid = float(raw) if raw is not None else 0.0
+                if mid > 0:
+                    limit_ref = to_int_price(mid, int(row.get("price_decimals") or 0))
+            except Exception as exc:                          # noqa: BLE001 - 降级不阻断
+                steps.append({"symbol": symbol, "ok": None,
+                              "error": f"实时报价不可用，清仓限价退回入场价锚: "
+                                       f"{type(exc).__name__}"})
             try:
                 result = await client.place_exit(
                     symbol=symbol, market_id=int(market_id), side=side, qty_int=qty_int,
                     price_decimals=int(row.get("price_decimals") or 0),
-                    exit_price=float(row.get("entry_price") or 0.0))
+                    exit_price=float(row.get("entry_price") or 0.0),
+                    limit_price_int=limit_ref)
             except Exception as exc:                          # noqa: BLE001 - 逐条记录
                 steps.append({"symbol": symbol, "ok": False,
                               "error": f"{type(exc).__name__}: {exc}"})
@@ -1098,20 +1170,33 @@ async def _default_flatten(store: Any, *, reason: str = "", by: str = "admin",
                           "code": getattr(result, "code", None),
                           "error": getattr(result, "error", "")})
             if getattr(result, "ok", False):
+                provisional.append(symbol)
+        # 受理 ≠ 成交：确认「交易所真的没仓了」才允许撤挂单；没平掉的标的保留其
+        # 止损单（撤了 = 制造裸仓），并明确标 failed。
+        still_open: List[str] = []
+        for symbol in provisional:
+            if await _flatten_confirm_flat(reader, symbol):
                 closed.append(symbol)
+            else:
+                still_open.append(symbol)
+                steps.append({"symbol": symbol, "ok": False,
+                              "error": "清仓单被受理但确认期内仓位仍在交易所 —— "
+                                       "未撤该标的挂单（止损单保留）"})
         cancel = None
-        try:
-            cancel = await client.cancel_all_orders()
-        except Exception as exc:                              # noqa: BLE001
-            steps.append({"symbol": "*", "ok": False,
-                          "error": f"撤单失败: {type(exc).__name__}: {exc}"})
-        ok = all(step.get("ok") for step in steps) if steps else True
+        if not still_open:
+            try:
+                cancel = await client.cancel_all_orders()
+            except Exception as exc:                          # noqa: BLE001
+                steps.append({"symbol": "*", "ok": False,
+                              "error": f"撤单失败: {type(exc).__name__}: {exc}"})
+        ok = (all(step.get("ok") for step in steps if step.get("ok") is not None)
+              if steps else True) and not still_open
         error = "" if ok else "; ".join(
             f"{step.get('symbol')}: {step.get('error')}"
-            for step in steps if not step.get("ok"))[:400]
+            for step in steps if step.get("ok") is False)[:400]
         return {"ok": bool(ok), "closed": closed,
                 "cancelled": bool(getattr(cancel, "ok", False)), "steps": steps,
-                "error": error}
+                "error": error, "still_open": still_open}
 
     try:
         # 本函数是 **async** 的（端点 await 它）：flatten 只有一条调用路径 ——
@@ -1740,7 +1825,6 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
     """
     from app.config import Config
     from app.executor import Executor, LighterAccountReader
-    from app.exchange import ExchangeClient
     from app.market import MarketClient
 
     config = Config.from_env()
@@ -1749,8 +1833,8 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
     _slip = entry_slippage_bps()
     if _slip is not None:
         extra["entry_slippage_bps"] = _slip
-    exchange = ExchangeClient.from_config(config, env=os.environ, dry_run=False,
-                                          confirm_live=config.account_index, **extra)
+    exchange = _shared_exchange_client(config, confirm_live=config.account_index,
+                                       extra=extra)
     reader = LighterAccountReader(base_url=config.base_url,
                                   account_index=config.account_index,
                                   auth_provider=lambda: exchange.auth.get())
