@@ -1363,5 +1363,42 @@ class SymbolIndicatorsCacheTests(unittest.TestCase):
         self.assertEqual(len(panel._symbol_ind_cache), 3)
 
 
+
+class PhantomPositionTests(PanelFixture):
+    """2026-10-30：本地有仓、交易所空仓时，**不许**报「止损未覆盖」。
+
+    那是「没有仓」，不是「没有止损」。补一张 reduce-only 止损只是给不存在的仓挂单。
+    """
+
+    def _stops(self, *, exchange_positions, orders=None):
+        seed(self.store)
+        sources = views.Sources(orders=lambda: (orders if orders is not None else []),
+                                positions=lambda: dict(exchange_positions))
+        return self.panel(sources=sources).stops()
+
+    def test_flat_exchange_is_reported_as_no_position(self):
+        block = self._stops(exchange_positions={})
+        row = block["stops"][0]
+        self.assertEqual(row["exchange_status"], "no_position")
+        self.assertFalse(row["protected"])
+        self.assertIn("无仓", row["note"])
+        self.assertEqual(block["uncovered"], [], "不能算作「止损未覆盖」")
+        self.assertIn("本地有仓但交易所无仓", " ".join(block["warnings"]))
+        self.assertFalse(block["all_protected"], "面板仍然不能显示「已全覆盖」")
+
+    def test_position_on_the_exchange_keeps_the_stop_verdict(self):
+        block = self._stops(exchange_positions={"BTC": {"qty": 1.0}}, orders=[])
+        row = block["stops"][0]
+        self.assertEqual(row["exchange_status"], "missing")
+        self.assertIn("止损", row["note"])
+        self.assertEqual(block["uncovered"], ["BTC"])
+
+    def test_no_positions_source_keeps_the_old_verdict(self):
+        """没有持仓数据源（只读面板降级）时按老口径判，不能凭空说「无仓」。"""
+        seed(self.store)
+        block = self.panel(sources=views.Sources(orders=lambda: [])).stops()
+        self.assertEqual(block["stops"][0]["exchange_status"], "missing")
+
+
 if __name__ == "__main__":
     unittest.main()

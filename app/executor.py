@@ -80,7 +80,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field, replace
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from typing import (Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional,
                     Sequence, Tuple)
 
@@ -99,11 +99,13 @@ __all__ = [
     "ISSUE_ORDERS_UNAVAILABLE", "ISSUE_POSITION_MISSING", "ISSUE_POSITION_UNKNOWN",
     "ISSUE_QTY_MISMATCH", "ISSUE_SIDE_MISMATCH", "ISSUE_STOP_ORDER_MISSING",
     "ISSUE_CODES", "SEVERITY_DANGER", "SEVERITY_GRACE", "SEVERITY_WARN",
-    "AccountReader", "ExchangeAccount", "ExchangeOrder", "ExchangePosition",
+    "DEFAULT_FILL_CONFIRM_S", "DEFAULT_FILL_POLL_INTERVAL_S", "DEFAULT_GRACE_TICKS",
+    "AccountReader", "ExchangeAccount", "ExchangeOrder", "ExchangePosition", "ExchangeTrade",
     "Executor", "ExecutorError", "LighterAccountReader", "ReaderError", "ReconcileIssue",
     "ReconcileReport", "SymbolOutcome", "TickReport", "TRANSFER_FLOW_EPS",
     "account_transaction_time_from_payload", "infer_transfer_flow", "orders_from_payload",
-    "pending_signal", "positions_from_payload", "reconcile", "transfers_to_flows",
+    "pending_signal", "positions_from_payload", "reconcile", "trades_from_payload",
+    "transfers_to_flows",
 ]
 
 logger = logging.getLogger(__name__)
@@ -140,6 +142,15 @@ ISSUE_CODES: Tuple[str, ...] = (
 
 #: 默认容差（tick 数）：止损单按触发价比对时双侧 ±1 tick（任务书要求）。
 DEFAULT_STOP_TOLERANCE_TICKS = 1
+
+#: 开仓后等「账户里真的出现仓位」的窗口（秒）与轮询间隔。
+#: IOC 单被 sequencer 受理 ≠ 成交；交易所侧仓位读数有秒级传播延迟（实测挂单 0.8~1.5s
+#: 可见），所以给到 12 秒。`0` = 只读一次。
+DEFAULT_FILL_CONFIRM_S = 12.0
+DEFAULT_FILL_POLL_INTERVAL_S = 1.5
+
+#: `grace` 连续多少轮仍未结案就作废幽灵仓（tick 间隔 30 分钟 ⇒ 默认 2 轮 = 约 1 小时）。
+DEFAULT_GRACE_TICKS = 2
 
 
 # ------------------------------------------------------------------ 异常
@@ -483,6 +494,172 @@ def orders_from_payload(payload: Mapping[str, Any]) -> Tuple[ExchangeOrder, ...]
     return tuple(out)
 
 
+@dataclass(frozen=True)
+class ExchangeTrade:
+    """交易所侧一笔**成交**（`GET /api/v1/trades` 的一行，只取结案要用的字段）。
+
+    2026-10-30 引入：对账只能说「交易所现在没有仓」，说不出「**为什么**没有仓」。
+    有了成交回报才能区分两种局面 —— 止损/信号平仓真的成交了（结案成 stop/exit），
+    还是**从来就没成交过**（幽灵仓，作废）。字段语义实测：
+
+    * `size`/`price` 是字符串（`"0.118"` / `"101.015"`）；
+    * `timestamp` 是**毫秒**；
+    * 我们站哪一边看 `ask_account_id`/`bid_account_id`（等于自己的 account_index 那侧）：
+      ask = 卖出（`side=-1`），bid = 买入（`side=+1`）；
+    * `ask_account_pnl`/`bid_account_pnl` 是我方逐笔盈亏，**已含资金费、无手续费**
+      （standard 档实测 maker/taker 全 0）。
+    """
+
+    trade_id: str
+    symbol: str
+    side: int
+    qty: float
+    qty_str: str
+    price: float
+    ts: float
+    pnl: Optional[float] = None
+    raw: Mapping[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"trade_id": self.trade_id, "symbol": self.symbol, "side": self.side,
+                "qty": self.qty, "price": self.price, "ts": self.ts, "pnl": self.pnl}
+
+
+def trades_from_payload(payload: Mapping[str, Any], *,
+                        account_index: int) -> Tuple[ExchangeTrade, ...]:
+    """`GET /api/v1/trades` 的响应 → `ExchangeTrade` 元组（只保留我方那一侧）。
+
+    `limit` 上限 20、只有 `desc`、**没有 cursor 可翻**（实测）⇒ 结案逻辑必须容忍
+    「这 20 笔覆盖不到仓位生命周期」的情况（`trades_cover` 判断）。
+    """
+    if not isinstance(payload, Mapping):
+        raise ReaderError(f"trades payload must be a mapping, got {type(payload).__name__}")
+    code = _opt_int(payload.get("code"))
+    if code is not None and code != 200:
+        raise ReaderError(f"trades endpoint returned code {code}: "
+                          f"{payload.get('message') or 'no message'}")
+    rows = payload.get("trades")
+    if rows is None:
+        rows = []
+    if not isinstance(rows, list):
+        raise ReaderError("trades payload has no 'trades' list")
+    mine = int(account_index)
+    out: List[ExchangeTrade] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ReaderError("trades payload contains a non-mapping entry")
+        ask_acct = _opt_int(row.get("ask_account_id"))
+        bid_acct = _opt_int(row.get("bid_account_id"))
+        if ask_acct == mine and bid_acct == mine:
+            raise ReaderError("a trade has our account on both sides")
+        if ask_acct == mine:
+            side, pnl = -1, _opt_float(row.get("ask_account_pnl"))
+        elif bid_acct == mine:
+            side, pnl = 1, _opt_float(row.get("bid_account_pnl"))
+        else:
+            continue
+        qty_str = str(row.get("size") or "").strip()
+        price_str = str(row.get("price") or "").strip()
+        ts_raw = _opt_int(row.get("timestamp"))
+        if not qty_str or not price_str or ts_raw is None:
+            raise ReaderError(f"trade row is missing size/price/timestamp: {dict(row)!r}")
+        out.append(ExchangeTrade(
+            trade_id=str(row.get("trade_id") or ""),
+            symbol=str(row.get("market_symbol") or row.get("symbol") or "").strip().upper(),
+            side=side, qty=float(qty_str), qty_str=qty_str, price=float(price_str),
+            ts=float(ts_raw) / 1000.0, pnl=pnl, raw=dict(row)))
+    return tuple(out)
+
+
+def _plan_with_qty(plan: Any, *, qty_int: int) -> Any:
+    """按**实际成交数量**重建 `OrderPlan`（部分成交时用）。
+
+    复核口径跟着交易所走：名义/保证金/风险都得按真实数量重算，否则止损单会按一个
+    不存在的仓位下单（reduce-only 会被交易所裁剪，但账本就假了）。
+    """
+    n = int(qty_int)
+    if n <= 0:
+        raise ExecutorError(f"cannot rebuild a plan with qty_int={qty_int!r}")
+    base = n / (10.0 ** int(plan.size_decimals))
+    entry = float(plan.entry_price)
+    stop = float(plan.stop_price)
+    notional = base * entry
+    leverage = float(plan.leverage or 1.0)
+    return replace(plan, qty_int=n, base_qty=base, notional=notional,
+                   margin=notional / leverage if leverage > 0 else notional,
+                   risk_amount=base * abs(entry - stop))
+
+
+def _qty_int_from_decimal(value: Any, decimals: int) -> int:
+    """交易所给的 base 数量（字符串/Decimal）→ 整数 tick（**向下取整**，宁可少算）。"""
+    try:
+        scaled = Decimal(str(value)) * (Decimal(10) ** int(decimals))
+    except (InvalidOperation, ValueError):                     # pragma: no cover - 脏数据
+        return 0
+    return int(scaled.to_integral_value(rounding=ROUND_FLOOR))
+
+
+def _trades_cover(trades: Sequence["ExchangeTrade"], opened_at: float) -> bool:
+    """这 20 笔成交**覆盖得住**仓位生命周期吗（`/trades` 无 cursor 可翻）。
+
+    覆盖得住 = 窗口里最老的一笔发生在仓位开仓之前 ⇒ 开仓之后的每一笔成交都在这批里，
+    「查不到某笔成交」才等于「确实没有这笔成交」。
+    """
+    if opened_at <= 0:
+        return False
+    if not trades:
+        return True
+    return min(float(t.ts) for t in trades) <= float(opened_at) + 1.0
+
+
+def _closing_fill(row: Mapping[str, Any], trades: Sequence["ExchangeTrade"], *,
+                  tolerance_s: float = 60.0) -> Optional[Dict[str, Any]]:
+    """在成交回报里找「平掉这个仓位」的那几笔（方向相反、时间在开仓之后、数量够）。
+
+    找到 ⇒ 返回加权均价（整数 tick）、逐笔盈亏合计与成交 id；数量不足 99% 则不算结案。
+    """
+    symbol = str(row.get("symbol") or "").strip().upper()
+    side = int(row.get("side") or 0)
+    qty = abs(float(row.get("qty") or 0.0))
+    if not symbol or side not in (1, -1) or qty <= 0:
+        return None
+    opened_at = float(row.get("opened_at") or 0.0)
+    decimals = int(row.get("price_decimals") or 0)
+    closing_side = -side
+    fills = [t for t in trades
+             if t.symbol == symbol and int(t.side) == closing_side
+             and float(t.ts) + tolerance_s >= opened_at]
+    if not fills:
+        return None
+    total = sum(t.qty for t in fills)
+    if total + 1e-9 < qty * 0.99:
+        return None
+    notional = sum(t.qty * t.price for t in fills)
+    avg = notional / total if total else 0.0
+    return {"price_int": int(round(avg * (10.0 ** decimals))),
+            "pnl": sum(float(t.pnl or 0.0) for t in fills),
+            "qty": total, "trade_ids": [t.trade_id for t in fills if t.trade_id],
+            "ts": max(float(t.ts) for t in fills)}
+
+
+def _closing_fill_matches_stop(row: Mapping[str, Any], fill: Mapping[str, Any], *,
+                               tolerance_pct: float = 0.015) -> bool:
+    """成交价落在止损价附近 ⇒ 按 `stop` 结案，否则按 `exit`（信号平仓）。
+
+    只是**记账分类**（`trades.kind`），不影响任何风控判定；判不准时按 `exit` 也算保守。
+    """
+    stop = row.get("stop_price")
+    try:
+        stop_f = float(stop) if stop is not None else 0.0
+        price_int = int(fill.get("price_int") or 0)
+    except (TypeError, ValueError):                            # pragma: no cover
+        return False
+    decimals = int(row.get("price_decimals") or 0)
+    if stop_f <= 0 or price_int <= 0:
+        return False
+    return abs(price_int / (10.0 ** decimals) - stop_f) <= stop_f * float(tolerance_pct)
+
+
 # ------------------------------------------------------------------ 读取器
 
 class AccountReader:
@@ -692,6 +869,19 @@ class LighterAccountReader(AccountReader):
         orders_url = self._url("/api/v1/accountActiveOrders", account_index=self.account_index)
         return orders_from_payload(
             await asyncio.to_thread(self._get, orders_url, self._auth_header()))
+
+    async def trades(self, *, limit: int = 20) -> Tuple["ExchangeTrade", ...]:
+        """最近成交（`/api/v1/trades`，`limit` 上限 20、只有 desc、无 cursor）。
+
+        对账结案用：区分「止损真的成交了」和「从来就没成交过」。
+        读失败**抛 ReaderError** —— 「读不到成交」不等于「没有成交」。
+        """
+        cap = max(1, min(20, int(limit)))
+        url = self._url("/api/v1/trades", account_index=self.account_index,
+                        limit=cap, sort_by="timestamp", sort_dir="desc")
+        return trades_from_payload(
+            await asyncio.to_thread(self._get, url, self._auth_header()),
+            account_index=self.account_index)
 
     async def read(self) -> ExchangeAccount:
         account_url = self._url("/api/v1/account", by="index", value=self.account_index)
@@ -1093,6 +1283,8 @@ class TickReport:
     error: str = ""
     #: 本轮止损守护做了什么（补挂/换单成功的那几张单；面板把它并进挂单缓存）
     stop_guards: Tuple[Mapping[str, Any], ...] = ()
+    #: 本轮对账 grace 的结案结果（`settled` 成交结案 / `voided` 幽灵仓作废）
+    grace_settlements: Tuple[Mapping[str, Any], ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -1111,6 +1303,7 @@ class TickReport:
                 "circuit_open": self.circuit_open, "failures": self.failures,
                 "error": self.error,
                 "reconcile": self.reconcile.as_dict() if self.reconcile else None,
+                "grace_settlements": [dict(s) for s in self.grace_settlements],
                 "outcomes": [o.as_dict() for o in self.outcomes]}
 
     def __str__(self) -> str:
@@ -1163,6 +1356,10 @@ class Executor:
                  enforce_in_dry_run: bool = False,
                  stop_guard: bool = True,
                  margin_isolated: bool = True,
+                 fill_confirm_s: float = DEFAULT_FILL_CONFIRM_S,
+                 fill_poll_interval_s: float = DEFAULT_FILL_POLL_INTERVAL_S,
+                 grace_ticks: int = DEFAULT_GRACE_TICKS,
+                 sleeper: Optional[Callable[[float], Awaitable[None]]] = None,
                  alert: Optional[Callable[[str, str], Any]] = None,
                  clock: Callable[[], float] = time.time,
                  now_ms: Optional[Callable[[], int]] = None) -> None:
@@ -1200,6 +1397,16 @@ class Executor:
         #: （≈名义/杠杆，交易所会归一；平仓时交易所自动释放，无需 REMOVE）。
         #: 默认开（账户 2026-10-29 起已切逐仓）；`LIGHTER_ISOLATED_MARGIN=0` 关。
         self.margin_isolated = bool(margin_isolated)
+        #: **成交确认**（2026-10-30）：`sendTx` 的 code=200 只表示进了 sequencer，
+        #: IOC 单可能「执行成功但零成交」⇒ 开仓后必须等账户里真的出现仓位再记账。
+        #: `fill_confirm_s=0` = 只读一次（测试用）。
+        self.fill_confirm_s = max(0.0, float(fill_confirm_s))
+        self.fill_poll_interval_s = max(0.0, float(fill_poll_interval_s))
+        #: 对账 `grace` 的结案门槛：连续这么多轮仍「本地有仓 / 交易所空且无成交」→ 作废幽灵仓。
+        #: 成交回报里能找到真实平仓成交时，第一轮就按 stop/exit 结案（不看这个计数）。
+        self.grace_ticks = max(1, int(grace_ticks))
+        self._grace_seen: Dict[int, int] = {}
+        self._sleep = sleeper if sleeper is not None else asyncio.sleep
         self.alert = alert
         self.clock = clock
         self._now_ms = now_ms or (lambda: int(self.clock() * 1000))
@@ -1308,6 +1515,10 @@ class Executor:
             self._report_reconcile(rec)
             if rec.has_blockers and (not self.dry_run or self.enforce_in_dry_run):
                 blocks.append(BLOCK_RECONCILE)
+        # ②b grace 结案（2026-10-30）：`grace` 不能是终点 —— 成交回报里有真实平仓成交
+        #     就当场结案，确实一笔都没成交（且成交窗口覆盖得住）就作废幽灵仓。
+        #     放在信号之前：结案后本轮的 RiskState 才不会被一个不存在的仓位占着槽。
+        settlements = await self._settle_grace_issues(rec, account, now_s=now_s)
         # ③ 权益点（先写，日初权益/回撤才有输入）
         if account.equity is not None:
             self.store.record_equity(float(account.equity), ts=now_s, source="exchange")
@@ -1354,7 +1565,8 @@ class Executor:
                                reconcile=rec, equity=account.equity,
                                blocked_entries=tuple(blocked_entries),
                                block_reasons=tuple(blocks), error=failure,
-                               stop_guards=stop_guards)
+                               stop_guards=stop_guards,
+                               grace_settlements=tuple(settlements))
             outcomes.append(outcome)
 
         # 一轮跑完且本轮没有任何新的硬失败 → 连续失败清零（成功一次就重置是有意的：
@@ -1365,7 +1577,8 @@ class Executor:
         return replace(report, status=status, outcomes=tuple(outcomes), reconcile=rec,
                        equity=account.equity,
                        blocked_entries=tuple(blocked_entries),
-                       block_reasons=tuple(blocks), stop_guards=stop_guards)
+                       block_reasons=tuple(blocks), stop_guards=stop_guards,
+                       grace_settlements=tuple(settlements))
 
     # ---------------------------------------------------------------- 取数
 
@@ -1479,6 +1692,42 @@ class Executor:
         if not self._accepted(order):
             return self._reject(symbol, decision, order, label="entry")
 
+        # ② 成交确认（2026-10-30 线上事故）：`sendTx` 的 code=200 只表示**进了 sequencer**，
+        #    IOC 单完全可能「执行成功但零成交」。此前这里直接把「受理」当成交 ⇒ 本地记了
+        #    仓位和成交、交易所侧空仓，止损单也自然挂不上，面板每轮报「止损未覆盖」。
+        #    ⇒ 必须等账户里真的出现该标的的仓位；数量以交易所为准（宁可少买不可多买）。
+        decision_used = decision
+        if not self.dry_run:
+            filled_qty_int = await self._confirm_entry_fill(
+                symbol=symbol, side=int(plan.side), size_decimals=int(plan.size_decimals),
+                qty_int=int(plan.qty_int), timeout_s=self.fill_confirm_s)
+            if filled_qty_int is None:
+                self._event(
+                    "entry_not_filled",
+                    f"{symbol}: entry accepted by the sequencer but no position appeared "
+                    f"— not booked (order {order.action})", symbol=symbol,
+                    data={"qty_int": int(plan.qty_int), "notional": float(plan.notional),
+                          "tx_hash": order.tx_hash, "code": order.code,
+                          "entry_coi": entry_coi,
+                          "waited_s": float(self.fill_confirm_s)})
+                self._alert("entry_not_filled",
+                            f"{symbol} 开仓单被受理但**没有成交**（账上未记仓、未挂止损）")
+                return SymbolOutcome(
+                    symbol=symbol, action=ACTION_ENTRY, bar_ms=bar_ms,
+                    reason=("entry accepted but never filled — nothing booked "
+                            f"(waited {self.fill_confirm_s:g}s)"),
+                    decision=decision.as_dict(), order=order.as_dict(), filled=False, ok=False,
+                    detail={"entry_coi": entry_coi, "filled": False, "qty_int": 0})
+            if filled_qty_int < int(plan.qty_int):
+                plan = _plan_with_qty(plan, qty_int=filled_qty_int)
+                decision_used = replace(decision, plan=plan)
+                self._event("entry_partial_fill",
+                            f"{symbol}: filled {plan.base_qty:g} of the planned size",
+                            symbol=symbol,
+                            data={"filled_qty_int": filled_qty_int,
+                                  "planned_qty_int": int(decision.plan.qty_int)
+                                  if decision.plan is not None else None})
+
         stop = await self._place(self.exchange.place_stop(plan, bar_ms=bar_ms),
                                  label=f"{symbol} stop")
         stop_ok = self._accepted(stop)
@@ -1490,7 +1739,7 @@ class Executor:
                                              "error": stop.error, "tx_hash": stop.tx_hash})
             self._alert("stop_order_failed", f"{symbol} 开仓成功但止损单挂单失败：{stop.error}")
         transition = self.lifecycle.apply_entry(
-            decision, order_id=f"coi:{entry_coi}",
+            decision_used, order_id=f"coi:{entry_coi}",
             stop_order_id=(f"coi:{stop_coi}" if stop_ok else None),
             equity=self._equity, ts=float(self.clock()))
         if stop_ok and transition.position_id:
@@ -1514,7 +1763,7 @@ class Executor:
         outcome = SymbolOutcome(
             symbol=symbol, action=ACTION_ENTRY, bar_ms=bar_ms,
             reason=f"opened {plan.base_qty:g} @ {plan.entry_price:g}",
-            decision=decision.as_dict(), order=order.as_dict(),
+            decision=decision_used.as_dict(), order=order.as_dict(),
             stop_order=stop.as_dict(), filled=True, ok=stop_ok,
             detail={"position_id": transition.position_id, "entry_coi": entry_coi,
                     "stop_coi": stop_coi, "stop_ok": stop_ok})
@@ -1572,6 +1821,28 @@ class Executor:
             # 离场被拒 → 显式回退 CLOSING → OPEN（绝不静默把仓位当平掉）
             self.lifecycle.abort_close(pid, reason=f"{kind}_rejected", ts=float(self.clock()))
             return self._reject(symbol, decision, order, label=kind, position_id=pid)
+        # 成交确认（2026-10-30）：IOC 离场单也可能「tx executed 但零成交」。
+        # 不确认就把仓位记 CLOSED = 本地以为空、交易所还持有且止损可能已失效 ⇒ 裸仓。
+        if not self.dry_run:
+            closed = await self._confirm_position_closed(symbol=symbol,
+                                                         timeout_s=self.fill_confirm_s)
+            if not closed:
+                self.lifecycle.abort_close(pid, reason=f"{kind}_not_filled", ts=float(self.clock()))
+                self._event(
+                    "exit_not_filled",
+                    f"{symbol}: {kind} order was executed with no fill — position is still "
+                    f"open, reverting to OPEN", symbol=symbol,
+                    data={"position_id": pid, "kind": kind, "tx_hash": order.tx_hash,
+                          "code": order.code, "qty_int": int(row.get("qty_int") or 0),
+                          "waited_s": float(self.fill_confirm_s)})
+                self._alert("exit_not_filled",
+                            f"{symbol} {kind} 单被受理但**仓位还在**（未成交），已回退 OPEN")
+                return SymbolOutcome(
+                    symbol=symbol, action=decision.action, bar_ms=bar_ms,
+                    reason=f"{kind} accepted but never filled — position still open",
+                    decision=decision.as_dict(), order=order.as_dict(), filled=False, ok=False,
+                    detail={"position_id": pid, "exit_price_int": exit_price_int,
+                            "filled": False})
         transition = self.lifecycle.complete_close(
             pid, exit_price_int=exit_price_int, kind=kind, reason=kind, bar_ms=bar_ms,
             ts=float(self.clock()))
@@ -1649,6 +1920,136 @@ class Executor:
         return reconcile(local_positions=self.store.open_positions(), account=snap,
                          now=float(self.clock()),
                          stop_tolerance_ticks=self.stop_tolerance_ticks)
+
+    # ------------------------------------------------------------ 成交确认 / grace 结案
+    #
+    # 2026-10-30 线上事故的两条教训（都写在这个区里）：
+    #   ① 开仓「受理 ≠ 成交」：IOC 单 tx ok 但零成交，本地照样记仓 ⇒ 幽灵仓。
+    #   ② 对账只能证明「交易所现在没仓」，不能证明「为什么」。`grace`（止损单也没了）
+    #     只有在该标的下一次生成离场决策时才会被 `_execute_exit` 结案 —— 若信号一直
+    #     说 hold，幽灵仓就**永远**留着，占仓位槽、面板显示有仓、每轮报「止损未覆盖」。
+    #     现在每个 grace 都当场结案：成交回报里有真实平仓成交 → 按 stop/exit 结案；
+    #     确实一笔成交都没有（且成交窗口覆盖得住）→ 连续 N 轮后作废仓位行。
+
+    async def _confirm_entry_fill(self, *, symbol: str, side: int, size_decimals: int,
+                                  qty_int: int, timeout_s: float) -> Optional[int]:
+        """等账户里**真的**出现该标的的仓位；返回成交数量（整数 tick），超时 `None`。"""
+        interval = float(self.fill_poll_interval_s)
+        if timeout_s <= 0 or interval <= 0:
+            attempts = 1
+        else:
+            attempts = int(timeout_s / interval) + 1
+        for attempt in range(max(1, attempts)):
+            snapshot = await self.reader.read()
+            pos = snapshot.position_for(symbol)
+            if pos is not None:
+                if int(pos.side) != int(side):
+                    raise ExecutorError(
+                        f"{symbol}: exchange position side {int(pos.side):+d} contradicts the "
+                        f"entry intent {int(side):+d} — refusing to book it")
+                got = _qty_int_from_decimal(pos.qty, size_decimals)
+                if got > 0:
+                    return got
+            if attempt + 1 < attempts:
+                await self._sleep(interval)
+        return None
+
+    async def _confirm_position_closed(self, *, symbol: str, timeout_s: float) -> bool:
+        """等账户里该标的的仓**真的不见**；超时 `False`。
+
+        离场单同样是 IOC：tx executed 不等于成交。若没成交却把仓位记成 CLOSED，
+        就是一个「本地以为平了、交易所还开着且止损单已被撤/失效」的裸仓 —— 比入场漏记危险得多。
+        """
+        interval = float(self.fill_poll_interval_s)
+        attempts = 1 if timeout_s <= 0 or interval <= 0 else int(timeout_s / interval) + 1
+        for attempt in range(max(1, attempts)):
+            snapshot = await self.reader.read()
+            pos = snapshot.position_for(symbol)
+            # `position_for` 只返回非零仓的行；数量再兜一层（防御性）。
+            if pos is None or float(pos.qty or 0) <= 0:
+                return True
+            if attempt + 1 < attempts:
+                await self._sleep(interval)
+        return False
+
+    async def _recent_trades(self) -> Optional[Tuple[ExchangeTrade, ...]]:
+        """最近的成交回报；读不到 → `None`（**绝不**当成「没有成交」）。"""
+        fn = getattr(self.reader, "trades", None)
+        if fn is None:
+            return None
+        try:
+            return tuple(await fn())
+        except Exception as exc:                                  # noqa: BLE001 - 降级留痕
+            self._event("trades_unavailable",
+                        f"could not read recent trades: {type(exc).__name__}: {exc}",
+                        data={"error": f"{type(exc).__name__}: {exc}"})
+            return None
+
+    async def _settle_grace_issues(self, report: ReconcileReport,
+                                   account: ExchangeAccount, *,
+                                   now_s: Optional[float] = None
+                                   ) -> Tuple[Mapping[str, Any], ...]:
+        """把 `grace` 一致性问题当场结案（成交确认 or 作废鬼影仓）。"""
+        if self.dry_run:
+            return ()
+        stamp = float(self.clock() if now_s is None else now_s)
+        settled: List[Mapping[str, Any]] = []
+        for issue in report.issues:
+            if str(issue.severity) != SEVERITY_GRACE or not issue.symbol:
+                continue
+            pid = int((issue.detail or {}).get("position_id") or 0)
+            row = self.store.position(pid) if pid else None
+            if row is None:
+                self._grace_seen.pop(pid, None)
+                continue
+            seen = self._grace_seen.get(pid, 0) + 1
+            self._grace_seen[pid] = seen
+            trades = await self._recent_trades()
+            fill = _closing_fill(row, trades or ())
+            if fill is not None:
+                kind = "stop" if _closing_fill_matches_stop(row, fill) else "exit"
+                transition = self.lifecycle.complete_close(
+                    pid, exit_price_int=int(fill["price_int"]), kind=kind,
+                    reason="settled_from_trades", fill_id=",".join(fill["trade_ids"]) or None,
+                    realized_pnl=float(fill["pnl"]), ts=stamp)
+                self._event("stop_fill_settled",
+                            f"{issue.symbol}: local position closed by a real exchange fill "
+                            f"— settled as {kind}", symbol=issue.symbol,
+                            data={"position_id": pid, "kind": kind,
+                                  "exit_price_int": int(fill["price_int"]),
+                                  "qty": float(fill["qty"]), "pnl": float(fill["pnl"]),
+                                  "trade_ids": list(fill["trade_ids"]),
+                                  "evidence": "trades_reports_close"})
+                self._grace_seen.pop(pid, None)
+                settled.append({"position_id": pid, "action": "settled", "kind": kind,
+                                "exit_price_int": int(fill["price_int"]),
+                                "pnl": float(fill["pnl"]),
+                                "position_id_after": transition.position_id})
+                continue
+            opened_at = float(row.get("opened_at") or 0.0)
+            provable = trades is not None and _trades_cover(trades, opened_at)
+            if provable and seen >= self.grace_ticks:
+                result = self.store.void_position(
+                    pid, reason="no_fill", ts=stamp,
+                    data={"grace_ticks": seen, "evidence": "no exchange fill in trades window",
+                          "trades_read": len(trades or ()),
+                          "oldest_trade_ts": (min((t.ts for t in trades), default=None))})
+                self._event("position_voided",
+                            f"{issue.symbol}: local position voided — the exchange never "
+                            f"filled it (no fill in the trades window)",
+                            symbol=issue.symbol,
+                            data={"position_id": pid, "grace_ticks": seen,
+                                  "voided": True, "removed_trade_rows":
+                                  int(result.get("removed_trade_rows") or 0)})
+                self._alert("position_voided",
+                            f"{issue.symbol} 本地有仓但交易所从未成交 —— 已作废该仓位行")
+                self._grace_seen.pop(pid, None)
+                settled.append({"position_id": pid, "action": "voided", "reason": "no_fill"})
+                continue
+            if not provable:
+                logger.warning("%s: grace cannot be settled yet — trades window does not "
+                               "cover the position (opened_at=%.0f)", issue.symbol, opened_at)
+        return tuple(settled)
 
     # ---------------------------------------------------------------- 止损守护
     #

@@ -1160,6 +1160,74 @@ class StateStore:
         assert out is not None
         return out
 
+    def void_position(self, position_id: int, *, reason: str = "no_fill",
+                      ts: Optional[float] = None,
+                      data: Optional[Mapping[str, Any]] = None) -> WriteResult:
+        """作废一条**本地有、交易所从未成立**的仓位（`OPEN`/`CLOSING` → `CLOSED`）。
+
+        2026-10-30 线上事实：Lighter 的 `sendTx` 返回 `code=200` 只表示**进了 sequencer**，
+        IOC 单完全可能「执行成功但零成交」（tx ok、无 fill、无仓）—— 本地照样记了一条
+        开仓成交，于是出现「本地有仓 / 交易所空仓且无任何成交」的幽灵仓。
+
+        这个方法**不查交易所**（证据必须由调用方给，`reconcile` 与成交回报是判据来源），
+        它只做「承认事实」的四件事：
+
+        1. 删掉该仓位**未经成交回报确认**的成交行（`fill_id IS NULL`）—— 它们从未发生；
+           **有 `fill_id` 的行一律不动**（那是有交易所成交回报的真实成交，删它就是造假）。
+        2. 受影响日期的 `daily_counters.trades_today` 用**剩余事实**重算（计数行与
+           `trades` 表必须对得上，`audit()` 的 `daily_counter_mismatch` 专门盯这个）。
+        3. 仓位行置 `CLOSED`：`qty/qty_int=0`、`exit_reason=<reason>`、`net_pnl=0`。
+        4. 落 `position_voided` 事件。
+
+        幂等：仓位已经是 `CLOSED` 时直接返回（`idempotent=True`），不抛错。
+        """
+        pid = int(position_id)
+        stamp = now() if ts is None else _finite(ts, default=now())
+        with self.write_transaction() as conn:
+            row = conn.execute("SELECT * FROM positions WHERE id=?", (pid,)).fetchone()
+            if row is None:
+                raise StoreError(f"position {pid} not found")
+            current = str(row["state"])
+            if current == "CLOSED":
+                return WriteResult(position_id=pid, state=current, idempotent=True)
+            if current not in OPEN_STATES:
+                raise StoreError(f"position {pid} is {current}, nothing to void")
+            symbol = str(row["symbol"])
+            confirmed = conn.execute(
+                "SELECT COUNT(*) AS n FROM trades WHERE position_id=? AND fill_id IS NOT NULL",
+                (pid,)).fetchone()["n"]
+            if int(confirmed or 0) > 0:
+                raise StoreError(
+                    f"position {pid} has {int(confirmed)} exchange-confirmed fills — "
+                    "void only applies to positions that never traded on the exchange")
+            doomed = conn.execute(
+                "SELECT id, strftime('%Y-%m-%d', ts, 'unixepoch') AS day FROM trades "
+                "WHERE position_id=? AND fill_id IS NULL", (pid,)
+            ).fetchall()
+            days = {str(r["day"]) for r in doomed if r["day"] is not None}
+            conn.execute("DELETE FROM trades WHERE position_id=? AND fill_id IS NULL", (pid,))
+            for day in sorted(days):
+                remaining = conn.execute(
+                    "SELECT COUNT(*) AS n FROM trades WHERE kind='entry' "
+                    "AND strftime('%Y-%m-%d', ts, 'unixepoch')=?", (day,)).fetchone()["n"]
+                conn.execute(
+                    "UPDATE daily_counters SET trades_today=?, updated_at=? WHERE day=?",
+                    (int(remaining or 0), stamp, day))
+            conn.execute(
+                """UPDATE positions SET state='CLOSED', qty=0.0, qty_int=0, closed_at=?,
+                          exit_reason=?, net_pnl=0.0, updated_at=? WHERE id=?""",
+                (stamp, str(reason), stamp, pid))
+            payload = {"position_id": pid, "symbol": symbol, "reason": str(reason),
+                       "removed_trade_rows": len(doomed), "days_recounted": sorted(days),
+                       "previous_state": current}
+            payload.update({k: v for k, v in dict(data or {}).items() if k not in payload})
+            self._log_event(conn, kind="position_voided",
+                            message=f"{symbol}: local position {pid} voided ({reason}) — "
+                                    "no exchange fill, local row removed",
+                            symbol=symbol, data=payload, ts=stamp)
+        return WriteResult(position_id=pid, state="CLOSED", inserted_trade=False,
+                           voided=True)
+
     # ------------------------------------------------------------ 成交：读
 
     def trades(self, *, limit: int = 50, symbol: Optional[str] = None,

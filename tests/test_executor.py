@@ -145,6 +145,11 @@ class FakeExchange:
         self.reject_leverage = False           # True → ensure_isolated 返回拒绝
         self.reject_alloc = False              # True → allocate_margin 返回拒绝
         self.wait_calls = []
+        #: 2026-10-30：模拟「tx executed 但零成交」（IOC 不可成交）。
+        #: `{'entry'}` → 下单成功但交易所侧不产生仓位；`{'exit'}` → 平仓成功但仓位还在。
+        self.no_fill = set()
+        #: 部分成交：给了就按这个数量开仓（小于 plan.qty_int）
+        self.partial_entry_qty_int = None
 
     # -- 下单 ---------------------------------------------------------------
     def _result(self, action, *, symbol="", **extra):
@@ -181,9 +186,12 @@ class FakeExchange:
         self.entries.append({"symbol": plan.symbol, "side": plan.side,
                              "qty_int": plan.qty_int, "market_id": plan.market_id,
                              "bar_ms": int(bar_ms), "coi": coi})
-        if not self.dry_run:            # dry-run 什么也没发 → 交易所侧不产生仓位
+        if not self.dry_run and "entry" not in self.no_fill:
+            # dry-run 什么也没发 → 交易所侧不产生仓位；
+            # `no_fill` = tx executed 但零成交（2026-10-30 线上事故的形态）
+            qty = int(self.partial_entry_qty_int or plan.qty_int)
             self.positions[plan.symbol] = {"side": int(plan.side),
-                                           "qty_int": int(plan.qty_int),
+                                           "qty_int": qty,
                                            "market_id": int(plan.market_id),
                                            "size_decimals": int(plan.size_decimals)}
         return self._result("entry", symbol=plan.symbol, market_id=int(plan.market_id),
@@ -228,8 +236,9 @@ class FakeExchange:
             return self.reject["exit"]
         self.exits.append({"symbol": symbol, "side": int(side), "qty_int": int(qty_int),
                            "exit_price": float(exit_price), "bar_ms": int(bar_ms)})
-        self.positions.pop(symbol, None)
-        self.orders = [o for o in self.orders if o.symbol != symbol]
+        if "exit" not in self.no_fill:          # no_fill：受理了但仓位还在
+            self.positions.pop(symbol, None)
+            self.orders = [o for o in self.orders if o.symbol != symbol]
         return self._result("exit", symbol=symbol, market_id=int(market_id),
                             side=int(side), qty_int=int(qty_int), reduce_only=True,
                             tx_hash=f"0xexit{int(bar_ms)}")
@@ -253,13 +262,20 @@ class FakeReader:
     """`AccountReader`：从 `FakeExchange` 读（所以正常一轮后两侧一致）。"""
 
     def __init__(self, exchange, *, equity=10_000.0, orders_error="", positions=None,
-                 orders=None):
+                 orders=None, trades=None, trades_error=""):
         self.exchange = exchange
         self.equity = equity
         self.orders_error = orders_error
         self._positions = positions
         self._orders = orders
+        self._trades = trades                # None = 没有 trades 方法的数据 → 返回空
+        self.trades_error = trades_error
         self.reads = 0
+
+    async def trades(self, limit=20):
+        if self.trades_error:
+            raise ReaderError(f"trades unavailable: {self.trades_error}")
+        return tuple(self._trades or ())
 
     async def read(self):
         self.reads += 1
@@ -1414,6 +1430,155 @@ class MarginGuardTests(Base):
                                   margin_isolated=False)
         self.run_tick(ex)
         self.assertEqual(self.exchange.margin_allocs, [])
+
+
+# --------------------------------------------------------------------------- 成交确认
+#
+# 2026-10-30 线上事故回归：Lighter 的 `sendTx` 返回 code=200 只表示「进了 sequencer」。
+# 20:03 那笔 SOL 空单 tx executed，但**零成交**（bar 收盘 99.835，3.8 分钟后市价已跌到
+# 99.1，卖出最差价 99.535 已在盘口之上 ⇒ IOC 不可成交），而本地照样记了仓 + 报「止损
+# 未覆盖」，幽灵仓一直留到人工清理。下面这几条钉住「受理 ≠ 成交」的三个方向。
+
+
+class EntryFillVerificationTests(Base):
+    """开仓必须等到交易所真的出现仓位才记账。"""
+
+    def test_entry_without_exchange_fill_is_not_booked(self):
+        self.exchange.no_fill = {"entry"}
+        ex = self.make_executor(fill_confirm_s=0)
+        report = self.run_tick(ex)
+
+        self.assertEqual(self.store.open_positions(), [], "零成交绝不能记仓")
+        self.assertEqual(self.store.trade_count(), 0, "零成交绝不能记成交行")
+        self.assertEqual(self.exchange.stops, [], "没有仓位就不该挂止损")
+        kinds = [e["kind"] for e in self.events()]
+        self.assertIn("entry_not_filled", kinds)
+        self.assertIn("entry_not_filled", [k for k, _ in self.alerts])
+        self.assertFalse(report.outcomes[0].filled)
+        self.assertFalse(report.outcomes[0].ok)
+        self.assertEqual(self.store.audit(), [], "账务不变式仍然成立")
+
+    def test_partial_fill_books_the_exchange_qty_not_the_plan(self):
+        self.exchange.partial_entry_qty_int = PLAN_QTY_INT // 2
+        ex = self.make_executor(fill_confirm_s=0)
+        self.run_tick(ex)
+
+        rows = self.store.open_positions()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(int(rows[0]["qty_int"]), PLAN_QTY_INT // 2)
+        self.assertEqual(self.exchange.stops[0]["qty_int"], PLAN_QTY_INT // 2,
+                         "止损数量必须跟着真实成交量")
+        self.assertIn("entry_partial_fill", [e["kind"] for e in self.events()])
+        self.assertEqual(self.store.audit(), [])
+
+    def test_dry_run_does_not_wait_for_a_fill(self):
+        """dry-run 本来就不会在交易所产生仓位 —— 不能因此把模拟盘锁死。"""
+        self.exchange.dry_run = True
+        ex = self.make_executor(fill_confirm_s=0)
+        self.run_tick(ex)
+        self.assertEqual(len(self.store.open_positions()), 1)
+        self.assertNotIn("entry_not_filled", [e["kind"] for e in self.events()])
+
+
+class ExitFillVerificationTests(Base):
+    """平仓同样要确认：没成交却记 CLOSED = 本地以为平了、交易所还开着。"""
+
+    def _stop_hit_executor(self, **kwargs):
+        bars = stop_hit_bars()
+        self.market.feeds[BTC] = bars_result(bars, unclosed=())
+        row = self.seed_position(entry_price_int=1120, stop_price_int=1050,
+                                 bar_ms=T0, qty_int=415600)
+        self.exchange.positions[BTC] = {"side": 1, "qty_int": 415600, "market_id": 1}
+        self.exchange.orders = []
+        return row, self.make_executor(fill_confirm_s=0, **kwargs)
+
+    def test_exit_without_fill_keeps_the_position_open(self):
+        row, ex = self._stop_hit_executor()
+        self.exchange.no_fill = {"exit"}
+        report = self.run_tick(ex)
+
+        self.assertEqual(self.store.position(int(row["id"]))["state"], "OPEN",
+                         "没成交就不能记 CLOSED（否则就是裸仓）")
+        self.assertIn("exit_not_filled", [e["kind"] for e in self.events()])
+        self.assertIn("exit_not_filled", [k for k, _ in self.alerts])
+        self.assertFalse(report.outcomes[0].filled)
+        self.assertIsNotNone(self.store.position(int(row["id"]))["closed_at"] is None)
+
+    def test_exit_that_fills_closes_the_position(self):
+        row, ex = self._stop_hit_executor()
+        self.run_tick(ex)
+        self.assertEqual(self.store.position(int(row["id"]))["state"], "CLOSED")
+
+
+class GraceSettlementTests(Base):
+    """`grace` 不能是终点：要么按真实成交结案，要么作废幽灵仓。"""
+
+    def _phantom(self, **kw):
+        """本地有仓 + 交易所空仓 + 止损单没有（= grace 的两个条件）。"""
+        row = self.seed_position(stop_order_id="coi:999", **kw)
+        self.exchange.positions.pop(BTC, None)
+        self.exchange.orders = []
+        self.market.feeds[BTC] = bars_result(quiet_bars(), unclosed=())
+        return row
+
+    def test_grace_voids_a_position_that_never_traded(self):
+        row = self._phantom()
+        ex = self.make_executor(fill_confirm_s=0, grace_ticks=2)
+
+        first = self.run_tick(ex)
+        self.assertEqual(self.store.position(int(row["id"]))["state"], "OPEN",
+                         "第一轮只累计，不动手")
+        self.assertIn("grace", json.dumps(first.reconcile.as_dict()))
+
+        second = self.run_tick(ex)
+        after = self.store.position(int(row["id"]))
+        self.assertEqual(after["state"], "CLOSED")
+        self.assertEqual(after["exit_reason"], "no_fill")
+        self.assertEqual(int(after["qty_int"]), 0)
+        self.assertEqual(self.store.trade_count(), 0, "未成交的开仓行必须删掉")
+        self.assertIn("position_voided", [e["kind"] for e in self.events()])
+        self.assertIn("position_voided", [k for k, _ in self.alerts])
+        self.assertEqual(self.store.audit(), [])
+        self.assertEqual(len(second.grace_settlements), 1)
+
+    def test_grace_settles_a_real_stop_fill_from_trades(self):
+        row = self._phantom()
+        trade = executor.ExchangeTrade(
+            trade_id="37135831346", symbol=BTC, side=-1, qty=float(row["qty"]),
+            qty_str=str(row["qty"]), price=float(row["stop_price"]),
+            ts=float(row["opened_at"]) + 5.0, pnl=-12.5)
+        self.reader._trades = (trade,)
+        ex = self.make_executor(fill_confirm_s=0, grace_ticks=2)
+        self.run_tick(ex)
+
+        after = self.store.position(int(row["id"]))
+        self.assertEqual(after["state"], "CLOSED")
+        self.assertEqual(after["exit_reason"], "settled_from_trades")
+        self.assertAlmostEqual(float(after["net_pnl"]), -12.5, places=6)
+        self.assertIn("stop_fill_settled", [e["kind"] for e in self.events()])
+
+    def test_grace_waits_when_the_trades_window_does_not_cover_it(self):
+        """成交窗口盖不住仓位生命周期 ⇒ 「查不到」不等于「没有」⇒ 不许作废。"""
+        row = self._phantom()
+        # 窗口里最老的一笔在开仓**之后** ⇒ 覆盖不住，不能证明「没有成交」
+        self.reader._trades = (executor.ExchangeTrade(
+            trade_id="1", symbol="ETH", side=1, qty=1.0, qty_str="1.0", price=100.0,
+            ts=float(row["opened_at"]) + 3600.0),)
+        ex = self.make_executor(fill_confirm_s=0, grace_ticks=1)
+        for _ in range(3):
+            self.run_tick(ex)
+        self.assertEqual(self.store.position(int(row["id"]))["state"], "OPEN")
+        self.assertNotIn("position_voided", [e["kind"] for e in self.events()])
+
+    def test_unreadable_trades_never_void_a_position(self):
+        row = self._phantom()
+        self.reader.trades_error = "boom"
+        ex = self.make_executor(fill_confirm_s=0, grace_ticks=1)
+        for _ in range(3):
+            self.run_tick(ex)
+        self.assertEqual(self.store.position(int(row["id"]))["state"], "OPEN")
+        self.assertIn("trades_unavailable", [e["kind"] for e in self.events()])
+
 
 
 if __name__ == "__main__":                                        # pragma: no cover
