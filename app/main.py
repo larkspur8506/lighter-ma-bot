@@ -509,6 +509,23 @@ def stop_guard_on(env: Optional[Mapping[str, str]] = None) -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def entry_slippage_bps(env: Optional[Mapping[str, str]] = None) -> Optional[int]:
+    """开仓「最差价」的滑点带宽（bps），默认 30（`LIGHTER_ENTRY_SLIPPAGE_BPS`）。
+
+    为什么留这个旋钮：tick 在 4h bar 收盘后 ~3 分钟才发单，而开仓是 `MARKET+IOC+最差价`。
+    实测（Lighter 1m K 线，近 10 天 60 个 4h 边界）：收盘后 3.5 分钟的价格漂移
+    p50=10bp / p90=18bp / max=58bp，**>30bp 的占 5%**（而且三例全部发生在 20:00 UTC）。
+    带宽越窄 → 越贴 bar 收盘、越容易零成交（现在会记 `entry_not_filled` 并报警，不再记假仓）；
+    带宽越宽 → 更不容易漏信号，但追价更狠。**默认 30 不动**，要不要放宽是策略口径决定。
+    """
+    raw = (env if env is not None else os.environ).get("LIGHTER_ENTRY_SLIPPAGE_BPS", "")
+    try:
+        value = int(str(raw).strip()) if str(raw).strip() else 30
+    except ValueError:
+        return None                     # None = 用 ExchangeClient 的默认（30bp）
+    return value if value > 0 else None
+
+
 def fill_confirm_seconds(env: Optional[Mapping[str, str]] = None) -> float:
     """开仓后等「账户里真的出现仓位」的窗口（秒），默认 12（`LIGHTER_FILL_CONFIRM_S`）。
 
@@ -1703,8 +1720,12 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
 
     config = Config.from_env()
     market = MarketClient(config.environment)
+    extra: Dict[str, Any] = {}
+    _slip = entry_slippage_bps()
+    if _slip is not None:
+        extra["entry_slippage_bps"] = _slip
     exchange = ExchangeClient.from_config(config, env=os.environ, dry_run=False,
-                                          confirm_live=config.account_index)
+                                          confirm_live=config.account_index, **extra)
     reader = LighterAccountReader(base_url=config.base_url,
                                   account_index=config.account_index,
                                   auth_provider=lambda: exchange.auth.get())

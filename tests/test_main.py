@@ -1079,6 +1079,25 @@ class MergeAcceptedStopsTests(unittest.TestCase):
             self.assertIs(main.stop_guard_on({"LIGHTER_STOP_GUARD": off}), False)
         self.assertIs(main.stop_guard_on({"LIGHTER_STOP_GUARD": "1"}), True)
 
+    def test_fill_confirmation_knobs(self) -> None:
+        """成交确认窗口与 grace 门槛：脏值/负数一律退回默认，绝不放宽成「不等成交」。"""
+        self.assertEqual(main.fill_confirm_seconds({}), 12.0)
+        self.assertEqual(main.fill_confirm_seconds({"LIGHTER_FILL_CONFIRM_S": "0"}), 0.0)
+        self.assertEqual(main.fill_confirm_seconds({"LIGHTER_FILL_CONFIRM_S": "-3"}), 12.0)
+        self.assertEqual(main.fill_confirm_seconds({"LIGHTER_FILL_CONFIRM_S": "abc"}), 12.0)
+        self.assertEqual(main.fill_confirm_seconds({"LIGHTER_FILL_CONFIRM_S": "20"}), 20.0)
+        self.assertEqual(main.grace_ticks({}), 2)
+        self.assertEqual(main.grace_ticks({"LIGHTER_GRACE_TICKS": "1"}), 1)
+        self.assertEqual(main.grace_ticks({"LIGHTER_GRACE_TICKS": "0"}), 2)
+        self.assertEqual(main.grace_ticks({"LIGHTER_GRACE_TICKS": "x"}), 2)
+
+    def test_entry_slippage_knob(self) -> None:
+        """默认就是回测口径的 30bp；`0`/脏值不许把带宽放宽成「无上限」。"""
+        self.assertEqual(main.entry_slippage_bps({}), 30)
+        self.assertEqual(main.entry_slippage_bps({"LIGHTER_ENTRY_SLIPPAGE_BPS": "60"}), 60)
+        self.assertIsNone(main.entry_slippage_bps({"LIGHTER_ENTRY_SLIPPAGE_BPS": "0"}))
+        self.assertIsNone(main.entry_slippage_bps({"LIGHTER_ENTRY_SLIPPAGE_BPS": "abc"}))
+
 
 class FundingRefreshTests(unittest.TestCase):
     """后台资金费率刷新：一次请求拿全部市场，只取 exchange='lighter' 的那一行。"""
