@@ -720,6 +720,17 @@ def _http_error_detail(body: str, limit: int = 200) -> str:
     return text[:limit]
 
 
+def _clean_alert_text(text: str, limit: int = 800) -> str:
+    """告警兜底：HTML 错误页只留标题，超长截断。
+
+    正常告警是多行文案，不动其换行——只有命中 HTML 页（SDK 异常携带整页
+    响应体的场景，如交易所停机/升级窗口）才压成一行。
+    """
+    if "<html" in text.lower():
+        return _http_error_detail(text)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def _default_http_json(url: str, headers: Optional[Mapping[str, str]] = None,
                        timeout: float = 20.0) -> Any:
     request = urllib.request.Request(url, headers=dict(headers or {}))
@@ -2985,7 +2996,7 @@ class Executor:
 
     def _note_failure(self, where: str, exc: BaseException) -> str:
         """记一次硬失败（落 events + 计数 + 可能熔断），返回一句描述。"""
-        failure = f"{where}: {type(exc).__name__}: {exc}"
+        failure = _clean_alert_text(f"{where}: {type(exc).__name__}: {exc}")
         self._failures += 1
         self._event("executor_error", failure,
                     data={"where": where, "error": failure,
@@ -3015,6 +3026,7 @@ class Executor:
 
     def _alert(self, kind: str, text: str) -> None:
         """推送（T9/T12 注入；默认只打日志）。推送失败**必须**留痕，不能静默。"""
+        text = _clean_alert_text(text)
         if self.alert is None:
             logger.warning("[alert:%s] %s", kind, text)
             return
