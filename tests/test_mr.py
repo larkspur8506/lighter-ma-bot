@@ -68,7 +68,8 @@ class FakeExchange:
 
     async def place_market(self, **kwargs):
         self.orders.append(kwargs)
-        return SimpleNamespace(order_id=f"OID-{len(self.orders)}", accepted=True)
+        return SimpleNamespace(order_id=f"OID-{len(self.orders)}", accepted=True,
+                               ok=True, kind="ok")
 
 
 class FakeMarket:
@@ -84,7 +85,7 @@ def _account(equity: float = 500.0, *, mr_qty: str = "0") -> ExchangeAccount:
         positions = (ExchangePosition(
             symbol="QQQ", side=1, qty=Decimal(mr_qty), market_id=129,
             unrealized_pnl=3.0, position_value=250.0, allocated_margin=250.0,
-            funding_paid=0.25),)
+            funding_paid=0.03),)
     return ExchangeAccount(equity=equity, positions=positions, orders=(),
                            orders_error="", as_of=0.0, transaction_time=0.0)
 
@@ -179,10 +180,10 @@ class TestMrExit(unittest.TestCase):
             row = store.mr_recent_trades(1)[0]
             self.assertEqual(row["state"], "CLOSED")
             self.assertEqual(row["exit_signal_date"], "2026-04-17")
-            # funding_pct = 0.25/250×100 = 0.1
-            self.assertAlmostEqual(row["funding_pct"], 0.1, places=6)
-            # net = (95.5 − 93.5)×2.6737 − 0.25
-            self.assertAlmostEqual(row["net_pnl"], 5.0974, places=3)
+            # funding_pct = 0.03/250×100 = 0.012（贴近 0.0004%/h × 30.5h 基线）
+            self.assertAlmostEqual(row["funding_pct"], 0.012, places=6)
+            # net = (95.5 − 93.5)×2.6737 − 0.03
+            self.assertAlmostEqual(row["net_pnl"], 5.3174, places=3)
             self.assertEqual(status["state"], "exited")
             self.assertEqual(trade_id, row["id"])
 
@@ -242,6 +243,141 @@ def _run(coro):
     import asyncio
     return asyncio.get_event_loop().run_until_complete(coro) \
         if False else asyncio.run(coro)
+
+
+class TestMrReviewP3(unittest.TestCase):
+    """P3 对抗审核（2026-11-01 第二轮）新增契约：
+
+    * 下单被拒 → 不写台账（否则假 OPEN 行会把下一轮逼进 recon_err）；
+    * 停用 + 持仓 → 照常离场（停用只挡入场，不能困住仓位）；
+    * funding 超基线 2 倍 → 自动停用 MR 腿（写 mr_admin 事件）；
+    * executor sizing 基数 = 账户权益 − MR 占用（_MR_MARKET_ID 与 MrConfig 一致）。
+    """
+
+    def test_entry_rejected_no_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, market_now=ENTRY_NOW_MS)
+            _enable(store)
+            async def reject(**kwargs):
+                exchange.orders.append(kwargs)
+                return SimpleNamespace(order_id="", accepted=False, ok=False,
+                                       error="post only would cross", kind="rejected")
+            exchange.place_market = reject
+            status = _run(leg.on_tick(now_ms=ENTRY_NOW_MS))
+            self.assertEqual(status["state"], "order_rejected")
+            self.assertIsNone(store.mr_open_trade())
+
+    def test_exit_rejected_keeps_holding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, mr_qty="2.6737")
+            _enable(store)
+            store.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.6737,
+                qty_int=26737, entry_price=ENTRY_DAY_CLOSE, entry_order_id="x",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=250.0, margin=250.0,
+                equity_at_entry=500.0)
+            async def reject(**kwargs):
+                exchange.orders.append(kwargs)
+                return SimpleNamespace(order_id="", accepted=False, ok=False,
+                                       error="boom", kind="rejected")
+            exchange.place_market = reject
+            status = _run(leg.on_tick(now_ms=EXIT_NOW_MS))
+            self.assertEqual(status["state"], "order_rejected")
+            self.assertIsNotNone(store.mr_open_trade())   # 仍 OPEN，下轮重试
+
+    def test_disabled_while_holding_still_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, mr_qty="2.6737")
+            # 不 _enable（停用态）但有持仓 → 必须照常评估离场，不许困仓
+            store.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.6737,
+                qty_int=26737, entry_price=ENTRY_DAY_CLOSE, entry_order_id="x",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=250.0, margin=250.0,
+                equity_at_entry=500.0)
+            status = _run(leg.on_tick(now_ms=EXIT_NOW_MS))
+            self.assertEqual(len(exchange.orders), 1)
+            self.assertEqual(status["state"], "exited")
+
+    def test_disabled_and_flat_skips_candle_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp)
+            calls = []
+            leg.market_client = SimpleNamespace(
+                candles_1h=lambda *a, **k: calls.append(1) or [])
+            status = _run(leg.on_tick(now_ms=ENTRY_NOW_MS))
+            self.assertEqual(status["state"], "disabled")
+            self.assertEqual(calls, [])                    # 停用+空仓不拉 K 线
+
+    def test_funding_over_twice_baseline_disables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, mr_qty="2.6737")
+            _enable(store)
+            store.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.6737,
+                qty_int=26737, entry_price=ENTRY_DAY_CLOSE, entry_order_id="x",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=250.0, margin=250.0,
+                equity_at_entry=500.0)
+            # 交易所侧本仓累计 funding = 5.0 USDC（基线 30.5h ≈ 0.012%）→ 触发
+            rich = ExchangePosition(
+                symbol="QQQ", side=1, qty=Decimal("2.6737"), market_id=129,
+                unrealized_pnl=3.0, position_value=250.0, allocated_margin=250.0,
+                funding_paid=5.0)
+            leg.reader = FakeReader(ExchangeAccount(
+                equity=500.0, positions=(rich,), orders=(), orders_error="",
+                as_of=0.0, transaction_time=0.0))
+            status = _run(leg.on_tick(now_ms=EXIT_NOW_MS))
+            self.assertEqual(status["state"], "exited")
+            self.assertFalse(leg._mr_enabled())            # 自动停用已生效
+
+    def test_exit_uses_exchange_qty_on_partial_fill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, mr_qty="1.5")   # 部分成交：实际 1.5
+            _enable(store)
+            store.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.6737,
+                qty_int=26737, entry_price=ENTRY_DAY_CLOSE, entry_order_id="x",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=250.0, margin=250.0,
+                equity_at_entry=500.0)
+            status = _run(leg.on_tick(now_ms=EXIT_NOW_MS))
+            self.assertEqual(status["state"], "exited")
+            self.assertEqual(exchange.orders[0]["qty_int"], 15000)  # 按实际持仓平
+
+    def test_funding_near_baseline_keeps_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, mr_qty="2.6737")
+            _enable(store)
+            store.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.6737,
+                qty_int=26737, entry_price=ENTRY_DAY_CLOSE, entry_order_id="x",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=250.0, margin=250.0,
+                equity_at_entry=500.0)
+            status = _run(leg.on_tick(now_ms=EXIT_NOW_MS))  # 默认 funding_paid=0.25
+            self.assertEqual(status["state"], "exited")
+            self.assertTrue(leg._mr_enabled())
+
+
+class TestExecutorGuard(unittest.TestCase):
+    """executor 的 sizing 基数剔除 MR 占用；_MR_MARKET_ID 与 MrConfig 钉死一致。"""
+
+    def test_mr_market_id_pin(self):
+        from app import executor as ex_mod
+        self.assertEqual(ex_mod._MR_MARKET_ID, MrConfig().market_id)
+
+    def test_crypto_equity_excludes_mr(self):
+        from app import executor as ex_mod
+        ex = ex_mod.Executor.__new__(ex_mod.Executor)
+        ex._equity = 500.0
+        ex._mr_contribution = 250.0
+        self.assertEqual(ex._crypto_equity, 250.0)
+        ex._equity = None
+        self.assertIsNone(ex._crypto_equity)
+
+    def test_mr_contribution_of(self):
+        from app import executor as ex_mod
+        ex = ex_mod.Executor.__new__(ex_mod.Executor)
+        acct = _account(500.0, mr_qty="2.6737")       # margin 250 + uPnL 3
+        self.assertAlmostEqual(ex._mr_contribution_of(acct), 253.0)
+        self.assertAlmostEqual(ex._mr_contribution_of(_account()), 0.0)
 
 
 if __name__ == "__main__":
