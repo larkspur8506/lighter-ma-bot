@@ -10,7 +10,8 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
-from app.executor import ReaderError, _default_http_json, _http_error_detail
+from app.executor import (ReaderError, _clean_alert_text, _default_http_json,
+                          _http_error_detail)
 
 MAINTENANCE_PAGE = (
     "<html>\r\n<head><title>503 Service Temporarily Unavailable</title></head>\r\n"
@@ -42,6 +43,23 @@ class HttpErrorDetailTests(unittest.TestCase):
 
     def test_truncation_still_applies(self):
         self.assertEqual(len(_http_error_detail("x" * 9000)), 200)
+
+
+class CleanAlertTextTests(unittest.TestCase):
+    """`_alert`/`_note_failure` 的告警兜底：SDK 异常携带 HTML 页时压成标题。"""
+
+    def test_multiline_alert_text_is_untouched(self):
+        text = "第一行\n- 要点 A\n- 要点 B"
+        self.assertEqual(_clean_alert_text(text), text)
+
+    def test_html_page_is_reduced_to_title(self):
+        text = "SOL 止损补挂/换单失败：ApiException (502)\n" + MAINTENANCE_PAGE
+        cleaned = _clean_alert_text(text)
+        self.assertIn("HTML 错误页：503 Service Temporarily Unavailable", cleaned)
+        self.assertNotIn("<html", cleaned.lower())
+
+    def test_overlong_text_is_truncated(self):
+        self.assertEqual(len(_clean_alert_text("y" * 5000)), 801)
 
 
 class DefaultHttpJsonTests(unittest.TestCase):
