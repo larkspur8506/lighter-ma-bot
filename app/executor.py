@@ -75,6 +75,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -705,6 +706,16 @@ class AccountReader:
         return None
 
 
+def _http_error_detail(body: str, limit: int = 200) -> str:
+    """响应体压成一行；HTML 维护页只留标题——整页 HTML 进告警只会是噪音。"""
+    text = " ".join(body.split())
+    if "<html" in text.lower():
+        match = re.search(r"<title>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+        title = " ".join(match.group(1).split()) if match else ""
+        text = f"HTML 错误页：{title}" if title else "HTML 错误页"
+    return text[:limit]
+
+
 def _default_http_json(url: str, headers: Optional[Mapping[str, str]] = None,
                        timeout: float = 20.0) -> Any:
     request = urllib.request.Request(url, headers=dict(headers or {}))
@@ -713,9 +724,8 @@ def _default_http_json(url: str, headers: Optional[Mapping[str, str]] = None,
         with urllib.request.urlopen(request, timeout=timeout) as resp:   # noqa: S310
             body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        detail = ""
         try:
-            detail = exc.read().decode("utf-8", "replace")[:200]
+            detail = _http_error_detail(exc.read().decode("utf-8", "replace"))
         except Exception:                                        # noqa: BLE001 - 只是错误详情
             detail = ""
         raise ReaderError(f"GET {url} -> HTTP {exc.code} {detail}".strip()) from exc
