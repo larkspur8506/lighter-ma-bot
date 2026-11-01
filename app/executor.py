@@ -86,6 +86,11 @@ from typing import (Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Opt
 
 from app import strategy, symbol_registry
 from app.exchange import OrderResult, _site_root, client_order_index
+
+#: MR 腿（feat/mr-leg）的 market_id。与 app/mr.py 的 MrConfig.market_id 同源；
+#: 不能反向 import（mr.py 依赖 executor 的类型）→ 这里钉副本，测试钉住一致性。
+_MR_MARKET_ID = 129
+
 from app.lifecycle import (ACTION_ENTRY, ACTION_EXIT, ACTION_SKIP, ACTION_STOP,
                            IDLE, OPEN, Decision, Lifecycle, Rejection)
 from app.risk import RiskLimits, RiskState
@@ -1490,6 +1495,7 @@ class Executor:
         self.last_report: Optional[TickReport] = None
         #: 记账用的权益（`apply_entry` 的 `equity_at_entry`），每轮刷新。
         self._equity: Optional[float] = None
+        self._mr_contribution: float = 0.0
 
     def __repr__(self) -> str:
         return (f"Executor(symbols={self.symbols}, failures={self._failures}, "
@@ -1598,6 +1604,10 @@ class Executor:
         if account.equity is not None:
             self.store.record_equity(float(account.equity), ts=now_s, source="exchange")
         self._equity = account.equity
+        # MR 腿（feat/mr-leg）占用：逐仓保证金 + uPnL，已计入账户 total_asset_value。
+        # crypto 腿的 **sizing** 不把这份占用当自己的基数（守卫=账户权益−MR 仓）；
+        # 回撤/日亏守护仍看账户总权益——它们守的是整个账户。
+        self._mr_contribution = self._mr_contribution_of(account)
 
         # ④ 取数 + 信号（先全部取完，任何一个标的取数失败 → 本轮停手）
         feeds: Dict[str, Dict[str, Any]] = {}
@@ -1708,8 +1718,26 @@ class Executor:
         info = details.get(symbol)
         return self.lifecycle.decide(
             symbol, feed["bars"], ind=feed["ind"], i=len(feed["bars"]) - 1,
-            signal=feed["signal"], equity=self._equity, market_info=info,
+            signal=feed["signal"], equity=self._crypto_equity, market_info=info,
             risk_state=risk_state)
+
+    def _mr_contribution_of(self, account: "ExchangeAccount") -> float:
+        """MR 腿（mkt129）在本账户的占用 = 逐仓保证金 + uPnL（账户权益已含）。"""
+        total = 0.0
+        for pos in (account.positions or []):
+            if getattr(pos, "market_id", None) != _MR_MARKET_ID:
+                continue
+            total += float(getattr(pos, "allocated_margin", None) or 0.0)
+            total += float(getattr(pos, "unrealized_pnl", None) or 0.0)
+        return total
+
+    @property
+    def _crypto_equity(self) -> Optional[float]:
+        """crypto 腿 sizing 基数 = 账户权益 − MR 仓占用；权益未知时保持 None。"""
+        eq = self._equity
+        if eq is None:
+            return None
+        return eq - self._mr_contribution
 
     @staticmethod
     def _apply_entry_guard(decision: Decision, *, blocks: Sequence[str] = ()

@@ -60,6 +60,8 @@ class MrConfig:
     entry_slippage_bps: int = 15        # 最差价带宽（IOC 保护）
     exit_slippage_bps: int = 15
     candle_count: int = 500             # 1h×500 ≈ 21 天会话
+    #: funding 基线（%名义/小时）。实测 2026-01-22~11-01 中位 0.0004%/h（3.5%/年）。
+    funding_baseline_pct_per_h: float = 0.0004
 
 
 @dataclass
@@ -76,6 +78,11 @@ class MrLeg:
     alert: Optional[Callable[[str], Awaitable[None]]] = None
     _recon_bad_since: Optional[float] = None
     _recon_alerted_at: float = 0.0
+
+    def __post_init__(self) -> None:
+        # `_to_int` 硬编码 ×10000；size_decimals 若被改，台账 qty_int 与下单数量错位
+        if self.config.size_decimals != 4:
+            raise ValueError("MrConfig.size_decimals 固定为 4（_to_int 契约）")
 
     # ------------------------------------------------------------------ 读
 
@@ -171,6 +178,11 @@ class MrLeg:
             status["state"] = "recon_err"
             return status
 
+        # 停用且空仓：连 K 线都不拉（省一次 API/tick）；有仓或启用才继续
+        if not enabled and not holding:
+            status["state"] = "disabled"
+            return status
+
         # ---- 拉场所 1h K 线并聚合会话 --------------------------------------------
         rows = self.market_client.candles_1h(cfg.market_id, count_back=cfg.candle_count)
         if not rows:
@@ -185,9 +197,8 @@ class MrLeg:
         status["last_session_date"] = sessions[-1].date
         status["sessions_usable"] = len(sessions)
 
-        if not enabled:
-            status["state"] = "disabled"
-            return status
+        # 注意：这里没有 `if not enabled: return` —— 停用只挡新入场（快路径在上方
+        # 已拦「停用+空仓」），**停用+持仓必须照常评估离场**，否则仓位被永久困住。
         if not holding:
             await self._maybe_enter(now_ms=now, sessions=sessions, rows=rows,
                                     account=account, status=status)
@@ -259,6 +270,14 @@ class MrLeg:
             symbol=cfg.symbol, market_id=cfg.market_id, qty_int=_to_int(qty),
             price_decimals=cfg.price_decimals, ref_price=last_close, is_entry=True,
             slippage_bps=cfg.entry_slippage_bps, client_order_index=coi)
+        if not getattr(result, "ok", False):
+            # 下单被拒：不写台账（下轮同信号重试 / 对账裁决），只告警
+            status.update(state="order_rejected",
+                          error=str(getattr(result, "error", "")
+                                    or getattr(result, "kind", "") or "unknown"))
+            await self._alert_once(
+                f"MR 入场单被拒（不下台账，下轮重试）：{status['error'][:200]}")
+            return
         trade_id = self.store.mr_record_entry(
             signal_date=signal_date, entry_session=decision["entry_session_date"],
             qty=qty, qty_int=_to_int(qty), entry_price=last_close,
@@ -305,12 +324,25 @@ class MrLeg:
         if exit_date is None:
             return
         last_close = float(rows[-1]["c"])
+        # 数量优先取交易所实际持仓（部分成交时台账 qty 会偏大 → 超量平仓被拒）；
+        # 持仓行缺失（刚下单未对上）才退回台账数量
+        pos_qty = getattr(pos, "qty", None) if pos is not None else None
+        exit_qty_int = (int(round(float(pos_qty) * 10000)) if pos_qty is not None
+                        else int(open_row["qty_int"]))
         coi = client_order_index(cfg.symbol, _signal_ms(str(exit_date)), "mr_exit")
         result = await self.exchange.place_market(
             symbol=cfg.symbol, market_id=cfg.market_id,
-            qty_int=int(open_row["qty_int"]),
+            qty_int=exit_qty_int,
             price_decimals=cfg.price_decimals, ref_price=last_close, is_entry=False,
             slippage_bps=cfg.exit_slippage_bps, client_order_index=coi)
+        if not getattr(result, "ok", False):
+            # 平仓被拒：不写 CLOSED（保持 holding，下轮重试）；若信号窗口翻回去，
+            # 仓位会留着并持续告警——比写假平仓进台账安全
+            status.update(state="order_rejected",
+                          error=str(getattr(result, "error", "")
+                                    or getattr(result, "kind", "") or "unknown"))
+            await self._alert_once(f"MR 离场被拒（下轮重试）：{status['error'][:200]}")
+            return
         funding_paid = getattr(pos, "funding_paid", None)
         notional = float(open_row.get("notional") or 0.0)
         funding_pct = (float(funding_paid) / notional * 100.0
@@ -325,6 +357,19 @@ class MrLeg:
             exit_ts=now_ms / 1000.0, exit_reason="sma5", exit_signal_date=exit_date,
             funding_pct=funding_pct, net_pnl=net_pnl,
             raw={"ref_price": last_close, "result": _result_brief(result)})
+        # 即时止损触发器：实际付出 funding 超基线（0.0004%/h，2026-01-22~11-01 实测
+        # 中位）2 倍且绝对值 >0.01% → 自动停用 MR 腿（写 mr_admin 事件，只挡新入场）
+        if funding_pct is not None and funding_pct > 0:
+            hours = max(now_ms / 1000.0 - float(open_row.get("entry_ts") or 0.0),
+                        0.0) / 3600.0
+            expected = cfg.funding_baseline_pct_per_h * hours
+            if expected > 0 and funding_pct > 2.0 * expected and funding_pct > 0.01:
+                reason = (f"funding {funding_pct:.3f}% 超基线 2 倍"
+                          f"（预期 {expected:.3f}%，持仓 {hours:.1f}h）")
+                self.store.log_event(MR_EVENT_KIND, f"MR 腿自动停用：{reason}",
+                                     data={"enabled": False, "by": "auto",
+                                           "reason": reason})
+                await self._alert_once(f"MR 腿自动停用：{reason}")
         status.update(state="exited", last_fill_at=now_ms / 1000.0)
         await self._alert_once(
             f"MR 离场：QQQ 平多 @≈{last_close:.2f}（净 {net_pnl:+.2f} USDC，"
