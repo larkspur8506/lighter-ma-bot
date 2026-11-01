@@ -394,12 +394,22 @@ class PanelCache:
         self.funding_value: Dict[str, Dict[str, Any]] = {}
         self.updated_at: Optional[float] = None
         self.error: str = ""
-        # tick 已经拉过的 K 线（symbol → (ts, bars)）。面板直接复用，别再自己去交易所
-        # 拉一遍：一次冷拉 3 标的 × 8 页 ≈27s（实测），而且会和 tick 用**不同的起点**
-        # 算出略微不同的 EMA（EMA 用首根收盘播种）—— 那正是「两个面板不一致」的来源。
+        #: tick 已经拉过的 K 线（symbol → (ts, bars)）。面板直接复用，别再自己去交易所
+        #: 拉一遍：一次冷拉 3 标的 × 8 页 ≈27s（实测），而且会和 tick 用**不同的起点**
+        #: 算出略微不同的 EMA（EMA 用首根收盘播种）—— 那正是「两个面板不一致」的来源。
         self.bars_value: Dict[str, Tuple[float, Any]] = {}
+        #: MR 腿状态块（`app/mr.MrLeg.on_tick()` 的返回值）。tick 是唯一 writer。
+        self.mr_value: Optional[Dict[str, Any]] = None
 
     # ---------------------------------------------------------------- 写
+
+    def set_mr(self, value: Optional[Dict[str, Any]]) -> None:
+        """记下本轮 MR 腿状态（面板只读）。"""
+        if isinstance(value, dict):
+            self.mr_value = dict(value)
+
+    def mr(self) -> Optional[Dict[str, Any]]:
+        return dict(self.mr_value) if self.mr_value else None
 
     def set_bars(self, symbol: str, bars: Any, *, ts: Optional[float] = None) -> None:
         """记下 tick 本轮用的 K 线（面板只读，不产生新的取数）。"""
@@ -1246,7 +1256,7 @@ def _default_panel_sources(cache: "PanelCache",
                          positions=cache.positions, marks=cache.marks,
                          funding=cache.funding,
                          prices=cache.prices, bars=bars,
-                         cached_bars=cache.bars)
+                         cached_bars=cache.bars, mr=cache.mr)
 
 
 async def _admin_params(request: Request) -> Dict[str, str]:
@@ -1576,6 +1586,48 @@ def create_app(*, panel: Optional[views.Panel] = None,
                                      "kill": state["kill"], "state": state,
                                      "audit_event_id": event_id, "warnings": []})
 
+    @app.post("/admin/mr")
+    async def admin_mr(request: Request) -> JSONResponse:
+        """MR 腿开关（`on=0|1` 必填）。只挡新入场；持仓照常按信号离场。
+
+        默认停用（没有 `mr_admin` 事件 = 停用）——MR 首笔真单在人工核对之前，
+        这个开关就是它的上线闸门。与 `/admin/kill` 的关系：kill 挡**所有**腿的
+        新开仓（包括 MR）；本开关只管 MR 自己。
+        """
+        params = await _admin_params(request)
+        k = params.get("k", "")
+        reason = params.get("reason", "")
+        by = params.get("by") or "admin"
+        err = _auth_error(request, k, token)
+        store = _store()
+        if err:
+            return _unauthorized("mr", err, store=store, by=by)
+        raw_on = str(params.get("on", "")).strip()
+        if raw_on not in ("0", "1"):
+            message = f"admin/mr 必须显式带 on=0|1，收到 {raw_on!r}"
+            _audit(store, endpoint="mr", result="rejected", by=by,
+                   reason=f"invalid on={raw_on!r}")
+            return JSONResponse(status_code=400, content={
+                "ok": False, "degraded": False, "action": "mr",
+                "error": message, "warnings": [message]})
+        if store is None:
+            return _degraded("mr", "数据库不可用，无法写 MR 开关: "
+                                   f"{panel.store_error or 'unknown'}",
+                             reason=reason, by=by)
+        wanted = raw_on == "1"
+        try:
+            state = views.set_mr_enabled(store, wanted, by=by, reason=reason,
+                                         ts=clock())
+        except Exception as exc:                              # noqa: BLE001 - 降级不崩
+            return _degraded("mr", f"写 MR 开关失败: {type(exc).__name__}: {exc}",
+                             reason=reason, by=by)
+        event_id = _audit(store, endpoint="mr", result="ok" if wanted else "off",
+                          by=by, reason=reason,
+                          extra={"mr_enabled": state["enabled"], "on": raw_on})
+        return JSONResponse(content={"ok": True, "degraded": False, "action": "mr",
+                                     "mr_enabled": state["enabled"], "state": state,
+                                     "audit_event_id": event_id, "warnings": []})
+
     @app.post("/admin/flatten")
     async def admin_flatten(request: Request) -> JSONResponse:
         """市价清仓 + 撤所有挂单（**唯一的「比 kill 更强」操作**）。
@@ -1830,6 +1882,7 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
     from app.config import Config
     from app.executor import Executor, LighterAccountReader
     from app.market import MarketClient
+    from app.mr import MrLeg
 
     config = Config.from_env()
     market = MarketClient(config.environment)
@@ -1898,6 +1951,20 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
                          error=str(getattr(account, "orders_error", "") or ""))
         # 刚并进缓存的那张止损单是开仓之后才下的：tick 开头那次读数看不到它。
         merge_accepted_stops(cache, report)
+        # MR 腿（QQQ 超跌反弹）：复用同一 store/exchange/reader/market，不新增进程。
+        # 它内部自带全量兜底（异常只记状态+告警，不外抛），所以挂在 crypto 腿后面。
+        try:
+            leg = box.get("mr_leg")
+            if leg is None:
+                leg = MrLeg(store=store, exchange=exchange, reader=reader,
+                            market_client=market,
+                            alert=notify.notifier_from_env())
+                box["mr_leg"] = leg
+            cache.set_mr(await leg.on_tick(account=account))
+        except Exception as exc:                              # noqa: BLE001 - MR 不拖死主腿
+            logger.warning("mr leg tick failed: %s: %s", type(exc).__name__, exc)
+            cache.set_mr({"enabled": None, "state": "error", "recon": "unknown",
+                          "error": f"{type(exc).__name__}: {exc}"})
         await _advance_drawdown(store, executor, reader)
         return report
 
