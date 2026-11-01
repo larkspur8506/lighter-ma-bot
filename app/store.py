@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ 常量
 
-SCHEMA_VERSION = 4                      # 当前代码认得的库版本（PRAGMA user_version）
+SCHEMA_VERSION = 5                      # 当前代码认得的库版本（PRAGMA user_version）
 DEFAULT_BUSY_TIMEOUT_MS = 5000          # 面板进程同时读时，写方最多等 5s 再报 busy
 BASE_TWR_INDEX = 1.0                    # TWR 指数基准（建仓/重置时 = 1.0）
 DD_STATE_KEY = "live"                   # dd_state 的单行主键
@@ -461,10 +461,44 @@ _MIGRATION_4: Tuple[str, ...] = (
     "ALTER TABLE positions ADD COLUMN stop_expiry_ts REAL",
 )
 
+#: v5（2026-11-01）：MR（超跌反弹）腿的台账。一个 `signal_date` 一行（唯一约束即
+#: 幂等键：崩溃重试不会重复入场）；状态 OPEN/CLOSED/SKIPPED。funding 在平仓时回填。
+_MIGRATION_5: Tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS mr_trades (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_date        TEXT    NOT NULL,      -- 触发信号的会话日期（幂等键）
+        entry_session      TEXT,                  -- 实际入场会话日期
+        state              TEXT    NOT NULL CHECK (state IN ('OPEN','CLOSED','SKIPPED')),
+        side               INTEGER NOT NULL DEFAULT 1,
+        qty                REAL,
+        qty_int            INTEGER,
+        entry_price        REAL,
+        entry_order_id     TEXT,
+        entry_ts           REAL,
+        notional           REAL,
+        margin             REAL,
+        equity_at_entry    REAL,
+        exit_price         REAL,
+        exit_order_id      TEXT,
+        exit_ts            REAL,
+        exit_reason        TEXT,
+        exit_signal_date   TEXT,
+        funding_pct        REAL,               -- 持仓期累计资金费（占名义 %，正=已支付）
+        net_pnl            REAL,
+        raw                TEXT,
+        created_at         REAL    NOT NULL,
+        updated_at         REAL    NOT NULL,
+        UNIQUE (signal_date)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_mr_trades_state ON mr_trades(state)",
+)
+
 #: `{目标版本: 该版本的语句}`。新增版本只往后追加，**永不改已发布的语句** —— 那是老库
 #: 升级路径唯一的依据（改一个字符，已升级过的库和新建的库就会分叉）。
 MIGRATIONS: Mapping[int, Tuple[str, ...]] = {1: _MIGRATION_1, 2: _MIGRATION_2,
-                                             3: _MIGRATION_3, 4: _MIGRATION_4}
+                                             3: _MIGRATION_3, 4: _MIGRATION_4,
+                                             5: _MIGRATION_5}
 
 
 class AuditFinding(dict):
@@ -1967,6 +2001,87 @@ class StateStore:
             return
         conn.execute("UPDATE daily_counters SET day_start_equity=COALESCE(day_start_equity, ?) "
                      "WHERE day=?", (float(equity), day))
+
+    # ------------------------------------------------------------------ MR 腿台账
+
+    def mr_open_trade(self) -> Optional[Dict[str, Any]]:
+        """MR 腿当前持有的那一笔（state='OPEN'，单槽至多一行）。"""
+        return self._fetchone(
+            "SELECT * FROM mr_trades WHERE state='OPEN' ORDER BY id DESC LIMIT 1")
+
+    def mr_trade_by_signal(self, signal_date: str) -> Optional[Dict[str, Any]]:
+        return self._fetchone("SELECT * FROM mr_trades WHERE signal_date=?",
+                              (str(signal_date),))
+
+    def mr_recent_trades(self, limit: int = 10) -> List[Dict[str, Any]]:
+        return self._fetchall(
+            "SELECT * FROM mr_trades ORDER BY id DESC LIMIT ?", (int(limit),))
+
+    def mr_record_entry(self, *, signal_date: str, entry_session: str, qty: float,
+                        qty_int: int, entry_price: Optional[float],
+                        entry_order_id: Optional[str], entry_ts: float,
+                        notional: Optional[float], margin: Optional[float],
+                        equity_at_entry: Optional[float],
+                        raw: Optional[Mapping[str, Any]] = None) -> int:
+        """写一笔 OPEN 台账行。`signal_date` 唯一约束 = 幂等键：重复调用原样返回已有 id。"""
+        with self.write_transaction() as conn:
+            existing = conn.execute("SELECT id FROM mr_trades WHERE signal_date=?",
+                                    (str(signal_date),)).fetchone()
+            if existing is not None:
+                return int(existing["id"])
+            cursor = conn.execute(
+                "INSERT INTO mr_trades(signal_date, entry_session, state, side, qty, "
+                "qty_int, entry_price, entry_order_id, entry_ts, notional, margin, "
+                "equity_at_entry, raw, created_at, updated_at) "
+                "VALUES(?,?, 'OPEN', 1, ?,?,?,?,?,?,?,?,?,?,?)",
+                (str(signal_date), str(entry_session), float(qty), int(qty_int),
+                 None if entry_price is None else float(entry_price),
+                 None if entry_order_id is None else str(entry_order_id),
+                 float(entry_ts), None if notional is None else float(notional),
+                 None if margin is None else float(margin),
+                 None if equity_at_entry is None else float(equity_at_entry),
+                 None if raw is None else json.dumps(dict(raw), sort_keys=True, default=str),
+                 now(), now()))
+            return int(cursor.lastrowid or 0)
+
+    def mr_mark_skipped(self, signal_date: str, reason: str) -> int:
+        """信号被放弃（超窗口/数值不足等）。已有行则原样返回。"""
+        with self.write_transaction() as conn:
+            existing = conn.execute("SELECT id FROM mr_trades WHERE signal_date=?",
+                                    (str(signal_date),)).fetchone()
+            if existing is not None:
+                return int(existing["id"])
+            cursor = conn.execute(
+                "INSERT INTO mr_trades(signal_date, state, exit_reason, created_at, "
+                "updated_at) VALUES(?, 'SKIPPED', ?, ?, ?)",
+                (str(signal_date), str(reason), now(), now()))
+            return int(cursor.lastrowid or 0)
+
+    def mr_close_trade(self, trade_id: int, *, exit_price: float,
+                       exit_order_id: Optional[str], exit_ts: float,
+                       exit_reason: str, exit_signal_date: Optional[str],
+                       funding_pct: Optional[float], net_pnl: Optional[float],
+                       raw: Optional[Mapping[str, Any]] = None) -> None:
+        with self.write_transaction() as conn:
+            conn.execute(
+                "UPDATE mr_trades SET state='CLOSED', exit_price=?, exit_order_id=?, "
+                "exit_ts=?, exit_reason=?, exit_signal_date=?, funding_pct=?, "
+                "net_pnl=?, raw=COALESCE(?, raw), updated_at=? WHERE id=? AND state='OPEN'",
+                (float(exit_price),
+                 None if exit_order_id is None else str(exit_order_id),
+                 float(exit_ts), str(exit_reason),
+                 None if exit_signal_date is None else str(exit_signal_date),
+                 None if funding_pct is None else float(funding_pct),
+                 None if net_pnl is None else float(net_pnl),
+                 None if raw is None else json.dumps(dict(raw), sort_keys=True, default=str),
+                 now(), int(trade_id)))
+
+    def mr_trade_update_raw(self, trade_id: int, raw: Mapping[str, Any]) -> None:
+        with self.write_transaction() as conn:
+            conn.execute(
+                "UPDATE mr_trades SET raw=?, updated_at=? WHERE id=?",
+                (json.dumps(dict(raw), sort_keys=True, default=str), now(),
+                 int(trade_id)))
 
     def _log_event(self, conn: sqlite3.Connection, *, kind: str, message: str,
                    symbol: Optional[str] = None, data: Optional[Mapping[str, Any]] = None,

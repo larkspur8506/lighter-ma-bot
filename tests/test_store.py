@@ -70,7 +70,14 @@ class StoreTestCase(unittest.TestCase):
 class SchemaTests(StoreTestCase):
     def test_fresh_database_is_at_current_version(self):
         self.assertEqual(self.store.schema_version, SCHEMA_VERSION)
-        self.assertEqual(SCHEMA_VERSION, 4)
+        self.assertEqual(SCHEMA_VERSION, 5)
+
+    def test_v5_adds_mr_trades_table(self):
+        """v5：MR（超跌反弹）腿台账（signal_date 唯一 = 幂等键）。"""
+        cols = {row["name"] for row in self.store._fetchall("PRAGMA table_info(mr_trades)")}
+        self.assertIn("signal_date", cols)
+        self.assertIn("funding_pct", cols)
+        self.assertIn("state", cols)
 
     def test_v4_adds_stop_expiry_column(self):
         """v4：止损到期时刻（Lighter 的 orderExpiry 到期废单，守护据此临期换单）。"""
@@ -96,7 +103,8 @@ class SchemaTests(StoreTestCase):
             "SELECT name FROM sqlite_master WHERE type='table'")
             if not row["name"].startswith("sqlite_")}
         self.assertEqual(names, {"positions", "trades", "equity_curve", "daily_counters",
-                                 "dd_anchors", "dd_state", "events", "account_flows"})
+                                 "dd_anchors", "dd_state", "events", "account_flows",
+                                 "mr_trades"})
         indexes = {row["name"] for row in self.store._fetchall(
             "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")}
         self.assertIn("idx_trades_symbol_ts", indexes)

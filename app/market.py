@@ -802,6 +802,30 @@ class MarketClient:
             end = earliest - 1
         return [seen[stamp] for stamp in sorted(seen)], pages
 
+    def candles_1h(self, market_id: int, *, count_back: int = 500,
+                   now_ms: Optional[int] = None) -> List[dict]:
+        """MR 腿用：拉最近 `count_back` 根 **1h** 原始行（升序、去重）。
+
+        1h 分辨率只在 MR 腿用（聚合美股会话），最近 ~21 天足够，单页拉完不分页。
+        契约与 4h 相同：`start_timestamp=0 & end_timestamp=E & count_back=K`，
+        响应字段是 `c`（不是 `candles`）。
+        """
+        end = int(now_ms if now_ms is not None else self._now_ms())
+        path = (f"candles?market_id={int(market_id)}&resolution=1h"
+                f"&start_timestamp=0&end_timestamp={end}&count_back={int(count_back)}")
+        payload = self._get_json(path)
+        page = payload.get("c") or []
+        seen: Dict[int, dict] = {}
+        for index, row in enumerate(page):
+            try:
+                stamp = int(row["t"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise FeedError(
+                    f"market {market_id}: 1h candle row #{index} has no usable "
+                    f"timestamp") from exc
+            seen[stamp] = row
+        return [seen[stamp] for stamp in sorted(seen)]
+
     def bars(self, symbol: str, *, since_ms: Optional[int] = None,
              now_ms: Optional[int] = None,
              max_age_ms: int = FRESH_MAX_AGE_MS,

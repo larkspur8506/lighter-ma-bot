@@ -784,6 +784,34 @@ def build_exit_order(*, symbol: str, market_id: int, side: int, qty_int: int,
     )
 
 
+def build_mr_market_order(*, symbol: str, market_id: int, qty_int: int,
+                          price_decimals: int, ref_price: float, is_entry: bool,
+                          now_ms: int, slippage_bps: int,
+                          client_order_index: Optional[int] = None) -> OrderSpec:
+    """MR 腿市价单：MARKET + IOC，入场 `reduce_only=0`、离场 `reduce_only=1`。
+
+    MR 只做多：入场 side=+1（买），离场 side=-1（卖，只减仓）。`coi` 必须由调用方
+    传入（以信号会话日期为键），同一次信号的重试天然同键 —— 交易所侧幂等。
+    """
+    now = _check_int(now_ms, "now_ms", minimum=1)
+    qty = _check_int(qty_int, "qty_int", minimum=1)
+    mid = _check_int(market_id, "market_id", minimum=0)
+    bps = _check_int(slippage_bps, "slippage_bps", minimum=0)
+    base = _check_int(price_int_from_float(ref_price, int(price_decimals)),
+                      "ref_price", minimum=1)
+    coi = _check_int(client_order_index, "client_order_index", minimum=1)
+    order_side = 1 if is_entry else -1
+    return OrderSpec(
+        purpose="mr_entry" if is_entry else "mr_exit",
+        symbol=str(symbol).upper(), market_id=mid, side=order_side,
+        position_side=1,
+        qty_int=qty, price_int=worst_price_int(base, bps, is_ask=order_side > 0),
+        order_type=ORDER_TYPE_MARKET, time_in_force=ORDER_TIME_IN_FORCE_IOC,
+        reduce_only=(not is_entry), trigger_price_int=0, order_expiry_ms=0,
+        client_order_index=coi,
+    )
+
+
 def _clamp_expiry(now_ms: int, expiry_ms: int) -> int:
     """把 `orderExpiry` 收到文档允许的 `[now+5min, now+30d]` 区间内（fail-loud 地）。
 
@@ -1500,6 +1528,18 @@ class ExchangeClient:
             price_decimals=price_decimals, exit_price=exit_price, now_ms=self._now_ms(),
             bar_ms=bar_ms, slippage_bps=self.exit_slippage_bps,
             client_order_index=client_order_index, limit_price_int=limit_price_int)
+        return await self._submit(spec)
+
+    async def place_market(self, *, symbol: str, market_id: int, qty_int: int,
+                           price_decimals: int, ref_price: float, is_entry: bool,
+                           slippage_bps: int,
+                           client_order_index: int) -> OrderResult:
+        """MR 腿市价单（MARKET + IOC）。`coi` 由调用方按信号日期推导（幂等键）。"""
+        spec = build_mr_market_order(
+            symbol=symbol, market_id=market_id, qty_int=qty_int,
+            price_decimals=price_decimals, ref_price=ref_price, is_entry=is_entry,
+            now_ms=self._now_ms(), slippage_bps=slippage_bps,
+            client_order_index=client_order_index)
         return await self._submit(spec)
 
     async def cancel_all(self, market_id: int) -> OrderResult:

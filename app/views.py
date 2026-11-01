@@ -76,7 +76,8 @@ __all__ = [
     "BLOCK_EVENTS", "BLOCK_PNL", "BLOCK_POSITIONS", "BLOCK_RECORDS", "BLOCK_STATUS",
     "BLOCK_STOPS", "BLOCK_SYMBOLS", "BLOCKS", "DEFAULT_SYMBOLS", "HOMEPAGE_BLOCKS",
     "KILL_EVENT_KIND", "LEVERAGE", "MAX_CURVE_POINTS", "MAX_EVENTS", "MAX_RECORD_ROWS",
-    "Panel", "RECORDS_BLOCKS", "Sources", "event_action", "kill_state", "pnl_curve",
+    "Panel", "RECORDS_BLOCKS", "Sources", "event_action", "kill_state", "mr_state",
+    "set_mr_enabled", "pnl_curve",
     "render_html", "render_records_html", "set_kill",
 ]
 
@@ -325,6 +326,39 @@ def set_kill(store: StateStore, enabled: Any, *, by: str = "admin", reason: str 
     return {"kill": flag, "known": True, "ts": _finite(ts), **payload}
 
 
+# ------------------------------------------------------------------ MR 开关
+
+
+def mr_state(store: Any) -> Dict[str, Any]:
+    """MR 腿开关状态（`events` 里最后一条 `mr_admin`；没有事件 = 停用，这是默认上线态）。"""
+    out = {"enabled": False, "known": True, "ts": None, "by": "", "reason": ""}
+    if store is None:
+        return out
+    try:
+        rows = store.events(kind="mr_admin", limit=1)
+    except Exception as exc:                                  # noqa: BLE001 - 面板不抛
+        logger.warning("could not read mr state: %s", exc)
+        return dict(out, known=False)
+    if not rows:
+        return out
+    data = _loads(_row_get(rows[0], "data"))
+    return {"enabled": bool(data.get("enabled", False)), "known": True,
+            "ts": _finite(_row_get(rows[0], "ts")),
+            "by": str(data.get("by") or ""), "reason": str(data.get("reason") or "")}
+
+
+def set_mr_enabled(store: StateStore, enabled: Any, *, by: str = "admin",
+                   reason: str = "", ts: Optional[float] = None) -> Dict[str, Any]:
+    """落一条 `mr_admin` 事件（**持久化**+审计）。只挡新入场，持仓照常按信号离场。"""
+    flag = bool(enabled)
+    payload = {"enabled": flag, "by": str(by or "admin"), "reason": str(reason or "")}
+    store.log_event("mr_admin",
+                    f"MR leg {'ENABLED' if flag else 'DISABLED'} by {payload['by']}"
+                    f"{(': ' + payload['reason']) if payload['reason'] else ''}",
+                    data=payload, ts=ts)
+    return {"enabled": flag, "known": True, "ts": _finite(ts), **payload}
+
+
 # ------------------------------------------------------------------ 盈亏曲线
 
 
@@ -525,6 +559,8 @@ class Sources:
     #: `/status` 用它算「数据源新鲜度」：没有它时状态条会为了一个时间戳去拉 3 标的 × 8 页
     #: K 线 —— 实测重启后第一次 `/status` 要 24s（之后才快，因为缓存被顺手暖了）。
     cached_bars: Optional[Callable[[str], Any]] = None
+    #: `() -> dict`，MR（超跌反弹）腿的状态块（tick 写入 PanelCache；见 `app/mr.py`）。
+    mr: Optional[Callable[[], Any]] = None
 
 
 # ------------------------------------------------------------------ 面板
@@ -744,6 +780,14 @@ class Panel:
         open_positions = store.open_positions()
         open_count = len(open_positions)
 
+        mr_block: Optional[Dict[str, Any]] = None
+        if self.sources.mr is not None:
+            try:
+                raw_mr = self.sources.mr()
+                mr_block = dict(raw_mr) if raw_mr else None
+            except Exception as exc:                          # noqa: BLE001 - 面板不抛
+                warnings.append(f"MR 状态读不出来: {type(exc).__name__}: {exc}")
+
         kill = kill_state(store)
         if not kill["known"]:
             warnings.append("kill 状态读不出来（当作「不知道」，不是「关着」）")
@@ -821,6 +865,7 @@ class Panel:
             "data_source": data_source,
             "credentials": credentials,
             "dd": dd_payload,
+            "mr": mr_block,
             "warnings": warnings,
             "degraded": bool(warnings),
         }
@@ -1883,6 +1928,21 @@ def _warn_html(warnings: Sequence[Any]) -> str:
     return '<div class="warnlist">⚠ ' + "<br>⚠ ".join(items) + "</div>"
 
 
+def _mr_status_chip(mr: Any) -> str:
+    """状态条里的 MR 徽标：`MR 停用 / MR 空仓 / MR 在场 (+uPnL) / MR 异常`。"""
+    if not isinstance(mr, Mapping) or not mr:
+        return '<span class="kv dim">MR —</span>'
+    err = str(mr.get("error") or "")
+    if err or str(mr.get("state") or "") in ("error", "recon_err"):
+        return '<span class="kv">MR <b class="neg">异常</b></span>'
+    if not mr.get("enabled"):
+        return '<span class="kv dim">MR 停用</span>'
+    pos = mr.get("pos") or {}
+    if isinstance(pos, Mapping) and pos:
+        return (f'<span class="kv">MR 在场 <b>{_money(pos.get("upnl"))} U</b></span>')
+    return f'<span class="kv dim">MR {html.escape(str(mr.get("state") or "空仓"))}</span>'
+
+
 def _status_html(block: Mapping[str, Any], mode: str) -> str:
     level = str(block.get("level") or "warn")
     dd = block.get("dd") or {}
@@ -1900,6 +1960,7 @@ def _status_html(block: Mapping[str, Any], mode: str) -> str:
         f'<span class="kv">持仓 <b>{int(block.get("open_count") or 0)}'
         f'/{int(block.get("max_positions") or 0)}</b></span>',
         f'<span class="kv">kill <b>{"ON" if block.get("kill") else "off"}</b></span>',
+        _mr_status_chip(block.get("mr")),
         f'<span class="kv">回撤 <b>{_pct(dd.get("drawdown"))}</b>'
         f' <span class="dim">({html.escape(str(dd.get("action") or "?"))})</span></span>',
         f'<span class="kv">模式 <b>{html.escape(mode)}</b></span>',

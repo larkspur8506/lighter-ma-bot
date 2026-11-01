@@ -1,0 +1,369 @@
+"""MR（超跌反弹）腿的执行编排 — 挂在现有 tick 里跑，不新建进程/容器/凭据。
+
+设计边界（2026-11-01 定稿）：
+
+- **单槽**：同一时刻至多一笔持仓；持仓中忽略一切新信号。
+- **仓位**：名义 = （账户权益 − MR 仓贡献）× 0.5；逐仓保证金 = 名义（1x）。
+  权益读交易所 `total_asset_value`，MR 仓贡献 = allocated_margin + uPnL ——
+  这样 crypto 腿自己的守卫口径（账户权益）天然**剔除**了 MR 的占用。
+- **纯市价零挂单**：入场/离场都是 MARKET+IOC，`reduce_only` 只在离场为 1。
+  绝不调用任何账户级撤单（`cancel_all_orders()` 会误伤 crypto 腿的止损单；
+  `cancel_all(market_id)` 只在 mr market 上是安全的，但 MR 根本不挂单，用不到）。
+- **幂等**：入场 coi 以信号会话日期为键（`client_order_index(symbol, signal_ms,
+  "mr_entry")`）；台账 `signal_date` 唯一约束。崩溃重启后同信号重试同键 ——
+  交易所拒重、台账拒重，双重保险。
+- **对账 fail-closed**：本地台账与交易所 mkt129 持仓不一致（任一方向）→
+  不做任何动作 + 事件告警，等人工。**不自动吃掉未知仓位**。
+- **kill 语义**：全局 `/admin/kill` 与 MR 专属 `/admin/mr` 都只挡**新入场**，
+  持仓照常按信号离场（和 crypto 腿一致——kill 不挡离场）。
+- MR 默认停用上线：没有 `mr_admin` 事件 = 停用。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable, Mapping, Optional
+from zoneinfo import ZoneInfo
+
+from . import mr_signal
+from .exchange import ExchangeClient, client_order_index
+from .executor import AccountReader, ExchangeAccount
+from .market import MarketClient
+from .store import StateStore
+
+logger = logging.getLogger(__name__)
+
+#: MR 开关事件（最后一条为准；没有事件 = 停用）。
+MR_EVENT_KIND = "mr_admin"
+#: 全局 kill 事件的 kind（与 views.KILL_EVENT_KIND 同值；不 import views 防环）。
+_KILL_EVENT_KIND = "admin_kill"
+#: 对账不一致告警的最小间隔（秒）——同一问题不刷屏。
+_RECON_ALERT_INTERVAL_S = 6 * 3600.0
+
+
+@dataclass(frozen=True)
+class MrConfig:
+    """MR 腿参数。改动 = 改这里 + 走 PR（参数面刻意最小）。"""
+
+    symbol: str = "QQQ"
+    market_id: int = 129                # Lighter QQQ 永续（0/0 费，实测 $1M/日）
+    size_decimals: int = 4              # 最小 0.0075 QQQ
+    price_decimals: int = 2
+    exposure: float = 0.5               # 名义 = 权益 × 0.5
+    min_base_qty: float = 0.0075
+    min_quote_notional: float = 10.0    # 名义下限 $10
+    leverage: float = 1.0               # 逐仓保证金 = 名义
+    entry_slippage_bps: int = 15        # 最差价带宽（IOC 保护）
+    exit_slippage_bps: int = 15
+    candle_count: int = 500             # 1h×500 ≈ 21 天会话
+
+
+@dataclass
+class MrLeg:
+    """MR 腿。tick 每轮调用一次 `on_tick()`；其余一律不碰。"""
+
+    store: StateStore
+    exchange: ExchangeClient
+    reader: AccountReader
+    market_client: MarketClient
+    config: MrConfig = field(default_factory=MrConfig)
+    clock: Callable[[], float] = time.time
+    #: 告警出口（tick 侧接 executor 的清洗告警；测试注入假函数）。
+    alert: Optional[Callable[[str], Awaitable[None]]] = None
+    _recon_bad_since: Optional[float] = None
+    _recon_alerted_at: float = 0.0
+
+    # ------------------------------------------------------------------ 读
+
+    def _mr_enabled(self) -> bool:
+        rows = self.store.events(kind=MR_EVENT_KIND, limit=1)
+        if not rows:
+            return False
+        payload = _event_payload(rows[0])
+        return bool(payload.get("enabled", False))
+
+    def _global_kill(self) -> bool:
+        rows = self.store.events(kind=_KILL_EVENT_KIND, limit=1)
+        if not rows:
+            return False
+        payload = _event_payload(rows[0])
+        return bool(payload.get("kill", False))   # 读不懂当「不知道」→ 不当开仓绿灯
+
+    def _exchange_mr_position(self, account: ExchangeAccount):
+        for pos in account.positions:
+            if getattr(pos, "market_id", None) == self.config.market_id:
+                return pos
+        return None
+
+    def _mr_position_contribution(self, pos: Any) -> float:
+        """MR 仓从账户权益里占走的部分（allocated_margin + uPnL）。取不到分量时回退仓位价值。"""
+        allocated = getattr(pos, "allocated_margin", None)
+        upnl = getattr(pos, "unrealized_pnl", None)
+        if allocated is not None:
+            contrib = float(allocated) + (float(upnl) if upnl is not None else 0.0)
+            return max(contrib, 0.0)
+        value = getattr(pos, "position_value", None)
+        return float(value) if value is not None else 0.0
+
+    async def _alert_once(self, message: str) -> None:
+        logger.warning("mr: %s", message)
+        self.store.log_event(MR_EVENT_KIND + "_alert", message)
+        if self.alert is not None:
+            try:
+                await self.alert(message)
+            except Exception as exc:                          # noqa: BLE001
+                logger.warning("mr: alert delivery failed: %s", exc)
+
+    # ------------------------------------------------------------------ 主流程
+
+    async def on_tick(self, now_ms: Optional[int] = None,
+                      account: Optional[ExchangeAccount] = None) -> dict:
+        """每轮 tick 调一次。返回面板 status 块；异常不外抛（MR 挂了不能拖死 crypto 腿）。"""
+        cfg = self.config
+        status: dict = {"enabled": False, "kill": False, "state": "disabled",
+                        "recon": "unknown", "error": "", "updated_at": self.clock()}
+        try:
+            status = await self._on_tick_inner(now_ms=now_ms, account=account,
+                                               status=status)
+        except Exception as exc:                              # noqa: BLE001
+            logger.exception("mr: tick failed")
+            status.update(state="error", error=f"{type(exc).__name__}: {exc}",
+                          updated_at=self.clock())
+            await self._alert_once(f"MR tick 异常：{type(exc).__name__}: {exc}")
+        return status
+
+    async def _on_tick_inner(self, *, now_ms: Optional[int], status: dict,
+                             account: Optional[ExchangeAccount]) -> dict:
+        cfg = self.config
+        now = int(now_ms if now_ms is not None else int(self.clock() * 1000))
+        enabled = self._mr_enabled()
+        kill = self._global_kill()
+        status.update(enabled=enabled, kill=kill)
+
+        open_row = self.store.mr_open_trade()
+        if account is None:
+            account = await self.reader.read()
+        pos = self._exchange_mr_position(account)
+
+        # ---- 对账（双向）：本地 OPEN ↔ 交易所持仓 --------------------------------
+        holding = False
+        recon_ok = True
+        if open_row is not None and pos is None and self._entry_is_fresh(open_row, now):
+            holding = True                                    # 刚下单，持仓行还没出现
+        elif open_row is not None and pos is None:
+            recon_ok = False
+            await self._recon_fail("台账有 OPEN 仓但交易所没有 mkt129 持仓（人工核对）",
+                                   status)
+        elif open_row is None and pos is not None:
+            recon_ok = False
+            await self._recon_fail("交易所有 mkt129 持仓但台账没有 OPEN（人工核对，不自动吃）",
+                                   status)
+        elif open_row is not None and pos is not None:
+            holding = True
+        if recon_ok:
+            self._recon_clear(status)
+
+        if status.get("recon") == "err":
+            status["state"] = "recon_err"
+            return status
+
+        # ---- 拉场所 1h K 线并聚合会话 --------------------------------------------
+        rows = self.market_client.candles_1h(cfg.market_id, count_back=cfg.candle_count)
+        if not rows:
+            status.update(state="no_data", error="1h candles empty")
+            await self._alert_once("MR 拿不到 1h K 线（空响应）")
+            return status
+        sessions = mr_signal.aggregate_sessions(rows)
+        if len(sessions) < 6:
+            status.update(state="no_data", error=f"usable sessions={len(sessions)}")
+            return status
+
+        status["last_session_date"] = sessions[-1].date
+        status["sessions_usable"] = len(sessions)
+
+        if not enabled:
+            status["state"] = "disabled"
+            return status
+        if not holding:
+            await self._maybe_enter(now_ms=now, sessions=sessions, rows=rows,
+                                    account=account, status=status)
+        else:
+            await self._maybe_exit(now_ms=now, sessions=sessions, rows=rows,
+                                   open_row=open_row, pos=pos, status=status)
+        return status
+
+    # ------------------------------------------------------------------ 对账辅助
+
+    def _entry_is_fresh(self, open_row: Mapping[str, Any], now_ms: int) -> bool:
+        ts = open_row.get("entry_ts")
+        if not ts:
+            return False
+        return (now_ms / 1000.0 - float(ts)) < 2 * 3600.0
+
+    async def _recon_fail(self, message: str, status: dict) -> None:
+        status["recon"] = "err"
+        now_s = self.clock()
+        if self._recon_bad_since is None:
+            self._recon_bad_since = now_s
+        if now_s - self._recon_alerted_at >= _RECON_ALERT_INTERVAL_S:
+            self._recon_alerted_at = now_s
+            await self._alert_once(f"MR 对账不平：{message}")
+        logger.error("mr recon: %s", message)
+
+    def _recon_clear(self, status: dict) -> None:
+        status["recon"] = "ok"
+        self._recon_bad_since = None
+
+    # ------------------------------------------------------------------ 入场
+
+    async def _maybe_enter(self, *, now_ms: int, sessions, rows, account: ExchangeAccount,
+                           status: dict) -> None:
+        cfg = self.config
+        if status.get("kill"):
+            status["state"] = "flat"
+            return
+        decision = mr_signal.entry_decision(sessions=sessions, now_ms=now_ms, flat=True)
+        status["state"] = "flat"
+        if decision is None:
+            self._mark_expired_signal(sessions=sessions, now_ms=now_ms)
+            return
+        signal_date = decision["signal_date"]
+        if self.store.mr_trade_by_signal(signal_date) is not None:
+            return                                           # 该信号已有台账（CLOSED/SKIPPED）
+
+        last_close = float(rows[-1]["c"])
+        equity = account.equity
+        if equity is None or equity <= 0:
+            status["state"] = "no_equity"
+            return
+        notional = equity * cfg.exposure
+        qty = int(notional / last_close * (10 ** cfg.size_decimals)) / (10 ** cfg.size_decimals)
+        if qty < cfg.min_base_qty or notional < cfg.min_quote_notional:
+            reason = (f"权益不足：equity={equity:.2f} notional={notional:.2f} "
+                      f"qty={qty}（min {cfg.min_base_qty} QQQ / ${cfg.min_quote_notional}）")
+            self.store.mr_mark_skipped(signal_date, reason)
+            await self._alert_once(f"MR 信号 {signal_date} 放弃：{reason}")
+            return
+        if notional > equity:
+            self.store.mr_mark_skipped(signal_date, "notional > equity（保证金不足保护）")
+            return
+
+        coi = client_order_index(cfg.symbol, _signal_ms(signal_date), "mr_entry")
+        await self.exchange.ensure_isolated(market_id=cfg.market_id,
+                                            leverage=cfg.leverage)
+        result = await self.exchange.place_market(
+            symbol=cfg.symbol, market_id=cfg.market_id, qty_int=_to_int(qty),
+            price_decimals=cfg.price_decimals, ref_price=last_close, is_entry=True,
+            slippage_bps=cfg.entry_slippage_bps, client_order_index=coi)
+        trade_id = self.store.mr_record_entry(
+            signal_date=signal_date, entry_session=decision["entry_session_date"],
+            qty=qty, qty_int=_to_int(qty), entry_price=last_close,
+            entry_order_id=str(getattr(result, "order_id", "") or ""),
+            entry_ts=now_ms / 1000.0, notional=notional, margin=notional,
+            equity_at_entry=equity, raw={"ref_price": last_close,
+                                         "result": _result_brief(result)})
+        status.update(state="entered", last_fill_at=now_ms / 1000.0)
+        await self._alert_once(
+            f"MR 入场：QQQ {qty} @≈{last_close:.2f}（名义 {notional:.2f}，"
+            f"信号 {signal_date}），台账 #{trade_id}")
+
+    def _mark_expired_signal(self, *, sessions, now_ms: int) -> None:
+        """信号日已整体错过（入场日已是过去时）却没有台账 → 记 SKIPPED，可审计。"""
+        sigs = mr_signal.session_signals(sessions)
+        k = mr_signal.completed_upto(sessions, now_ms)
+        if k <= 0 or not sigs[k - 1]["entry"]:
+            return
+        s = sessions[k - 1]
+        entry_day = mr_signal.next_business_day(s.date)
+        today = (datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
+                 .astimezone(ZoneInfo(mr_signal.SESSION_TZ)).strftime("%Y-%m-%d"))
+        if entry_day < today and self.store.mr_trade_by_signal(s.date) is None:
+            self.store.mr_mark_skipped(s.date, "窗口错过（停机/延迟）")
+
+    # ------------------------------------------------------------------ 离场
+
+    async def _maybe_exit(self, *, now_ms: int, sessions, rows, open_row, pos,
+                          status: dict) -> None:
+        cfg = self.config
+        entry_session = str(open_row.get("entry_session") or open_row.get("signal_date"))
+        exit_date = mr_signal.exit_decision(sessions=sessions, now_ms=now_ms,
+                                            entry_session_date=entry_session)
+        status["state"] = "holding"
+        status["pos"] = {
+            "signal_date": open_row.get("signal_date"),
+            "entry_session": entry_session,
+            "qty": open_row.get("qty"),
+            "entry_price": open_row.get("entry_price"),
+            "notional": open_row.get("notional"),
+            "upnl": getattr(pos, "unrealized_pnl", None),
+            "funding_paid": getattr(pos, "funding_paid", None),
+        }
+        if exit_date is None:
+            return
+        last_close = float(rows[-1]["c"])
+        coi = client_order_index(cfg.symbol, _signal_ms(str(exit_date)), "mr_exit")
+        result = await self.exchange.place_market(
+            symbol=cfg.symbol, market_id=cfg.market_id,
+            qty_int=int(open_row["qty_int"]),
+            price_decimals=cfg.price_decimals, ref_price=last_close, is_entry=False,
+            slippage_bps=cfg.exit_slippage_bps, client_order_index=coi)
+        funding_paid = getattr(pos, "funding_paid", None)
+        notional = float(open_row.get("notional") or 0.0)
+        funding_pct = (float(funding_paid) / notional * 100.0
+                       if funding_paid is not None and notional > 0 else None)
+        entry_price = float(open_row.get("entry_price") or 0.0)
+        qty = float(open_row.get("qty") or 0.0)
+        net_pnl = ((last_close - entry_price) * qty
+                   - (float(funding_paid) if funding_paid is not None else 0.0))
+        self.store.mr_close_trade(
+            int(open_row["id"]), exit_price=last_close,
+            exit_order_id=str(getattr(result, "order_id", "") or ""),
+            exit_ts=now_ms / 1000.0, exit_reason="sma5", exit_signal_date=exit_date,
+            funding_pct=funding_pct, net_pnl=net_pnl,
+            raw={"ref_price": last_close, "result": _result_brief(result)})
+        status.update(state="exited", last_fill_at=now_ms / 1000.0)
+        await self._alert_once(
+            f"MR 离场：QQQ 平多 @≈{last_close:.2f}（净 {net_pnl:+.2f} USDC，"
+            f"funding {funding_pct if funding_pct is not None else '?'}%），"
+            f"信号日 {exit_date}")
+
+
+# ------------------------------------------------------------------ 工具
+
+def _event_payload(row: Mapping[str, Any]) -> dict:
+    """事件行的 data 列（JSON 字符串或 dict）→ dict；解析失败返回 {}。"""
+    data = row.get("data")
+    if isinstance(data, Mapping):
+        return dict(data)
+    if isinstance(data, str):
+        try:
+            parsed = json.loads(data)
+        except ValueError:
+            return {}
+        if isinstance(parsed, Mapping):
+            return dict(parsed)
+    return {}
+
+
+def _signal_ms(signal_date: str) -> int:
+    """会话日期 → 确定性毫秒键（UTC 零点）。coi 只需要稳定，不要求语义。"""
+    dt = datetime.strptime(signal_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _to_int(qty: float) -> int:
+    """qty（浮点，size_decimals 已取整）→ 整数 base 单位。"""
+    return int(round(qty * 10000))
+
+
+def _result_brief(result: Any) -> dict:
+    out: dict = {}
+    for key in ("order_id", "accepted", "status", "submit_id"):
+        val = getattr(result, key, None)
+        if val is not None:
+            out[key] = val if isinstance(val, (int, float, bool, str)) else str(val)
+    return out
