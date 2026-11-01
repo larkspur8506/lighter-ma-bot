@@ -75,7 +75,6 @@ import asyncio
 import json
 import logging
 import math
-import re
 import time
 import urllib.error
 import urllib.parse
@@ -709,9 +708,14 @@ class AccountReader:
 def _http_error_detail(body: str, limit: int = 200) -> str:
     """响应体压成一行；HTML 维护页只留标题——整页 HTML 进告警只会是噪音。"""
     text = " ".join(body.split())
-    if "<html" in text.lower():
-        match = re.search(r"<title>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
-        title = " ".join(match.group(1).split()) if match else ""
+    lower = text.lower()
+    if "<html" in lower:
+        title = ""
+        start = lower.find("<title>")
+        if start != -1:
+            end = lower.find("</title>", start)
+            if end != -1:
+                title = " ".join(text[start + len("<title>"):end].split())
         text = f"HTML 错误页：{title}" if title else "HTML 错误页"
     return text[:limit]
 
