@@ -876,10 +876,11 @@ def _entry_window(sessions, now_ms: int):
     sig = mr_signal.session_signals(sessions[:k])[k - 1]
     if not sig.get("entry"):
         return None
+    # 窗口从 09:30 ET 起算（不是 09:00）：09:30 + 3h = 12:30。
+    end_min = 9 * 60 + 30 + int(round(mr_signal.ENTRY_WINDOW_H * 60))
     return {"date": mr_signal.next_business_day(sessions[k - 1].date),
             "start_et": "09:30",
-            "deadline_et": f"{9 + int(mr_signal.ENTRY_WINDOW_H)}:"
-                           f"{int((mr_signal.ENTRY_WINDOW_H % 1) * 60):02d}"}
+            "deadline_et": f"{end_min // 60}:{end_min % 60:02d}"}
 
 
 def _phase(sessions, now_ms: int) -> str:

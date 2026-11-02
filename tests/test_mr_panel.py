@@ -165,5 +165,21 @@ class MrDynamicsTests(MrPanelFixture):
         self.assertNotIn("超跌腿", page)
 
 
+class MrWindowTests(unittest.TestCase):
+    """入场窗口文案：09:30 ET 起算 3 小时 = 12:30（曾算成 12:00）。"""
+
+    def test_entry_window_deadline(self) -> None:
+        from app import mr, mr_signal
+        ss = [mr_signal.SessionBar(date=d, open=c, high=c, low=c, close=c, bars=6,
+                                   last_bar_ms=0, last_bar_et="15:00")
+              for d, c in zip(["2026-10-26", "2026-10-27", "2026-10-28",
+                               "2026-10-29", "2026-10-30"],
+                              [95.0, 94.0, 93.0, 92.0, 88.0])]
+        win = mr._entry_window(ss, 1793630100000)      # 2026-11-02 09:35 ET
+        self.assertEqual(win["date"], "2026-11-02")
+        self.assertEqual(win["start_et"], "09:30")
+        self.assertEqual(win["deadline_et"], "12:30")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
