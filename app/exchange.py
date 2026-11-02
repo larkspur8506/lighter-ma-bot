@@ -801,11 +801,15 @@ def build_mr_market_order(*, symbol: str, market_id: int, qty_int: int,
                       "ref_price", minimum=1)
     coi = _check_int(client_order_index, "client_order_index", minimum=1)
     order_side = 1 if is_entry else -1
+    # `is_ask` 的语义是「我们是卖方（打买盘）」⇒ 最差价向**下**放宽。
+    # 入场是买单（side=+1），最差价必须**高于**参考价；写成 `order_side > 0` 会把方向
+    # 弄反 —— 买单限价落到市价下方，IOC 直接零成交（2026-11-02 最小额往返实测：
+    # ref 696.59、盘口 ask 696.50、限价 695.55 ⇒ accepted 但零成交、无成交记录）。
     return OrderSpec(
         purpose="mr_entry" if is_entry else "mr_exit",
         symbol=str(symbol).upper(), market_id=mid, side=order_side,
         position_side=1,
-        qty_int=qty, price_int=worst_price_int(base, bps, is_ask=order_side > 0),
+        qty_int=qty, price_int=worst_price_int(base, bps, is_ask=order_side < 0),
         order_type=ORDER_TYPE_MARKET, time_in_force=ORDER_TIME_IN_FORCE_IOC,
         reduce_only=(not is_entry), trigger_price_int=0, order_expiry_ms=0,
         client_order_index=coi,

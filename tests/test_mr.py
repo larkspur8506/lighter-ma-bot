@@ -764,6 +764,20 @@ class TestFundGateAndResiduals(unittest.TestCase):
             self.assertIsNone(store.mr_open_trade())
             self.assertEqual(status["recon"], "err")
 
+    def test_mr_order_limit_direction(self):
+        """买单的最差价必须在参考价**上方**（写反 = IOC 永远零成交）。"""
+        from app.exchange import build_mr_market_order
+        entry = build_mr_market_order(symbol="QQQ", market_id=129, qty_int=158,
+                                      price_decimals=2, ref_price=100.0, is_entry=True,
+                                      now_ms=1, slippage_bps=15, client_order_index=123)
+        self.assertGreater(entry.price_int, 10000)
+        self.assertFalse(entry.reduce_only)
+        exit_ = build_mr_market_order(symbol="QQQ", market_id=129, qty_int=158,
+                                      price_decimals=2, ref_price=100.0, is_entry=False,
+                                      now_ms=1, slippage_bps=15, client_order_index=124)
+        self.assertLess(exit_.price_int, 10000)
+        self.assertTrue(exit_.reduce_only)
+
     def test_dropped_session_lands_one_event(self):
         """被末根闸丢弃的**已收盘**会话要留审计行；当天盘中半截会话不报、不重复报。"""
         with tempfile.TemporaryDirectory() as tmp:
