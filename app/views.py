@@ -1630,6 +1630,55 @@ class Panel:
                 "position_id": _row_get(trade, "position_id"),
             })
 
+        # MR 腿（QQQ）的成交记在 mr_trades 台账、不在 trades 表——不并入的话
+        # 记录页与聚合页的「最近成交」永远看不到 QQQ（2026-11-02 线上实测）。
+        try:
+            mr_trades = store.mr_recent_trades(limit=MAX_RECORD_ROWS)
+        except Exception as exc:                              # noqa: BLE001 - 单区块降级
+            mr_trades = []
+            warnings.append(f"读MR台账失败: {type(exc).__name__}: {exc}")
+        for mr in mr_trades:
+            entry_ts = _finite(_row_get(mr, "entry_ts"))
+            if not entry_ts:
+                continue
+            side = int(_row_get(mr, "side") or 0)
+            qty = _finite(_row_get(mr, "qty")) or 0.0
+            pos_id = f"mr:{_row_get(mr, 'signal_date')}"
+            side_text = "多" if side > 0 else ("空" if side < 0 else "—")
+            equity_after, lag = _equity_after(stamps, entry_ts)
+            entry_price = _finite(_row_get(mr, "entry_price"))
+            rows.append({
+                "id": int(_row_get(mr, "id") or 0),
+                "ts": entry_ts, "symbol": "QQQ",
+                "side": side, "side_text": side_text,
+                "kind": "entry", "kind_text": "开仓",
+                "qty": qty, "price": entry_price,
+                "notional": qty * (entry_price or 0.0),
+                "fee": 0.0, "fee_token": "USDC",
+                "realized_pnl": None,
+                "equity_after": equity_after, "equity_after_lag_s": lag,
+                "position_id": pos_id,
+            })
+            exit_ts = _finite(_row_get(mr, "exit_ts"))
+            if not exit_ts:
+                continue
+            # 离场腿的 side 记**成交方向**（与 trades 表同口径）：平多=卖、平空=买
+            exit_price = _finite(_row_get(mr, "exit_price"))
+            equity_after, lag = _equity_after(stamps, exit_ts)
+            rows.append({
+                "id": int(_row_get(mr, "id") or 0),
+                "ts": exit_ts, "symbol": "QQQ",
+                "side": -side, "side_text": "空" if side > 0 else ("多" if side < 0 else "—"),
+                "kind": "exit", "kind_text": "离场",
+                "qty": qty, "price": exit_price,
+                "notional": qty * (exit_price or 0.0),
+                "fee": 0.0, "fee_token": "USDC",
+                "realized_pnl": _finite(_row_get(mr, "net_pnl")),
+                "equity_after": equity_after, "equity_after_lag_s": lag,
+                "position_id": pos_id,
+            })
+        rows.sort(key=lambda r: r["ts"], reverse=True)
+
         last = points[-1] if points else None
         first = points[0] if points else None
         state = {}
