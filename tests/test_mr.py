@@ -798,5 +798,91 @@ class TestFundGateAndResiduals(unittest.TestCase):
             self.assertEqual(len(store.events(kind="mr_session_dropped", limit=5)), 1)
 
 
+class TestAdminFlattenCoversMr(unittest.TestCase):
+    """2026-11-02 第五轮：强制清仓必须覆盖 MR 腿（`positions` 表里没有它）。"""
+
+    @staticmethod
+    def _flat_account():
+        return ExchangeAccount(equity=500.0, positions=(), orders=(),
+                               orders_error="", as_of=0.0, transaction_time=0.0)
+
+    def test_flatten_closes_mr_position_and_ledger(self):
+        from app.main import MR_FLATTEN_MARKET_ID, _flatten_mr_leg
+        self.assertEqual(MR_FLATTEN_MARKET_ID, MrConfig().market_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(f"{tmp}/flat.db")
+            store.mr_record_entry(signal_date="2026-04-15", entry_session="2026-04-16",
+                                  qty=0.36, qty_int=3600, entry_price=100.0,
+                                  entry_order_id="x", entry_ts=1.0, notional=36.0,
+                                  margin=36.0, equity_at_entry=500.0)
+            pos = ExchangePosition(symbol="QQQ", side=1, qty=Decimal("0.36"),
+                                   market_id=129, position_value=36.9)
+
+            class Reader:
+                def __init__(self):
+                    self.n = 0
+
+                async def read(self):
+                    self.n += 1
+                    if self.n == 1:
+                        return ExchangeAccount(equity=500.0, positions=(pos,), orders=(),
+                                               orders_error="", as_of=0.0,
+                                               transaction_time=0.0)
+                    return TestAdminFlattenCoversMr._flat_account()
+
+            class Client:
+                def __init__(self):
+                    self.calls = []
+
+                async def place_market(self, **kw):
+                    self.calls.append(kw)
+                    return SimpleNamespace(ok=True, error="")
+
+            class Market:
+                def candles_1h(self, market_id, *, count_back=500):
+                    return [{"t": 1, "o": 100.0, "h": 103.0, "l": 99.0, "c": 102.5}]
+
+            steps, client = [], Client()
+            closed, still = _run(_flatten_mr_leg(client=client, reader=Reader(),
+                                                 store=store, market=Market(),
+                                                 steps=steps))
+            self.assertTrue(closed)
+            self.assertFalse(still)
+            self.assertEqual(client.calls[0]["market_id"], 129)
+            self.assertEqual(client.calls[0]["qty_int"], 3600)
+            self.assertFalse(client.calls[0]["is_entry"])
+            row = store.mr_trade_by_signal("2026-04-15")
+            self.assertEqual(row["state"], "CLOSED")
+            self.assertEqual(row["exit_reason"], "admin_flatten")
+            self.assertAlmostEqual(row["exit_price"], 102.5, places=6)
+
+    def test_flatten_closes_orphan_ledger_when_exchange_is_flat(self):
+        from app.main import _flatten_mr_leg
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(f"{tmp}/flat2.db")
+            store.mr_record_entry(signal_date="2026-04-15", entry_session="2026-04-16",
+                                  qty=0.36, qty_int=3600, entry_price=100.0,
+                                  entry_order_id="x", entry_ts=1.0, notional=36.0,
+                                  margin=36.0, equity_at_entry=500.0)
+
+            class Reader:
+                async def read(self):
+                    return TestAdminFlattenCoversMr._flat_account()
+
+            class Client:
+                async def place_market(self, **kw):        # 不该被调用
+                    raise AssertionError("no order expected")
+
+            steps = []
+            closed, still = _run(_flatten_mr_leg(client=Client(), reader=Reader(),
+                                                 store=store, market=None, steps=steps))
+            self.assertFalse(closed)
+            self.assertFalse(still)
+            row = store.mr_trade_by_signal("2026-04-15")
+            self.assertEqual(row["state"], "CLOSED")
+            self.assertEqual(row["exit_reason"], "admin_flatten_recon")
+
+
 if __name__ == "__main__":
     unittest.main()

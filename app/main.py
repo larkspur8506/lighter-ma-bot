@@ -109,6 +109,12 @@ ADMIN_TOKEN_QUERY = "k"
 #: `flatten` 的二次确认值（大小写不敏感）。刻意**不接受**空字符串或随便一个词：
 #: 不可撤销操作必须有一句话真的说出口。
 CONFIRM_VALUES = frozenset({"yes", "y", "1", "true", "confirm", "flatten"})
+#: MR 腿（QQQ，mkt129）在「强制清仓」里的参数。与 `MrConfig` 同源（测试钉住一致性）：
+#: market_id / size_decimals 决定下单整数位，slippage 与 tick 侧同一个带宽。
+MR_FLATTEN_MARKET_ID = 129
+MR_FLATTEN_PRICE_DECIMALS = 2
+MR_FLATTEN_SIZE_DECIMALS = 4
+MR_FLATTEN_SLIPPAGE_BPS = 15
 
 #: 4h bar 收盘后 tick 的分钟位（UTC）：`:03`（收盘 +3 分钟，等交易所把 bar 落定）
 #: 与 `:33`（同一根 bar 的复检 —— 执行器按 `(symbol, bar_ms)` 幂等，重跑只会产生 skip）。
@@ -1102,6 +1108,104 @@ async def _flatten_confirm_flat(reader: Any, symbol: str, *, timeout_s: float = 
 
 
 
+async def _flatten_mr_leg(*, client: Any, reader: Any, store: Any, market: Any,
+                           steps: List[Dict[str, Any]]) -> tuple:
+    """平掉 MR 腿（mkt129）并关账。返回 `(closed, still_open)`。
+
+    **为什么需要单独一段**（2026-11-02 第五轮）：`store.open_positions()` 只有 crypto 腿的
+    仓位，MR 仓在 `mr_trades` 里 —— 旧版「强制清仓」会把面板刷成成功，却留着一笔
+    无止损的 QQQ 多单。这是这个按钮唯一的意义所在，不能漏。
+
+    口径与 tick 侧一致：参考价取 1h 收盘（MR 自己的锚），IOC 15bp；**必须确认交易所
+    真的没仓**才算平掉，否则保留 `still_open` 让上层不要撤别的挂单。
+    """
+    from app.exchange import client_order_index                  # noqa: PLC0415 - 懒加载
+
+    mr_row = store.mr_open_trade()
+    try:
+        account = await reader.read()
+    except Exception as exc:                                     # noqa: BLE001
+        if mr_row is not None:
+            steps.append({"symbol": "QQQ", "ok": False,
+                          "error": f"读账户失败，无法确认 MR 仓：{type(exc).__name__}"})
+            return False, True
+        return False, False
+
+    pos = next((p for p in (account.positions or [])
+                if getattr(p, "market_id", None) == MR_FLATTEN_MARKET_ID), None)
+    if pos is None:
+        if mr_row is not None:
+            # 台账 OPEN 但交易所没仓：只关账，不臆造盈亏
+            px = float(mr_row.get("entry_price") or 0.0)
+            store.mr_close_trade(
+                int(mr_row["id"]), exit_price=px, exit_order_id="",
+                exit_ts=time.time(), exit_reason="admin_flatten_recon",
+                exit_signal_date=None, funding_pct=None, net_pnl=0.0,
+                raw={"by": "admin_flatten", "note": "no position on exchange"})
+            steps.append({"symbol": "QQQ", "ok": True,
+                          "note": "台账 OPEN 但交易所无仓，已关账"})
+        return False, False
+
+    qty = float(pos.qty)
+    qty_int = int(round(qty * 10 ** MR_FLATTEN_SIZE_DECIMALS))
+    ref = 0.0
+    try:
+        rows = market.candles_1h(MR_FLATTEN_MARKET_ID, count_back=5)
+        ref = float(rows[-1]["c"]) if rows else 0.0
+    except Exception as exc:                                     # noqa: BLE001 - 降级不阻断
+        steps.append({"symbol": "QQQ", "ok": None,
+                      "error": f"取参考价失败：{type(exc).__name__}"})
+    if ref <= 0:
+        value = float(getattr(pos, "position_value", 0) or 0)
+        ref = value / qty if qty else 0.0
+    if ref <= 0:
+        steps.append({"symbol": "QQQ", "ok": False, "error": "无可用参考价，拒绝下盲单"})
+        return False, True
+
+    coi = client_order_index("QQQ", max(int(time.time() // 60), 1), "mr_flatten")
+    try:
+        res = await client.place_market(
+            symbol="QQQ", market_id=MR_FLATTEN_MARKET_ID, qty_int=qty_int,
+            price_decimals=MR_FLATTEN_PRICE_DECIMALS, ref_price=ref, is_entry=False,
+            slippage_bps=MR_FLATTEN_SLIPPAGE_BPS, client_order_index=coi)
+    except Exception as exc:                                     # noqa: BLE001
+        steps.append({"symbol": "QQQ", "ok": False,
+                      "error": f"{type(exc).__name__}: {exc}"})
+        return False, True
+    if not getattr(res, "ok", False):
+        steps.append({"symbol": "QQQ", "ok": False,
+                      "error": getattr(res, "error", "") or "MR 清仓单被拒"})
+        return False, True
+
+    gone = False
+    for _ in range(15):
+        await asyncio.sleep(1.0)
+        try:
+            again = await reader.read()
+        except Exception:                                        # noqa: BLE001
+            continue
+        if not any(getattr(p, "market_id", None) == MR_FLATTEN_MARKET_ID
+                   for p in (again.positions or [])):
+            gone = True
+            break
+    if not gone:
+        steps.append({"symbol": "QQQ", "ok": False,
+                      "error": "MR 清仓单被受理但确认期内仓位仍在交易所"})
+        return False, True
+
+    value = float(getattr(pos, "position_value", 0) or 0)
+    px = (value / qty) if qty else ref
+    if mr_row is not None:
+        entry_px = float(mr_row["entry_price"] or 0.0)
+        store.mr_close_trade(
+            int(mr_row["id"]), exit_price=float(px or ref), exit_order_id="",
+            exit_ts=time.time(), exit_reason="admin_flatten", exit_signal_date=None,
+            funding_pct=None, net_pnl=(float(px or ref) - entry_px) * qty,
+            raw={"by": "admin_flatten", "price_source": "position_value"})
+    steps.append({"symbol": "QQQ", "ok": True})
+    return True, False
+
+
 async def _default_flatten(store: Any, *, reason: str = "", by: str = "admin",
                            confirm_live: Optional[int] = None) -> Dict[str, Any]:
     """默认的「市价清仓 + 撤所有挂单」实现（**阶段二未实测**：阶段一没有凭据）。
@@ -1196,6 +1300,13 @@ async def _default_flatten(store: Any, *, reason: str = "", by: str = "admin",
                 steps.append({"symbol": symbol, "ok": False,
                               "error": "清仓单被受理但确认期内仓位仍在交易所 —— "
                                        "未撤该标的挂单（止损单保留）"})
+        # ---- MR 腿：positions 表里没有它，必须单独平（2026-11-02 第五轮）----------
+        mr_closed, mr_open = await _flatten_mr_leg(
+            client=client, reader=reader, store=store, market=market, steps=steps)
+        if mr_closed:
+            closed.append("QQQ")
+        if mr_open:
+            still_open.append("QQQ")
         cancel = None
         if not still_open:
             try:
