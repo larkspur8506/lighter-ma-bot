@@ -1010,6 +1010,9 @@ class Panel:
 
         if not prices:
             warnings.append("没有现价 —— 浮盈/名义/强平按开仓价估算（标记为估算）")
+        mr_row = self._mr_position_row(now, warnings)
+        if mr_row is not None:
+            out.append(mr_row)
         return {"as_of": now, "positions": out,
                 "open_count": sum(1 for r in out if r["position_id"]),
                 "entry_blocked": entry_blocked, "symbols": symbols,
@@ -1323,14 +1326,111 @@ class Panel:
             self._symbol_ind_cache[symbol] = cached
         return cached
 
+    def _mr_position_row(self, now: float,
+                         warnings: List[str]) -> Optional[Dict[str, Any]]:
+        """MR 腿（QQQ）的仓位行 —— **启用后常驻**，空仓渲染一行灰字；停用则完全不出现。
+
+        数据全部来自 `Sources.mr()`（tick 写 PanelCache），面板零重算、零网络。
+        口径：离场线 = 最近 4 个已完成会话收盘均值（与 `close > SMA5` 等价）；
+        「距离场%」正 = 现价仍在线下方（多单安全）。
+        """
+        if self.sources.mr is None:
+            return None
+        try:
+            mr = dict(self.sources.mr() or {})
+        except Exception as exc:                              # noqa: BLE001 - 单源失败不崩表
+            warnings.append(f"MR 状态读取失败: {type(exc).__name__}: {exc}")
+            return None
+        if not mr:
+            return None
+        pos = dict(mr.get("pos") or {})
+        sig = dict(mr.get("signal") or {})
+        if not mr.get("enabled") and not pos:
+            return None
+        holding = bool(pos)
+        entry = _finite(pos.get("entry_price")) or 0.0
+        mark = _finite(pos.get("mark")) or _finite(mr.get("mark"))
+        exit_line = _finite(pos.get("exit_line")) or _finite(sig.get("exit_line"))
+        upnl_pct = _finite(pos.get("upnl_pct"))
+        dist_exit = _finite(pos.get("dist_to_exit_pct"))
+        opened = _finite(pos.get("entry_ts"))
+        recon_err = str(mr.get("recon") or "") == "err"
+        if recon_err:
+            status = "对账不平"
+        elif not mr.get("enabled"):
+            status = "停用"
+        elif holding:
+            status = "持仓中"
+        else:
+            status = _mr_phase_text(mr)
+        return {
+            "symbol": "QQQ", "is_mr": True, "position_id": "MR" if holding else None,
+            "side": 1, "side_text": "多" if holding else "—",
+            "state": "OPEN" if holding else "IDLE", "status": status,
+            "entry_price": entry if holding else 0.0,
+            "price": mark if (holding or mr.get("enabled")) else None,
+            "price_source": "exchange" if holding else "provider",
+            "upnl": (_finite(pos.get("upnl")) or 0.0) if holding else 0.0,
+            "upnl_pct": ((upnl_pct or 0.0) / 100.0) if holding else 0.0,
+            "qty": (_finite(pos.get("qty")) or 0.0) if holding else 0.0,
+            "stop_price": 0.0, "dist_to_stop_pct": None, "no_stop": True,
+            "exit_price": exit_line,
+            "dist_to_exit_pct": ((dist_exit or 0.0) / 100.0)
+                                if (holding and dist_exit is not None) else None,
+            "funding_rate": None, "funding_rate_cash": None,
+            "holding_text": _dur(max(0.0, now - opened)) if opened else "—",
+            "notional": (_finite(pos.get("notional")) or 0.0) if holding else 0.0,
+            "margin": (_finite(pos.get("notional")) or 0.0) if holding else 0.0,
+            "liq_price": _finite(pos.get("liq_price")),
+            "opened_at": opened, "holding_s": max(0.0, now - opened) if opened else None,
+            "warnings": (["MR 台账与交易所持仓不一致（先看是否裸奔）"]
+                         if recon_err else []),
+            "next_eval_et": sig.get("next_eval_et"),
+        }
+
+    def _mr_dynamics(self, now: float) -> Optional[Dict[str, Any]]:
+        """标的动态里的「超跌腿（QQQ）」一行：现价/持仓/距入场/RSI2/离场线/距离场%/结论。"""
+        if self.sources.mr is None:
+            return None
+        try:
+            mr = dict(self.sources.mr() or {})
+        except Exception:                                     # noqa: BLE001 - 动态卡不因它崩
+            return None
+        if not mr or (not mr.get("enabled") and not mr.get("pos")):
+            return None
+        pos = dict(mr.get("pos") or {})
+        sig = dict(mr.get("signal") or {})
+        holding = bool(pos)
+        entry = _finite(pos.get("entry_price"))
+        mark = _finite(pos.get("mark")) or _finite(mr.get("mark"))
+        dist_entry = ((mark / entry - 1.0) * 100.0
+                      if (holding and entry and mark) else None)
+        return {
+            "symbol": "QQQ", "price": mark, "holding": holding,
+            "qty": _finite(pos.get("qty")), "entry_price": entry,
+            "dist_to_entry_pct": dist_entry,
+            "rsi2": _finite(sig.get("rsi2")), "threshold": _finite(sig.get("threshold")),
+            "exit_line": _finite(sig.get("exit_line")) or _finite(pos.get("exit_line")),
+            "dist_to_exit_pct": _finite(pos.get("dist_to_exit_pct")),
+            "sessions_usable": sig.get("sessions_usable"),
+            "last_session_date": sig.get("last_session_date"),
+            "next_eval_et": sig.get("next_eval_et"),
+            "window": sig.get("window"), "phase": sig.get("phase"),
+            "recon": mr.get("recon"), "enabled": bool(mr.get("enabled")),
+            "status": _mr_phase_text(mr) if not holding else "持仓中",
+            "is_mr": True,
+        }
+
     #: `Panel.symbols` 是标的元组（属性名），所以区块方法叫 `symbols_block()`
     #: 以免撞名；`GET /symbols` 调它。
     def _symbols(self) -> Dict[str, Any]:
         now = self._now()
         warnings: List[str] = []
         if self.sources.bars is None:
-            return _symbols_fallback("没有 K 线数据源（app.market 未接入）",
-                                     symbols=self.symbols, as_of=now)
+            # MR 子块不依赖 crypto 的 K 线源：crypto 降级也要能看到 QQQ
+            return {**_symbols_fallback("没有 K 线数据源（app.market 未接入）",
+                                        symbols=self.symbols, as_of=now),
+                    "mr": self._mr_dynamics(now)}
         prices: Dict[str, float] = {}
         if self.sources.prices is not None:
             try:
@@ -1357,7 +1457,7 @@ class Panel:
         if any(row.get("warnings") for row in out):
             for row in out:
                 warnings.extend(f"{row['symbol']}: {w}" for w in row.get("warnings") or [])
-        return {"as_of": now, "symbols": out,
+        return {"as_of": now, "symbols": out, "mr": self._mr_dynamics(now),
                 "warnings": warnings, "degraded": bool(warnings)}
 
     def _symbol_row(self, symbol: str, prices: Mapping[str, float],
@@ -1720,6 +1820,29 @@ def _symbol_verdict(row: Mapping[str, Any]) -> str:
     return "等条件"
 
 
+_MR_PHASE_TEXT = {
+    "in_window": "窗口内等成交",
+    "no_data": "无数据",
+    "no_signal": "空仓",
+}
+
+
+def _mr_phase_text(mr: Mapping[str, Any]) -> str:
+    """MR 相位 → 一句中文结论（面板仓位行 / 动态卡共用，只描述状态不复述数字）。"""
+    if str(mr.get("recon") or "") == "err":
+        return "对账不平"
+    if not mr.get("enabled"):
+        return "停用"
+    sig = dict(mr.get("signal") or {})
+    phase = str(sig.get("phase") or "")
+    win = dict(sig.get("window") or {})
+    if phase == "signal_ready":
+        return f"信号已出，等 {win.get('date', '')} 开盘".strip()
+    if phase == "expired":
+        return "窗口已过，等明日"
+    return _MR_PHASE_TEXT.get(phase, "空仓")
+
+
 def _symbol_empty(symbol: str, *, reason: str = "") -> Dict[str, Any]:
     row: Dict[str, Any] = {
         "symbol": symbol, "price": 0.0, "band_pct": None, "threshold_pct": None,
@@ -1829,6 +1952,14 @@ footer { color: var(--dim); font-size: 11px; padding: 4px 2px 20px; }
 .dyn-row .nm { font-weight: 600; }
 .dyn-row .verdict { font-weight: 600; }
 .warn { color: var(--warn); }
+.badge-mr { display: inline-block; padding: 0 4px; border-radius: 3px; font-size: 10px;
+            font-weight: 600; letter-spacing: .02em; color: var(--muted);
+            border: 1px solid var(--line); vertical-align: 1px; }
+.mr-sub { margin-top: 12px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.mr-title { color: var(--muted); font-size: 11px; font-weight: 600; margin-bottom: 2px; }
+.mr-row { display: grid; align-items: baseline; gap: 3px 10px; padding: 6px 2px;
+          grid-template-columns: 74px 92px 108px 88px 92px 92px 1.1fr 1.1fr; }
+.mr-row.head { color: var(--muted); font-size: 11px; font-weight: 600; }
 @media (max-width: 640px) {
   .dyn-row.head { display: none; }
   .dyn-row { display: flex; flex-wrap: wrap; gap: 2px 10px; }
@@ -1837,7 +1968,14 @@ footer { color: var(--dim); font-size: 11px; padding: 4px 2px 20px; }
   .dyn-row .verdict { flex: 1 0 100%; margin-top: 4px; padding-top: 4px;
                       border-top: 1px dashed var(--line2); }
 }
-@media (max-width: 640px) { body { padding: 8px; } th, td { padding: 4px 5px; } }
+@media (max-width: 640px) {
+  body { padding: 8px; } th, td { padding: 4px 5px; }
+  .mr-row.head { display: none; }
+  .mr-row { display: flex; flex-wrap: wrap; gap: 2px 10px; }
+  .mr-row > span { white-space: nowrap; }
+  .mr-row .verdict { flex: 1 0 100%; margin-top: 4px; padding-top: 4px;
+                     border-top: 1px solid var(--line2); }
+}
 """
 
 
@@ -1991,6 +2129,14 @@ def _funding_cell(rate: Any, cash: Any, side: int) -> str:
     return f"<td class=\"{cls}\">{txt}</td>"
 
 
+def _symbol_cell(row: Mapping[str, Any]) -> str:
+    """标的单元格：MR 腿加一个徽标，避免和 crypto 腿混读。"""
+    name = html.escape(str(row.get("symbol") or ""))
+    if row.get("is_mr"):
+        return f"{name} <span class='badge-mr'>MR</span>"
+    return name
+
+
 def _positions_html(block: Mapping[str, Any]) -> str:
     head = ("<tr><th>标的</th><th>方向</th><th>开仓价</th><th>现价</th><th>浮盈(U)</th>"
             "<th>浮盈%</th><th>数量</th><th>止损价</th><th>距止损%</th>"
@@ -2000,15 +2146,15 @@ def _positions_html(block: Mapping[str, Any]) -> str:
     for row in block.get("positions") or ():
         rows.append(
             "<tr>"
-            f"<td>{html.escape(str(row.get('symbol')))}</td>"
+            f"<td>{_symbol_cell(row)}</td>"
             f"<td>{html.escape(str(row.get('side_text')))}</td>"
             f"<td>{_money(row.get('entry_price')) if row.get('position_id') else '—'}</td>"
             f"<td>{_money(row.get('price'))}</td>"
             f"<td class=\"{_cls(row.get('upnl'))}\">{_money(row.get('upnl'))}</td>"
             f"<td class=\"{_cls(row.get('upnl_pct'))}\">{_pct(row.get('upnl_pct'))}</td>"
             f"<td>{_qty_text(row.get('qty')) if row.get('position_id') else '—'}</td>"
-            f"<td>{_money(row.get('stop_price')) if row.get('position_id') else '—'}</td>"
-            f"<td>{_pct(row.get('dist_to_stop_pct'))}</td>"
+            f"<td>{'—' if row.get('no_stop') else (_money(row.get('stop_price')) if row.get('position_id') else '—')}</td>"
+            f"<td>{'—' if row.get('no_stop') else _pct(row.get('dist_to_stop_pct'))}</td>"
             f"<td>{_money(row.get('exit_price')) if row.get('position_id') else '—'}</td>"
             f"<td class=\"{_cls(row.get('dist_to_exit_pct'))}\">{_pct(row.get('dist_to_exit_pct'))}</td>"
             + _funding_cell(row.get("funding_rate"), row.get("funding_rate_cash"),
@@ -2154,9 +2300,64 @@ def _symbols_html(block: Mapping[str, Any]) -> str:
             f"<span class=\"dim next\">{html.escape(time.strftime('%m-%d %H:%M', time.gmtime(nxt)) if nxt else '—')}</span>"
             f"<span class=\"verdict {verdict_css}\">{html.escape(verdict)}</span>"
             "</div>")
-    return ('<section id="block-symbols"><h2>⑤ 三标的动态（还差什么才开单）</h2>'
+    mr = block.get("mr") or None
+    return ('<section id="block-symbols"><h2>⑤ 标的动态（还差什么才开单）</h2>'
             f"<div class='dyn'>{head}{''.join(rows)}</div>"
-            f"{_warn_html(block.get('warnings'))}</section>")
+            + (_mr_dyn_html(mr) if mr else "")
+            + f"{_warn_html(block.get('warnings'))}</section>")
+
+
+def _mr_dyn_html(mr: Mapping[str, Any]) -> str:
+    """「超跌腿（QQQ）」子表：crypto 那套列对 QQQ 无意义，单独一张小表。
+
+    列：标的 | 现价 | 持仓 | 距入场 | RSI2(收盘) | 离场线 | 距离场% | 结论
+    """
+    price = _finite(mr.get("price"))
+    entry = _finite(mr.get("entry_price"))
+    d_entry = _finite(mr.get("dist_to_entry_pct"))
+    rsi = _finite(mr.get("rsi2"))
+    thr = _finite(mr.get("threshold"))
+    exit_line = _finite(mr.get("exit_line"))
+    d_exit = _finite(mr.get("dist_to_exit_pct"))
+    holding = bool(mr.get("holding"))
+    qty = _finite(mr.get("qty"))
+
+    if holding and qty is not None:
+        pos_txt = f"多 {_qty_text(qty)}"
+    else:
+        pos_txt = "空仓"
+    e_txt = f"{d_entry:+.2f}%" if d_entry is not None else "—"
+    e_css = _cls(d_entry / 100.0) if d_entry is not None else "dim"
+    if rsi is None:
+        rsi_txt, rsi_css = "—", "dim"
+    else:
+        ok = thr is not None and rsi < thr
+        rsi_txt = f"{rsi:.2f}{' ✔' if ok else ''}"
+        rsi_css = "pos" if ok else ""
+    if d_exit is None:
+        ex_txt, ex_css = "—", "dim"
+    elif d_exit < 0:
+        ex_txt, ex_css = f"已站上 {abs(d_exit):.2f}%（等收盘）", "warn"
+    else:
+        ex_txt, ex_css = f"{d_exit:.2f}%", "dim"
+    status = str(mr.get("status") or "—")
+    status_css = "bad" if mr.get("recon") == "err" else ("dim" if not holding else "pos")
+    head = ("<div class='mr-row head'><span>标的</span><span>现价</span><span>持仓</span>"
+            "<span>距入场</span><span>RSI2(收盘)</span><span>离场线</span>"
+            "<span>距离场%</span><span>结论</span></div>")
+    row = ("<div class='mr-row'>"
+           f"<span class='nm'>QQQ <span class='badge-mr'>MR</span></span>"
+           f"<span>{_money(price)}</span>"
+           f"<span>{html.escape(pos_txt)}</span>"
+           f"<span class='{e_css}'>{e_txt}</span>"
+           f"<span class='{rsi_css}'>{rsi_txt}</span>"
+           f"<span>{_money(exit_line)}</span>"
+           f"<span class='{ex_css}'>{ex_txt}</span>"
+           f"<span class='verdict {status_css}'>{html.escape(status)}</span>"
+           "</div>")
+    return ("<div class='mr-sub'>"
+            "<div class='mr-title'>超跌腿（QQQ · RSI2 反弹，收盘价判定）</div>"
+            f"{head}{row}</div>")
 
 
 def _equity_after(points: Sequence[Tuple[float, Optional[float]]], ts: float,

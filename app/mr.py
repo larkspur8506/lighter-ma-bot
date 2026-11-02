@@ -38,7 +38,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time as _at_time
 from typing import Any, Awaitable, Callable, Mapping, Optional
 from zoneinfo import ZoneInfo
 
@@ -363,6 +363,7 @@ class MrLeg:
 
         status["last_session_date"] = sessions[-1].date
         status["sessions_usable"] = len(sessions)
+        self._fill_signal_status(status, sessions, rows, now)
 
         # 注意：这里没有 `if not enabled: return` —— 停用只挡新入场（快路径在上方
         # 已拦「停用+空仓」），**停用+持仓必须照常评估离场**，否则仓位被永久困住。
@@ -534,6 +535,39 @@ class MrLeg:
                 return float(row.get("ts") or 0.0)
         return 0.0
 
+    def _fill_signal_status(self, status: dict, sessions, rows, now_ms: int) -> None:
+        """面板/聚合页要的只读视图：最近会话信号 + 离场线 + 下一次评估时刻。
+
+        全部在这里算完（tick 本来就要 sessions/signals），面板零重算、零网络。
+        离场线 = **最近 4 个已完成会话收盘均值** —— `close > SMA5`（SMA5 含当日）等价于
+        `close > mean(前 4 个收盘)`，这样面板显示的数可以直接和收盘价比。
+        """
+        try:
+            sigs = mr_signal.session_signals(sessions)
+        except Exception:                                     # noqa: BLE001
+            return
+        if not sigs:
+            return
+        last = sessions[-1]
+        sig = sigs[-1]
+        closes = [s.close for s in sessions]
+        try:
+            status["mark"] = float(rows[-1]["c"]) if rows else None
+        except (KeyError, TypeError, ValueError):
+            status["mark"] = None
+        status["signal"] = {
+            "last_session_date": last.date,
+            "rsi2": sig.get("rsi2"),
+            "threshold": mr_signal.RSI_THRESHOLD,
+            "entry_flag": bool(sig.get("entry")),
+            "exit_flag": bool(sig.get("exit_above")),
+            "exit_line": (sum(closes[-4:]) / 4.0) if len(closes) >= 4 else None,
+            "sessions_usable": len(sessions),
+            "next_eval_et": _next_eval_et(now_ms),
+            "window": _entry_window(sessions, now_ms),
+            "phase": _phase(sessions, now_ms),
+        }
+
     # ------------------------------------------------------------------ 入场
 
     async def _maybe_enter(self, *, now_ms: int, sessions, rows, account: ExchangeAccount,
@@ -683,14 +717,36 @@ class MrLeg:
         exit_date = mr_signal.exit_decision(sessions=sessions, now_ms=now_ms,
                                             entry_session_date=entry_session)
         status["state"] = "holding"
+        mark = None
+        value = getattr(pos, "position_value", None)
+        pos_qty = getattr(pos, "qty", None)
+        if value is not None and pos_qty and float(pos_qty) > 0:
+            mark = float(value) / float(pos_qty)
+        if not mark and rows:
+            mark = float(rows[-1]["c"])
+        entry_px = float(open_row.get("entry_price") or 0.0)
+        signal = status.get("signal") or {}
+        exit_line = signal.get("exit_line")
         status["pos"] = {
             "signal_date": open_row.get("signal_date"),
             "entry_session": entry_session,
             "qty": open_row.get("qty"),
             "entry_price": open_row.get("entry_price"),
             "notional": open_row.get("notional"),
+            "entry_ts": open_row.get("entry_ts"),
             "upnl": getattr(pos, "unrealized_pnl", None),
             "funding_paid": getattr(pos, "funding_paid", None),
+            # 面板口径（2026-11-02）：现价 / 浮盈% / 离场线 / 距离场% / 下一次评估时刻
+            "mark": mark,
+            "upnl_pct": ((mark - entry_px) / entry_px * 100.0
+                         if mark and entry_px > 0 else None),
+            "exit_line": exit_line,
+            # 正 = 现价还在离场线下方（多单安全），负 = 已站上、收盘确认即离场
+            "dist_to_exit_pct": ((float(exit_line) - mark) / mark * 100.0
+                                 if exit_line and mark else None),
+            "liq_price": (getattr(pos, "liquidation_price", None)
+                          if getattr(pos, "liquidation_price", None) else None),
+            "next_eval_et": signal.get("next_eval_et"),
         }
         if exit_date is None:
             return
@@ -795,6 +851,68 @@ class MrLeg:
 
 
 # ------------------------------------------------------------------ 工具
+
+def _next_eval_et(now_ms: int) -> str:
+    """下一次「收盘评估」的 ET 时刻（ISO，带时区）。持仓/空仓都用它回答"什么时候再看"。
+
+    规则：今天还没到 16:00 ET 且今天是交易日 → 今天 16:00；否则下一个交易日的 16:00。
+    """
+    tz = ZoneInfo(mr_signal.SESSION_TZ)
+    now = datetime.fromtimestamp(now_ms / 1000.0, tz=tz)
+    day = now.date()
+    close = datetime.combine(day, _at_time(16, 0), tzinfo=tz)
+    if now >= close or day.weekday() >= 5 or mr_signal.is_market_holiday(day):
+        day = datetime.strptime(mr_signal.next_business_day(day.isoformat()),
+                                "%Y-%m-%d").date()
+        close = datetime.combine(day, _at_time(16, 0), tzinfo=tz)
+    return close.isoformat()
+
+
+def _entry_window(sessions, now_ms: int):
+    """待执行信号的入场窗口 `{date, start_et, deadline_et}`；没有待执行信号 → None。"""
+    k = mr_signal.completed_upto(sessions, now_ms)
+    if k <= 0:
+        return None
+    sig = mr_signal.session_signals(sessions[:k])[k - 1]
+    if not sig.get("entry"):
+        return None
+    return {"date": mr_signal.next_business_day(sessions[k - 1].date),
+            "start_et": "09:30",
+            "deadline_et": f"{9 + int(mr_signal.ENTRY_WINDOW_H)}:"
+                           f"{int((mr_signal.ENTRY_WINDOW_H % 1) * 60):02d}"}
+
+
+def _phase(sessions, now_ms: int) -> str:
+    """面板结论用的相位：no_signal / signal_ready / in_window / expired / no_data。
+
+    `disabled` / `holding` / `recon_err` 由调用方（面板）按 status 的其它字段叠加。
+    """
+    if not sessions:
+        return "no_data"
+    k = mr_signal.completed_upto(sessions, now_ms)
+    if k <= 0:
+        return "no_data"
+    last = sessions[k - 1]
+    sig = mr_signal.session_signals(sessions[:k])[k - 1]
+    tz = ZoneInfo(mr_signal.SESSION_TZ)
+    now = datetime.fromtimestamp(now_ms / 1000.0, tz=tz)
+    today = now.strftime("%Y-%m-%d")
+    entry_day = mr_signal.next_business_day(last.date)
+    if not sig.get("entry"):
+        return "expired" if entry_day < today else "no_signal"
+    if entry_day > today:
+        return "signal_ready"
+    if entry_day < today:
+        return "expired"
+    open_ms = int(datetime.strptime(today, "%Y-%m-%d")
+                  .replace(hour=9, minute=30, tzinfo=tz).timestamp() * 1000)
+    deadline_ms = open_ms + int(mr_signal.ENTRY_WINDOW_H * 3600_000)
+    if now_ms < open_ms:
+        return "signal_ready"
+    if now_ms <= deadline_ms:
+        return "in_window"
+    return "expired"
+
 
 def _partial_exits(row: Mapping[str, Any]) -> list:
     """台账 `raw.partial_exits`（部分成交片段）→ list；解析失败返回 []。"""
