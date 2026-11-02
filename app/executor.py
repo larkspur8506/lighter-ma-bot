@@ -1758,13 +1758,24 @@ class Executor:
         `decide_entry` ⑤ 用 1e-9 容差比对 `equity`（定仓）与 `risk_state.equity`（风控），
         而 `AccountSnapshot.equity` 是**账户总权益**、定仓基数是「总权益 − MR 占用」——
         不对齐的话，MR 一持仓 crypto 腿的每次开仓都会撞 `equity_mismatch` 被静默拒掉
-        （2026-11-02 复核复现）。回撤/日亏守护读的是 snapshot 自己的权益，不受影响。
+        （2026-11-02 复核复现）。
+
+        **日初权益必须同幅下移**（2026-11-02 第五轮）：只改 `equity` 不改
+        `day_start_equity`，`check_entry` 的日亏闸会把「基数缩小」算成「今天亏了 50%」——
+        MR 一旦持仓，crypto 腿就会被 `daily_loss` 全量拒单（容器内实测：
+        equity 246 / day_start 497 → `allowed=False, codes=('daily_loss',)`）。
+        回撤闸读 dd_index/peak，不受这条影响。
         """
         state = snapshot.to_risk_state()
         eq = self._crypto_equity
         if eq is None or getattr(state, "equity", None) is None:
             return state
-        return replace(state, equity=float(eq))
+        contrib = max(float(self._mr_contribution or 0.0), 0.0)
+        day_start = getattr(state, "day_start_equity", None)
+        new_day_start = day_start
+        if contrib > 0 and day_start is not None:
+            new_day_start = max(float(day_start) - contrib, 0.0)
+        return replace(state, equity=float(eq), day_start_equity=new_day_start)
 
     @staticmethod
     def _apply_entry_guard(decision: Decision, *, blocks: Sequence[str] = ()
