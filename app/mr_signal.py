@@ -9,7 +9,8 @@
   会话首根 bar 是 10:00 ET——这只影响台账里的「参考开盘价」，不影响任何信号：
   RSI2/SMA5 只用会话收盘价，末根 15:00 ET bar 的收盘恰是 16:00 价格，与日线
   收盘对齐（夏/冬令时都成立）。夜盘与周末的永续 bar 全部丢弃；周六/周日不是
-  会话。
+  会话。**交易日历 = 周末 + NYSE 规则假日**（`market_holidays`，规则生成）：
+  入场日必须是真的交易日，否则「信号日次日是假日」时整条信号会被丢掉。
   **缺数判据**：一个会话至少要 5 根 bar（正常 6 根，允许缺 1 小时），且**末根必须
   不早于 15:00 ET**，否则整日弃用。2026-11-02 第四轮复核发现：只要求「≥5 根」
   时，10:00–14:00 的 5 根（缺 15:00 那根）仍会通过，把 **14:00 价当全天收盘**喂给
@@ -30,15 +31,17 @@ import 它；两边文件必须逐字节一致（conformance 测试断言）。�
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any, List, Mapping, Optional, Sequence
+from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
+from typing import Any, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 __all__ = [
     "SESSION_TZ", "SESSION_START", "SESSION_END", "RSI_PERIOD", "RSI_THRESHOLD",
     "SMA_WINDOW", "ENTRY_WINDOW_H", "MIN_SESSION_BARS", "SessionBar",
-    "aggregate_sessions", "rsi2_wilder", "sma", "session_signals",
-    "entry_decision", "exit_decision", "next_business_day",
+    "aggregate_sessions", "aggregate_sessions_ex", "rsi2_wilder", "sma",
+    "session_signals", "entry_decision", "exit_decision", "next_business_day",
+    "market_holidays", "is_market_holiday",
 ]
 
 SESSION_TZ = "America/New_York"
@@ -93,13 +96,16 @@ def _parse_hourly_row(row: Mapping[str, Any]) -> Optional[tuple]:
     return et, o, h, low, c
 
 
-def aggregate_sessions(hourly_rows: Sequence[Mapping[str, Any]]) -> List[SessionBar]:
-    """1h K 线（升序）→ 美股交易日会话 OHLC（升序）。
+def aggregate_sessions_ex(hourly_rows: Sequence[Mapping[str, Any]]
+                          ) -> Tuple[List[SessionBar], List[dict]]:
+    """1h K 线（升序）→（可用会话 OHLC 升序, 被丢弃的会话明细）。
 
     归属规则：bar 的 **开盘时刻**（ET）落在 [09:30, 16:00) 内且为周一至周五。
     每个会话取首根 bar 的 open、末根 bar 的 close、全体 high/low。
     少于 ``MIN_SESSION_BARS`` 根、或末根 bar 早于 ``MIN_LAST_BAR_ET``
-    （盘中数据缺失）的会话直接丢弃。
+    （盘中数据缺失）的会话直接丢弃，**并返回原因**（`too_few_bars` /
+    `missing_close_bar`）—— 2026-11-02 第五轮复核：只丢弃不报告，等于
+    「数据源抖动 → 一整天静默没信号」，调用方至少要把这件事落一条审计事件。
     """
     buckets: "dict[str, list]" = {}
     for row in hourly_rows:
@@ -116,12 +122,19 @@ def aggregate_sessions(hourly_rows: Sequence[Mapping[str, Any]]) -> List[Session
         buckets.setdefault(et.strftime("%Y-%m-%d"), []).append((et, o, h, low, c))
 
     out: List[SessionBar] = []
+    dropped: List[dict] = []
     for date in sorted(buckets):
         rows = buckets[date]
-        if len(rows) < MIN_SESSION_BARS:
-            continue
         last_et = rows[-1][0]
+        if len(rows) < MIN_SESSION_BARS:
+            dropped.append({"date": date, "bars": len(rows),
+                            "last_bar_et": last_et.strftime("%H:%M"),
+                            "reason": "too_few_bars"})
+            continue
         if (last_et.hour, last_et.minute) < MIN_LAST_BAR_ET:
+            dropped.append({"date": date, "bars": len(rows),
+                            "last_bar_et": last_et.strftime("%H:%M"),
+                            "reason": "missing_close_bar"})
             continue                                   # 盘中数据缺失 → 弃用该会话
         out.append(SessionBar(
             date=date,
@@ -130,7 +143,12 @@ def aggregate_sessions(hourly_rows: Sequence[Mapping[str, Any]]) -> List[Session
             bars=len(rows), last_bar_ms=int(last_et.timestamp() * 1000),
             last_bar_et=last_et.strftime("%H:%M"),
         ))
-    return out
+    return out, dropped
+
+
+def aggregate_sessions(hourly_rows: Sequence[Mapping[str, Any]]) -> List[SessionBar]:
+    """只要可用会话（`aggregate_sessions_ex` 的第一项）。"""
+    return aggregate_sessions_ex(hourly_rows)[0]
 
 
 def _time(h: int, m: int):
@@ -215,11 +233,87 @@ def completed_upto(sessions: Sequence[SessionBar], now_ms: int) -> int:
     return k
 
 
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """当月第 n 个星期 ``weekday``（0=周一，n 从 1 起）。"""
+    d = date(year, month, 1)
+    d += timedelta(days=(weekday - d.weekday()) % 7)
+    return d + timedelta(days=7 * (n - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    """当月最后一个星期 ``weekday``。"""
+    d = date(year, month + 1, 1) - timedelta(days=1)
+    return d - timedelta(days=(d.weekday() - weekday) % 7)
+
+
+def _observed(d: date) -> date:
+    """NYSE 观察日：周六提前到周五、周日推后到周一。"""
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def _easter(year: int) -> date:
+    """复活节（Anonymous Gregorian algorithm）；受难日 = 复活节前 2 天。"""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month, day = divmod(h + l - 7 * m + 114, 31)
+    return date(year, month, day + 1)
+
+
+@lru_cache(maxsize=8)
+def market_holidays(year: int) -> frozenset:
+    """该年 NYSE/Nasdaq 的**全日休市**日期集合（规则生成，不依赖三方日历包）。
+
+    覆盖：元旦、MLK、总统日、耶稣受难日、阵亡将士纪念日、六月节、独立日、
+    劳动节、感恩节、圣诞。临时休市（国葬、天气）表达不了 —— 那种情况靠
+    「当天没有可用会话」自然跳过（fail-closed）。
+    """
+    out = {
+        _observed(date(year, 1, 1)),
+        _nth_weekday(year, 1, 0, 3),          # MLK：1 月第 3 个周一
+        _nth_weekday(year, 2, 0, 3),          # 总统日：2 月第 3 个周一
+        _easter(year) - timedelta(days=2),    # Good Friday
+        _last_weekday(year, 5, 0),            # 阵亡将士：5 月最后一个周一
+        _observed(date(year, 6, 19)),         # 六月节
+        _observed(date(year, 7, 4)),          # 独立日
+        _nth_weekday(year, 9, 0, 1),          # 劳动节：9 月第 1 个周一
+        _nth_weekday(year, 11, 3, 4),         # 感恩节：11 月第 4 个周四
+        _observed(date(year, 12, 25)),        # 圣诞
+    }
+    nxt = _observed(date(year + 1, 1, 1))     # 次年元旦落在周六 → 本年 12/31 休市
+    if nxt.year == year:
+        out.add(nxt)
+    return frozenset(out)
+
+
+def is_market_holiday(day: Any) -> bool:
+    """``'YYYY-MM-DD'`` 或 ``date`` 是否为美股全日休市日。"""
+    if isinstance(day, str):
+        day = datetime.strptime(day, "%Y-%m-%d").date()
+    return day in market_holidays(day.year)
+
+
 def next_business_day(date_str: str) -> str:
-    """下一个美股工作日（周一–周五，不含节假日；节假日靠 venue 无会话天然跳过）。"""
+    """下一个美股交易日（周一–周五，且不是全日休市日）。
+
+    2026-11-02 第五轮复核：旧版只跳周末，于是「信号日次日是假日」时信号被
+    **整天丢弃**（`entry_decision` 要求 `next_business_day(signal) == today`，
+    而真实的下一个会话是假日之后那天）。现在假日也跳，信号会落到假日后的第一个
+    交易日；反过来，假日当天也不会被当成入场日。
+    """
     d = datetime.strptime(date_str, "%Y-%m-%d").date()
     d += timedelta(days=1)
-    while d.weekday() >= 5:
+    while d.weekday() >= 5 or is_market_holiday(d):
         d += timedelta(days=1)
     return d.strftime("%Y-%m-%d")
 

@@ -132,9 +132,9 @@ def _leg(tmpdir: str, *, equity=500.0, mr_qty="0", market_now=EXIT_NOW_MS):
     return leg, store, exchange
 
 
-def _enable(store: StateStore):
+def _enable(store: StateStore, ts: float = None):
     from app.views import set_mr_enabled
-    set_mr_enabled(store, True, by="test")
+    set_mr_enabled(store, True, by="test", ts=ts)
 
 
 class TestMrDisabled(unittest.TestCase):
@@ -566,7 +566,8 @@ class TestMrConfirmationResilience(unittest.TestCase):
             "2026-04-16T20:00:00+00:00").timestamp() * 1000)
         with tempfile.TemporaryDirectory() as tmp:
             leg, store, exchange = _leg(tmp, market_now=after_window)
-            _enable(store)
+            # 启用事件必须早于该信号的截止时刻，否则「停用期间过期」去噪会跳过它
+            _enable(store, ts=ENTRY_NOW_MS / 1000.0 - 86400.0)
             _run(leg.on_tick(now_ms=after_window))
             row = store.mr_trade_by_signal("2026-04-15")
             self.assertIsNotNone(row)
@@ -592,9 +593,28 @@ class TestExecutorGuard(unittest.TestCase):
     def test_mr_contribution_of(self):
         from app import executor as ex_mod
         ex = ex_mod.Executor.__new__(ex_mod.Executor)
-        acct = _account(500.0, mr_qty="2.6737")       # margin 250 + uPnL 3
-        self.assertAlmostEqual(ex._mr_contribution_of(acct), 253.0)
+        acct = _account(500.0, mr_qty="2.6737")       # position_value 250 / allocated 250
+        # 2026-11-02 第五轮：占用改为**名义**（价格敞口），不再 allocated+uPnL
+        self.assertAlmostEqual(ex._mr_contribution_of(acct), 250.0)
         self.assertAlmostEqual(ex._mr_contribution_of(_account()), 0.0)
+
+    def test_mr_contribution_is_notional_not_margin(self):
+        """5x 下保证金只占名义的 1/5 —— 扣保证金会把 crypto 腿放大 1.8 倍。"""
+        from app import executor as ex_mod
+        ex = ex_mod.Executor.__new__(ex_mod.Executor)
+        pos = ExchangePosition(symbol="QQQ", side=1, qty=Decimal("2.6737"), market_id=129,
+                               unrealized_pnl=0.0, position_value=250.0,
+                               allocated_margin=50.0)      # 5x 逐仓口径
+        acct = ExchangeAccount(equity=500.0, positions=(pos,), orders=(),
+                               orders_error="", as_of=0.0, transaction_time=0.0)
+        self.assertAlmostEqual(ex._mr_contribution_of(acct), 250.0)
+        # 没有 position_value 时才回退「保证金 + uPnL」
+        pos2 = ExchangePosition(symbol="QQQ", side=1, qty=Decimal("2.6737"), market_id=129,
+                                unrealized_pnl=1.0, position_value=None,
+                                allocated_margin=50.0)
+        acct2 = ExchangeAccount(equity=500.0, positions=(pos2,), orders=(),
+                                orders_error="", as_of=0.0, transaction_time=0.0)
+        self.assertAlmostEqual(ex._mr_contribution_of(acct2), 51.0)
 
     def test_risk_state_equity_matches_sizing_equity(self):
         """MR 持仓时风控权益必须与定仓基数同源（否则每次开仓都撞 equity_mismatch）。"""
@@ -624,6 +644,142 @@ class TestExecutorGuard(unittest.TestCase):
                           market_info=None, risk_state=state)
         self.assertNotIn("equity_mismatch",
                          [r.code for r in decision.rejections])
+
+
+class TestFundGateAndResiduals(unittest.TestCase):
+    """2026-11-02 第五轮：MR 必须吃基金级闸门 + 三条残余修复的回归。"""
+
+    @staticmethod
+    def _state(equity: float = 500.0, day_start: float = 500.0,
+               dd_index: float = 1.0, dd_peak: float = 1.0):
+        from app.risk import RiskState
+        return RiskState(equity=equity, day_start_equity=day_start, trades_today=0,
+                         open_positions=(), open_notional_total=0.0,
+                         open_notional_by_symbol={},
+                         dd_index=dd_index, dd_peak_index=dd_peak)
+
+    def test_drawdown_kill_blocks_entry(self):
+        """回撤熔断（DD kill）必须挡 MR 入场 —— 旧版只读 admin_kill，形同没有。"""
+        from app.risk import RiskLimits
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, market_now=ENTRY_NOW_MS)
+            _enable(store)
+            state = self._state(dd_index=0.65, dd_peak=1.0)   # −35% > 30% 熔断线
+            status = _run(leg.on_tick(now_ms=ENTRY_NOW_MS, risk_state=state,
+                                      limits=RiskLimits()))
+            self.assertEqual(status["state"], "blocked_drawdown")
+            self.assertEqual(exchange.orders, [])                    # 一张单都没发
+            self.assertIsNone(store.mr_trade_by_signal("2026-04-15"))  # 不写 SKIPPED
+            self.assertEqual(status["fund_gate"], "risk_state")
+
+    def test_daily_loss_blocks_entry(self):
+        from app.risk import RiskLimits
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, market_now=ENTRY_NOW_MS)
+            _enable(store)
+            state = self._state(equity=450.0, day_start=500.0)  # −10% > 5%
+            status = _run(leg.on_tick(now_ms=ENTRY_NOW_MS, risk_state=state,
+                                      limits=RiskLimits()))
+            self.assertEqual(status["state"], "blocked_daily_loss")
+            self.assertEqual(exchange.orders, [])
+
+    def test_fill_confirm_bounded_by_wall_clock(self):
+        """确认轮询必须有墙钟上限：慢读 / 重试不能把 `_tick_lock` 顶住几分钟。"""
+        import asyncio
+        import time as _time
+
+        class SlowFail:
+            def __init__(self):
+                self.n = 0
+
+            async def read(self):
+                self.n += 1
+                await asyncio.sleep(0.15)
+                raise RuntimeError("503")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp)
+            slow = SlowFail()
+            leg.reader = slow
+            leg.config = MrConfig(fill_confirm_s=0.3, fill_poll_s=0.05)
+            started = _time.monotonic()
+            pos, ok = _run(leg._await_position(want=True))
+            elapsed = _time.monotonic() - started
+            self.assertIsNone(pos)
+            self.assertFalse(ok)
+            # 无墙钟闸时 = 7 次 × 0.15s ≈ 1.05s；有闸门应在预算附近收手
+            self.assertLess(elapsed, 0.9)
+            self.assertLessEqual(slow.n, 3)
+
+    def test_partial_exit_pnl_includes_filled_leg(self):
+        """部分成交离场：先平掉那一截的盈亏也要进台账。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, mr_qty="2.6737")
+            _enable(store)
+            store.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.6737,
+                qty_int=26737, entry_price=ENTRY_DAY_CLOSE, entry_order_id="x",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=250.0, margin=250.0,
+                equity_at_entry=500.0)
+            original = exchange.place_market
+
+            async def partial(**kwargs):
+                exchange.orders.append(kwargs)
+                exchange.reader.account = _account(500.0, mr_qty="1.6737")  # 只平掉 1.0
+                return SimpleNamespace(order_id="O1", accepted=True, ok=True, kind="ok")
+
+            exchange.place_market = partial
+            first = _run(leg.on_tick(now_ms=EXIT_NOW_MS))
+            self.assertEqual(first["state"], "exit_not_filled")
+            row = store.mr_trade_by_signal("2026-04-15")
+            parts = json.loads(row["raw"])["partial_exits"]
+            self.assertAlmostEqual(parts[0]["qty"], 1.0, places=6)
+            self.assertEqual(row["state"], "OPEN")
+
+            exchange.place_market = original
+            _run(leg.on_tick(now_ms=EXIT_NOW_MS + 300_000))
+            row = store.mr_trade_by_signal("2026-04-15")
+            self.assertEqual(row["state"], "CLOSED")
+            # 两段之和 = (95.5 − 93.5) × 2.6737 − funding（fixture 的 0.03）
+            self.assertAlmostEqual(row["net_pnl"], 2.0 * 2.6737 - 0.03, places=4)
+            self.assertAlmostEqual(row["exit_price"], 95.5, places=6)
+
+    def test_adoption_rejects_short_position(self):
+        """交易所有空头仓时，绝不按 MR 入场认领（MR 只做多）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, market_now=ENTRY_NOW_MS)
+            _enable(store)
+            exchange.fill = False                     # 先留一条入场意图、零成交
+            _run(leg.on_tick(now_ms=ENTRY_NOW_MS))
+            self.assertTrue(store.events(kind="mr_entry_intent", limit=1))
+            short = ExchangePosition(symbol="QQQ", side=-1, qty=Decimal("2.0"),
+                                     market_id=129, avg_entry_price=93.0,
+                                     position_value=186.0, allocated_margin=186.0)
+            leg.reader.account = ExchangeAccount(
+                equity=500.0, positions=(short,), orders=(), orders_error="",
+                as_of=0.0, transaction_time=0.0)
+            status = _run(leg.on_tick(now_ms=ENTRY_NOW_MS + 60_000))
+            self.assertIsNone(store.mr_open_trade())
+            self.assertEqual(status["recon"], "err")
+
+    def test_dropped_session_lands_one_event(self):
+        """被末根闸丢弃的**已收盘**会话要留审计行；当天盘中半截会话不报、不重复报。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, _ = _leg(tmp, market_now=ENTRY_NOW_MS)
+            dropped = [{"date": "2026-04-15", "bars": 4, "last_bar_et": "13:00",
+                        "reason": "missing_close_bar"}]
+            status = {}
+            leg._note_dropped_sessions(dropped, ENTRY_NOW_MS, status)
+            self.assertEqual(len(store.events(kind="mr_session_dropped", limit=5)), 1)
+            self.assertEqual(status["dropped_sessions"], ["2026-04-15"])
+            leg._note_dropped_sessions(dropped, ENTRY_NOW_MS + 60_000, {})
+            self.assertEqual(len(store.events(kind="mr_session_dropped", limit=5)), 1)
+            # 还没收盘的会话（当天 10:00 ET）不报
+            mid_session = [{"date": "2026-04-16", "bars": 1, "last_bar_et": "10:00",
+                            "reason": "too_few_bars"}]
+            leg._note_dropped_sessions(mid_session,
+                                       ENTRY_NOW_MS - 6 * 3600_000, {})
+            self.assertEqual(len(store.events(kind="mr_session_dropped", limit=5)), 1)
 
 
 if __name__ == "__main__":

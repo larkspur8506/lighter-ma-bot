@@ -21,6 +21,13 @@
   不做任何动作 + 事件告警，等人工。**不自动吃掉未知仓位**。
 - **kill 语义**：全局 `/admin/kill` 与 MR 专属 `/admin/mr` 都只挡**新入场**，
   持仓照常按信号离场（和 crypto 腿一致——kill 不挡离场）。
+- **基金级闸门（2026-11-02 第五轮）**：入场前还要过 crypto 腿那一份 `RiskState` +
+  `RiskLimits` 里的**基金级**拒绝码（kill / 回撤熔断 / 当日亏损 / 状态不可用）。
+  旧版只读 `admin_kill`，而 Lighter 的 DD 熔断只是 `check_entry` 的一个拒绝码、
+  不写 kill 事件 ⇒ 熔断期间 MR 仍能开 0.5×权益的裸多（HL 侧因为 DD 会 `hl_set_kill`
+  反而是挡住的）。标的级闸门（max_positions / symbol_notional）不套到 MR 上。
+- **占用口径 = 价格敞口（名义）**，不是保证金：定仓基数 = 权益 − |数量 × 标记价|。
+  同一个 MR 敞口在 5x 下保证金只有 1/5，按保证金扣会让 crypto 腿在 MR 持仓期间被放大。
 - MR 默认停用上线：没有 `mr_admin` 事件 = 停用。
 """
 
@@ -39,6 +46,10 @@ from . import mr_signal
 from .exchange import ExchangeClient, client_order_index
 from .executor import AccountReader, ExchangeAccount
 from .market import MarketClient
+from .risk import RiskLimits
+from .risk import check_entry as risk_check_entry
+from .risk import dd_action as risk_dd_action
+from .risk import drawdown as risk_drawdown
 from .store import StateStore
 
 logger = logging.getLogger(__name__)
@@ -47,6 +58,10 @@ logger = logging.getLogger(__name__)
 MR_EVENT_KIND = "mr_admin"
 #: 全局 kill 事件的 kind（与 views.KILL_EVENT_KIND 同值；不 import views 防环）。
 _KILL_EVENT_KIND = "admin_kill"
+#: 基金级闸门里**只挡开仓、且与「账户整体风险」有关**的那几个码（2026-11-02 第五轮）。
+#: `max_positions` / `symbol_notional` / `total_notional` 这类是 crypto 腿的标的级闸门，
+#: MR 有独立单槽，套上去只会误杀。
+_MR_FUND_BLOCKS = ("kill_switch", "state_unavailable", "daily_loss", "drawdown")
 #: 对账不一致告警的最小间隔（秒）——同一问题不刷屏。
 _RECON_ALERT_INTERVAL_S = 6 * 3600.0
 #: 重复拒单/未成交告警的最小间隔（秒）。
@@ -103,6 +118,11 @@ class MrLeg:
     clock: Callable[[], float] = time.time
     #: 告警出口（tick 侧接 executor 的清洗告警；测试注入假函数）。
     alert: Optional[Callable[[str], Awaitable[None]]] = None
+    #: 本轮 crypto 腿的风控状态（`RiskState`，含 DD / 日亏 / 成交笔数口径）。
+    #: `main._tick` 每轮传入 —— **基金级闸门（回撤熔断等）靠它**；缺失时只做 DD 兜底。
+    risk_state: Optional[Any] = None
+    #: 本轮生效的 `RiskLimits`（阈值随 risk_pct 档位联动，不能在这里另算一份）。
+    limits: Optional[RiskLimits] = None
     _recon_bad_since: Optional[float] = None
     _recon_alerted_at: float = 0.0
     #: 订单类告警的去重时间戳（key → 上次发送时刻）；入场窗口内每轮重试不刷屏。
@@ -136,14 +156,57 @@ class MrLeg:
         return None
 
     def _mr_position_contribution(self, pos: Any) -> float:
-        """MR 仓从账户权益里占走的部分（allocated_margin + uPnL）。取不到分量时回退仓位价值。"""
+        """MR 仓从定仓基数里占走的部分 = **价格敞口（数量 × 标记价）**。
+
+        2026-11-02 第五轮：原来是「allocated_margin + uPnL」，即**按保证金**扣。
+        同一个 MR 敞口，1x 时扣满额、5x 时只扣 1/5 —— 扣多少取决于杠杆设置而不是
+        风险大小（HL 侧 5x 就是这样，crypto 腿在 MR 持仓期间被放大 1.8 倍）。改成
+        名义之后两所一致，也与「MR 不挂止损、它是敞口风险」的形状匹配。
+        """
+        value = getattr(pos, "position_value", None)
+        if value is not None:
+            return max(abs(float(value)), 0.0)
         allocated = getattr(pos, "allocated_margin", None)
         upnl = getattr(pos, "unrealized_pnl", None)
         if allocated is not None:
-            contrib = float(allocated) + (float(upnl) if upnl is not None else 0.0)
-            return max(contrib, 0.0)
-        value = getattr(pos, "position_value", None)
-        return float(value) if value is not None else 0.0
+            return max(float(allocated) + (float(upnl) if upnl is not None else 0.0), 0.0)
+        return 0.0
+
+    def _fund_block(self, notional: float) -> str:
+        """基金级开仓闸门（kill / 回撤熔断 / 当日亏损 / 状态不可用）→ 拒绝码或空串。
+
+        2026-11-02 第五轮 P1：MR 原来只读 `admin_kill`，而 Lighter 的**回撤熔断**只是
+        `risk.check_entry()` 的一个拒绝码、**不写 kill 事件** ⇒ 熔断期间 MR 仍能开
+        0.5×权益的裸多（HL 侧相反：DD 命中会 `hl_set_kill(origin=dd)`，MR 被挡）。
+        现在复用同一份 `check_entry`（同一 `RiskState` / 同一 `RiskLimits`），只白名单
+        基金级那几个码；标的级闸门（max_positions / symbol_notional）不套到 MR 上。
+        """
+        limits = self.limits or RiskLimits()
+        state = self.risk_state
+        if state is not None:
+            try:
+                decision = risk_check_entry("QQQ", float(notional), state, limits)
+            except Exception as exc:                          # noqa: BLE001
+                logger.warning("mr: 基金级闸门异常（按不可用处理）：%s", exc)
+                return "state_unavailable"
+            for gate in decision.gates:
+                code = gate.code or gate.gate
+                if gate.blocked and code in _MR_FUND_BLOCKS:
+                    return code
+            return ""
+        # 没拿到 RiskState（装配退化 / 单测）：只做 DD 兜底 —— 回撤是最不该被绕过的一条。
+        try:
+            row = self.store.dd_state() or {}
+            dd = risk_drawdown(row.get("twr_index"), row.get("twr_peak"))
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning("mr: 读 dd_state 失败（跳过 DD 闸门）：%s", exc)
+            return ""
+        if dd is None:
+            return ""
+        if risk_dd_action(dd, limits.risk_pct, limits.dd_warn_pct,
+                          limits.dd_kill_pct) == "kill":
+            return "drawdown"
+        return ""
 
     async def _alert_once(self, message: str) -> None:
         logger.warning("mr: %s", message)
@@ -183,6 +246,7 @@ class MrLeg:
         attempts = 1 if poll <= 0 or budget <= 0 else int(budget / poll) + 1
         pos = None
         read_ok = False
+        started = time.monotonic()
         for i in range(max(attempts, 1)):
             try:
                 account = await self.reader.read()
@@ -194,18 +258,35 @@ class MrLeg:
                 pos = self._exchange_mr_position(account)
                 if (pos is not None) is bool(want):
                     return pos, True
+            # 墙钟上限（2026-11-02 第五轮）：单次读可能因为重试/超时比自己久得多
+            # （HL 侧一次失败读实测 ≈26s），固定 13 次会变成几分钟的阻塞 ——
+            # 而 MR tick 是持着 `_tick_lock` 跑的，会顶住主 tick。
+            elapsed = time.monotonic() - started
+            if elapsed >= budget:
+                logger.warning("mr: 成交确认超时（%.1fs ≥ %.1fs，%d 次读），按当前真相返回",
+                               elapsed, budget, i + 1)
+                break
             if i + 1 < attempts:
-                await asyncio.sleep(poll)
+                await asyncio.sleep(max(min(poll, budget - elapsed), 0.0))
         return pos, read_ok
 
     # ------------------------------------------------------------------ 主流程
 
     async def on_tick(self, now_ms: Optional[int] = None,
-                      account: Optional[ExchangeAccount] = None) -> dict:
-        """每轮 tick 调一次。返回面板 status 块；异常不外抛（MR 挂了不能拖死 crypto 腿）。"""
+                      account: Optional[ExchangeAccount] = None,
+                      risk_state: Optional[Any] = None,
+                      limits: Optional[RiskLimits] = None) -> dict:
+        """每轮 tick 调一次。返回面板 status 块；异常不外抛（MR 挂了不能拖死 crypto 腿）。
+
+        `risk_state`/`limits` 由 `main._tick` 从 crypto 腿那一轮带过来（同一份权益口径、
+        同一套阈值）—— 基金级闸门（回撤熔断 / 当日亏损）就靠它们。
+        """
         cfg = self.config
+        self.risk_state = risk_state
+        self.limits = limits
         status: dict = {"enabled": False, "kill": False, "state": "disabled",
-                        "recon": "unknown", "error": "", "updated_at": self.clock()}
+                        "recon": "unknown", "error": "", "updated_at": self.clock(),
+                        "fund_gate": "risk_state" if risk_state is not None else "dd_only"}
         try:
             status = await self._on_tick_inner(now_ms=now_ms, account=account,
                                                status=status)
@@ -274,7 +355,8 @@ class MrLeg:
             status.update(state="no_data", error="1h candles empty")
             await self._alert_once("MR 拿不到 1h K 线（空响应）")
             return status
-        sessions = mr_signal.aggregate_sessions(rows)
+        sessions, dropped = mr_signal.aggregate_sessions_ex(rows)
+        self._note_dropped_sessions(dropped, now, status)
         if len(sessions) < 6:
             status.update(state="no_data", error=f"usable sessions={len(sessions)}")
             return status
@@ -323,6 +405,10 @@ class MrLeg:
         if not signal_date or self.store.mr_trade_by_signal(signal_date) is not None:
             return False
         qty = float(getattr(pos, "qty", 0) or 0)
+        if getattr(pos, "side", 1) != 1:
+            # MR 只做多：交易所这一格如果是空头（手工/其它系统开的），不按 MR 入场认领。
+            logger.warning("mr: mkt129 是空头（side=%s），跳过入场认领", getattr(pos, "side", None))
+            return False
         fill_px = getattr(pos, "avg_entry_price", None)
         entry_price = float(fill_px) if fill_px and float(fill_px) > 0 else float(payload.get("ref_price") or 0)
         if qty <= 0 or entry_price <= 0:
@@ -405,6 +491,49 @@ class MrLeg:
         status["recon"] = "ok"
         self._recon_bad_since = None
 
+    def _note_dropped_sessions(self, dropped, now_ms: int, status: dict) -> None:
+        """「整个会话因数据不足被弃用」→ 落一条审计事件（同一会话只报一次）。
+
+        2026-11-02 第五轮 P2：末根闸把「用错收盘价」换成了「整天静默丢弃」——
+        信号日整天消失、连事件都没有。这里只报**已收盘**的会话（当天盘中的半截
+        会话是正常状态，不报），也不推送（避免把数据抖动变成告警噪音）。
+        """
+        if not dropped:
+            return
+        tz = ZoneInfo(mr_signal.SESSION_TZ)
+        reported = []
+        for item in dropped[-5:]:
+            try:
+                close_ms = int(datetime.strptime(str(item["date"]), "%Y-%m-%d")
+                               .replace(hour=16, minute=0, tzinfo=tz).timestamp() * 1000)
+            except (TypeError, ValueError):
+                continue
+            if close_ms + 3600_000 > now_ms:                  # 还没收盘：正常
+                continue
+            key = "session_dropped:" + str(item["date"])
+            if self._order_alerted_at.get(key):
+                continue
+            self._order_alerted_at[key] = now_ms / 1000.0
+            reported.append(item)
+            self.store.log_event(
+                "mr_session_dropped",
+                f"MR 会话 {item['date']} 数据不足已弃用（bars={item['bars']}、"
+                f"末根 {item['last_bar_et']} ET、{item['reason']}）",
+                data=item)
+        if reported:
+            status["dropped_sessions"] = [str(r["date"]) for r in reported]
+
+    def _enabled_since(self) -> float:
+        """最近一次「启用」事件的时刻（0 = 从未启用）。给 `_mark_expired_signal` 去噪。"""
+        try:
+            rows = self.store.events(kind=MR_EVENT_KIND, limit=5)
+        except Exception:                                     # noqa: BLE001
+            return 0.0
+        for row in rows:
+            if _event_payload(row).get("enabled"):
+                return float(row.get("ts") or 0.0)
+        return 0.0
+
     # ------------------------------------------------------------------ 入场
 
     async def _maybe_enter(self, *, now_ms: int, sessions, rows, account: ExchangeAccount,
@@ -437,6 +566,17 @@ class MrLeg:
             return
         if notional > equity:
             self.store.mr_mark_skipped(signal_date, "notional > equity（保证金不足保护）")
+            return
+
+        block = self._fund_block(notional)
+        if block:
+            # 基金级闸门（回撤熔断 / 当日亏损 / kill）：**不写 SKIPPED** —— 信号本身
+            # 还有效，熔断解除后的下一个 tick 仍可入场（写 SKIPPED 会把它永久作废）。
+            status.update(state=f"blocked_{block}", error=block)
+            await self._alert_throttled(
+                f"fund_block_{block}",
+                f"MR 入场被基金级风控挡住（{block}）—— 本轮不入场，信号保留到下次 tick",
+                interval_s=6 * 3600.0)
             return
 
         coi = _attempt_coi(cfg.symbol, "mr_entry", now_ms)
@@ -514,6 +654,7 @@ class MrLeg:
         sigs = mr_signal.session_signals(sessions)
         k = mr_signal.completed_upto(sessions, now_ms)
         tz = ZoneInfo(mr_signal.SESSION_TZ)
+        enabled_since = self._enabled_since()
         for i in range(max(k - 5, 0), k):
             if not sigs[i]["entry"]:
                 continue
@@ -525,6 +666,10 @@ class MrLeg:
             if now_ms <= deadline_ms:
                 continue
             if now_ms - deadline_ms > 14 * 86400_000:      # 太老的信号不追溯
+                continue
+            if enabled_since and deadline_ms / 1000.0 < enabled_since:
+                # 那条信号是在腿**停用期间**过期的 —— 不是「启用后错过」，别补 SKIPPED
+                # 刷噪音（2026-11-02 第五轮）。
                 continue
             if self.store.mr_trade_by_signal(s.date) is None:
                 self.store.mr_mark_skipped(s.date, "窗口错过（停机/延迟）")
@@ -582,6 +727,23 @@ class MrLeg:
         # 受理 ≠ 成交：必须看到交易所的仓真的没了才关账 —— 否则「台账 CLOSED + 裸多仓」
         left, left_seen = await self._await_position(want=False)
         if left is not None or not left_seen:
+            if left is not None and left_seen:
+                # 部分成交：先把这个已平掉的片段入账。否则最终决算只按**剩余**数量算
+                # 价差，前面平掉那一截的盈亏就丢了（2026-11-02 第五轮 P3）。
+                prev_qty = float(getattr(pos, "qty", 0) or 0)
+                left_qty = float(getattr(left, "qty", 0) or 0)
+                filled_qty = prev_qty - left_qty
+                if filled_qty > 1e-12:
+                    self.store.mr_trade_append_partial(
+                        int(open_row["id"]), qty=filled_qty,
+                        price=last_close, ts=now_ms / 1000.0)
+                    self.store.log_event(
+                        "mr_exit_partial",
+                        f"MR 离场部分成交 {filled_qty:g}（剩余 {left_qty:g}）—— "
+                        f"该片段按参考价 {last_close:.2f} 记账",
+                        data={"signal_date": open_row.get("signal_date"),
+                              "filled": filled_qty, "left": left_qty,
+                              "ref_price": last_close})
             status.update(state="exit_not_filled",
                           error=f"确认窗口内仍有持仓 {getattr(left, 'qty', '?')}")
             await self._alert_throttled(
@@ -595,14 +757,19 @@ class MrLeg:
                        if funding_paid is not None and notional > 0 else None)
         entry_price = float(open_row.get("entry_price") or 0.0)
         qty = float(pos_qty) if pos_qty is not None else float(open_row.get("qty") or 0.0)
+        partials = _partial_exits(open_row)
+        partial_pnl = sum((float(p.get("price") or 0.0) - entry_price)
+                          * float(p.get("qty") or 0.0) for p in partials)
         net_pnl = ((last_close - entry_price) * qty
-                   - (float(funding_paid) if funding_paid is not None else 0.0))
+                   - (float(funding_paid) if funding_paid is not None else 0.0)
+                   + partial_pnl)
         self.store.mr_close_trade(
             int(open_row["id"]), exit_price=last_close,
             exit_order_id=str(getattr(result, "order_id", "") or ""),
             exit_ts=now_ms / 1000.0, exit_reason="sma5", exit_signal_date=exit_date,
             funding_pct=funding_pct, net_pnl=net_pnl,
-            raw={"ref_price": last_close, "result": _result_brief(result)})
+            raw={"ref_price": last_close, "result": _result_brief(result),
+                 "partial_exits": partials, "partial_pnl": partial_pnl})
         # 即时止损触发器：实际付出 funding 超基线 10 倍且绝对额 >0.10% 名义 → 自动停用
         # （2026-11-02 第四轮复核：旧值 2 倍会在多数正常交易后自停 —— 实测 12 笔回合
         # 有 7 笔触发；10 倍 + 绝对门槛在样本内 0/12 触发，只拦真正的费率尖峰）
@@ -628,6 +795,22 @@ class MrLeg:
 
 
 # ------------------------------------------------------------------ 工具
+
+def _partial_exits(row: Mapping[str, Any]) -> list:
+    """台账 `raw.partial_exits`（部分成交片段）→ list；解析失败返回 []。"""
+    raw = row.get("raw") if isinstance(row, Mapping) else None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return []
+    if not isinstance(raw, Mapping):
+        return []
+    parts = raw.get("partial_exits")
+    if not isinstance(parts, list):
+        return []
+    return [dict(p) for p in parts if isinstance(p, Mapping)]
+
 
 def _event_payload(row: Mapping[str, Any]) -> dict:
     """事件行的 data 列（JSON 字符串或 dict）→ dict；解析失败返回 {}。"""
