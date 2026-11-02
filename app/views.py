@@ -2336,7 +2336,10 @@ def _mr_dyn_html(mr: Mapping[str, Any]) -> str:
         ok = thr is not None and rsi < thr
         rsi_txt = f"{rsi:.2f}{' ✔' if ok else ''}"
         rsi_css = "pos" if ok else ""
-    if d_exit is None:
+    if not holding:
+        # 空仓不给离场线/距离场（假想值会被读成止损价，2026-11-02 用户指出）
+        ex_txt, ex_css = "—", "dim"
+    elif d_exit is None:
         ex_txt, ex_css = "—", "dim"
     elif d_exit < 0:
         ex_txt, ex_css = f"已站上 {abs(d_exit):.2f}%（等收盘）", "warn"
@@ -2353,7 +2356,7 @@ def _mr_dyn_html(mr: Mapping[str, Any]) -> str:
            f"<span>{html.escape(pos_txt)}</span>"
            f"<span class='{e_css}'>{e_txt}</span>"
            f"<span class='{rsi_css}'>{rsi_txt}</span>"
-           f"<span>{_money(exit_line)}</span>"
+           f"<span>{_money(exit_line) if holding else '—'}</span>"
            f"<span class='{ex_css}'>{ex_txt}</span>"
            f"<span class='verdict {status_css}'>{html.escape(status)}</span>"
            "</div>")
