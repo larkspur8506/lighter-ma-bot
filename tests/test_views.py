@@ -558,6 +558,34 @@ class RecordsTests(PanelFixture):
         self.assertIn("1,500.00", html)
         self.assertIn("离场", html)
 
+    def test_mr_leg_trades_merge_into_records(self) -> None:
+        """MR 腿成交在 mr_trades 台账，必须并入记录页与 /api/records（2026-11-02）。"""
+        self._seed_trades()
+        self.store.mr_record_entry(signal_date="2026-11-02", entry_session="09:30",
+                                   qty=0.3575, qty_int=35750, entry_price=695.66,
+                                   entry_order_id="coi:1", entry_ts=T0 + 9000,
+                                   notional=248.7, margin=49.7,
+                                   equity_at_entry=1500.0)
+        rows = self.panel().records()["trades"]
+        self.assertEqual(rows[0]["symbol"], "QQQ")              # 按时间排，最新在前
+        self.assertEqual(rows[0]["kind_text"], "开仓")
+        self.assertEqual(rows[0]["side_text"], "多")
+        self.assertIsNone(rows[0]["realized_pnl"])
+        self.assertEqual(rows[0]["position_id"], "mr:2026-11-02")
+        # 关账后出现离场腿：side 记**成交方向**（平多=卖），盈亏取 net_pnl
+        self.store.mr_close_trade(1, exit_price=713.33, exit_order_id="coi:2",
+                                  exit_ts=T0 + 20000, exit_reason="exit",
+                                  exit_signal_date="2026-11-03", funding_pct=0.001,
+                                  net_pnl=6.31)
+        rows = self.panel().records()["trades"]
+        self.assertEqual([r["kind_text"] for r in rows[:2]], ["离场", "开仓"])
+        self.assertEqual(rows[0]["side_text"], "空")
+        self.assertAlmostEqual(rows[0]["realized_pnl"], 6.31, places=6)
+        self.assertEqual(rows[0]["position_id"], rows[1]["position_id"])
+        # 整条列表仍按时间新→旧（QQQ 两腿夹着 crypto 的两条）
+        stamps = [r["ts"] for r in rows]
+        self.assertEqual(stamps, sorted(stamps, reverse=True))
+
 
 # --------------------------------------------------------------------------- 5. 降级
 
