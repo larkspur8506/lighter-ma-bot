@@ -1149,7 +1149,8 @@ def _qty_matches(local_qty_int: int, size_decimals: int, exchange_qty: Decimal) 
 def reconcile(*, local_positions: Iterable[Mapping[str, Any]],
               account: ExchangeAccount,
               now: Optional[float] = None,
-              stop_tolerance_ticks: int = DEFAULT_STOP_TOLERANCE_TICKS) -> ReconcileReport:
+              stop_tolerance_ticks: int = DEFAULT_STOP_TOLERANCE_TICKS,
+              universe: Optional[Iterable[str]] = None) -> ReconcileReport:
     """**纯函数**对账：本地仓位行 × 交易所快照 → `ReconcileReport`。
 
     没有 store 句柄 → **结构上不可能改本地状态**（这是 T8 验收项 4 的机械保证）。
@@ -1180,8 +1181,15 @@ def reconcile(*, local_positions: Iterable[Mapping[str, Any]],
         if not symbol:
             raise ExecutorError("local position row has no symbol")
         local_by_symbol[symbol] = row
+    #: 只对**本策略的标的**对账（2026-11-02 线上事故）：同一个 Lighter 账户上还有
+    #  MR 腿的 QQQ（mkt129），它有自己的台账与对账。把它的仓算成「交易所有、本地没有」，
+    #  会让 crypto 腿每轮报 `position_unknown_locally`（danger + blocker）⇒ 一开 MR 仓，
+    #  crypto 腿就永久开不了新仓。`universe=None` 保持旧行为（全部标的）。
+    universe_set = ({str(s).strip().upper() for s in universe} if universe else set())
     exchange_by_symbol: Dict[str, ExchangePosition] = {}
     for pos in account.positions:
+        if universe_set and str(pos.symbol or "").strip().upper() not in universe_set:
+            continue
         exchange_by_symbol[pos.symbol] = pos
 
     issues: List[ReconcileIssue] = []
@@ -2276,7 +2284,8 @@ class Executor:
             raise ExecutorError("reconcile needs an exchange snapshot (call read() first)")
         return reconcile(local_positions=self.store.open_positions(), account=snap,
                          now=float(self.clock()),
-                         stop_tolerance_ticks=self.stop_tolerance_ticks)
+                         stop_tolerance_ticks=self.stop_tolerance_ticks,
+                         universe=self.symbols)
 
     # ------------------------------------------------------------ 成交确认 / grace 结案
     #

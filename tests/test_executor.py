@@ -663,7 +663,7 @@ class ReconcileDetectionTests(Base):
         self.assertEqual(self.store.trade_count(), before_trades)
         # 纯函数：连 store 都不该出现在签名里
         self.assertEqual(set(inspect.signature(reconcile).parameters),
-                         {"local_positions", "account", "now", "stop_tolerance_ticks"})
+                         {"local_positions", "account", "now", "stop_tolerance_ticks", "universe"})
 
     def test_stop_fill_is_grace_not_mismatch_and_gets_settled(self):
         """本地有仓 / 交易所已平 / 止损单也不在了 → grace（不误报），并由 record_stop 结案。"""
@@ -871,6 +871,25 @@ class ReconcileUnitTests(unittest.TestCase):
                                   reduce_only=True, trigger_price_int=1049),))
         report = reconcile(local_positions=[self.row(stop_order_id=None)], account=account)
         self.assertTrue(report.ok, str(report))
+
+    def test_mr_position_is_outside_the_crypto_universe(self):
+        """同一个账户上 MR 腿的 QQQ 不能被 crypto 腿判成「交易所有、本地没有」。
+
+        2026-11-02 线上：MR 一开 QQQ 仓，crypto 腿每轮就报 `position_unknown_locally`
+        （danger + blocker）⇒ 所有 crypto 开仓被挡。修法 = 对账只看本策略标的。
+        """
+        account = ExchangeAccount(positions=(
+            ExchangePosition(symbol=BTC, side=1, qty=Decimal("4.156"), market_id=1),
+            ExchangePosition(symbol="QQQ", side=1, qty=Decimal("0.3575"), market_id=129),
+        ), orders=(ExchangeOrder(order_id="s", client_order_index=None, market_id=1,
+                                 reduce_only=True, trigger_price_int=1050),))
+        scoped = reconcile(local_positions=[self.row()], account=account,
+                           universe=("BTC", "ETH", "SOL"))
+        self.assertTrue(scoped.ok, str(scoped))
+        self.assertNotIn(ISSUE_POSITION_UNKNOWN, scoped.codes)
+        # 不传 universe（旧行为）：QQQ 仍会被报出来
+        legacy = reconcile(local_positions=[self.row()], account=account)
+        self.assertIn(ISSUE_POSITION_UNKNOWN, legacy.codes)
 
     def test_non_reduce_only_order_is_not_a_stop(self):
         account = ExchangeAccount(positions=(
