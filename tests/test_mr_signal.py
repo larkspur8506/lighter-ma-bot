@@ -56,10 +56,8 @@ class TestAggregateSessions(unittest.TestCase):
         # 冬令时覆盖 9:00–14:00 ET → 10:00–14:00 ET 开盘的 bar 只有 15–19 时段。
         rows = _hourly("2026-01-05", 50.0, hours=(14, 15, 16, 17, 18, 19))
         sessions = mr_signal.aggregate_sessions(rows)
-        self.assertEqual(len(sessions), 1)
-        s = sessions[0]
-        self.assertEqual(s.bars, 5)               # 15:00–19:00 UTC = 10:00–14:00 EST
-        self.assertEqual(s.last_bar_et, "14:00")
+        # 末根 14:00 ET = 午后缺数（拿 14:00 当收盘是假收盘）→ 整日弃用
+        self.assertEqual(sessions, [])
         # 冬令时正确的会话应包含 20:00 UTC（15:00 EST）那根 bar
         rows_winter = _hourly("2026-01-05", 50.0,
                               hours=(15, 16, 17, 18, 19, 20))
@@ -82,12 +80,19 @@ class TestAggregateSessions(unittest.TestCase):
         rows = _hourly("2026-01-06", 50.0, hours=(15, 16, 17, 18))
         self.assertEqual(mr_signal.aggregate_sessions(rows), [])
 
-    def test_five_bar_session_kept(self):
-        # 允许缺 1 小时（末根 14:00 ET，收盘最多早 1 小时）
-        rows = _hourly("2026-01-06", 50.0, hours=(15, 16, 17, 18, 19))
+    def test_five_bar_session_ending_1500_kept(self):
+        # 允许缺 1 小时，但末根必须是 15:00 ET（11:00–15:00 EST = 16–20 UTC）
+        rows = _hourly("2026-01-06", 50.0, hours=(16, 17, 18, 19, 20))
         sessions = mr_signal.aggregate_sessions(rows)
         self.assertEqual(len(sessions), 1)
         self.assertEqual(sessions[0].bars, 5)
+        self.assertEqual(sessions[0].last_bar_et, "15:00")
+
+    def test_five_bar_session_ending_1400_dropped(self):
+        # 2026-11-02 第四轮复核：10:00–14:00 的 5 根会通过旧规则，把 14:00 价当
+        # 全天收盘；末根必须 ≥15:00，否则整日弃用（午后缺数 fail-closed）。
+        rows = _hourly("2026-01-06", 50.0, hours=(15, 16, 17, 18, 19))
+        self.assertEqual(mr_signal.aggregate_sessions(rows), [])
 
     def test_session_with_stale_last_bar_dropped(self):
         # 交易所盘中缺数：最后一根 bar 11:00 ET（16:00 UTC EST）→ 会话弃用
