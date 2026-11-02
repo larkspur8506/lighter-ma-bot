@@ -106,11 +106,12 @@ class MrPositionRowTests(MrPanelFixture):
         qqq = page.split("QQQ <span class='badge-mr'>MR</span>", 1)[1][:260]
         self.assertIn("<td>—</td><td>—</td>", qqq)
 
-    def test_enabled_flat_row_persists_without_entry(self) -> None:
-        row = [r for r in self.rows(mr_status(phase="signal_ready")) if r.get("is_mr")][0]
-        self.assertIsNone(row["position_id"])
-        self.assertEqual(row["entry_price"], 0.0)
-        self.assertEqual(row["status"], "信号已出，等 2026-11-02 开盘")
+    def test_flat_has_no_position_row(self) -> None:
+        """空仓不进仓位表（2026-11-02 用户拍板：无仓位不显示），状态看动态卡。"""
+        self.assertEqual([r for r in self.rows(mr_status(phase="signal_ready"))
+                          if r.get("is_mr")], [])
+        mr = self.panel(mr_status(phase="signal_ready")).symbols_block()["mr"]
+        self.assertEqual(mr["status"], "信号已出，等 2026-11-02 开盘")
 
     def test_disabled_flat_row_absent(self) -> None:
         self.assertEqual([r for r in self.rows(mr_status(enabled=False))
@@ -125,8 +126,8 @@ class MrPositionRowTests(MrPanelFixture):
     def test_phase_texts(self) -> None:
         for phase, text in (("in_window", "窗口内等成交"), ("expired", "窗口已过，等明日"),
                             ("no_signal", "空仓"), ("no_data", "无数据")):
-            row = [r for r in self.rows(mr_status(phase=phase)) if r.get("is_mr")][0]
-            self.assertEqual(row["status"], text, phase)
+            mr = self.panel(mr_status(phase=phase)).symbols_block()["mr"]
+            self.assertEqual(mr["status"], text, phase)
 
     def test_missing_signal_fields_render_dashes(self) -> None:
         row = [r for r in self.rows(mr_status(holding=True, with_signal=False))

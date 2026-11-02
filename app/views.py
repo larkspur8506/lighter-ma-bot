@@ -1345,9 +1345,11 @@ class Panel:
             return None
         pos = dict(mr.get("pos") or {})
         sig = dict(mr.get("signal") or {})
-        if not mr.get("enabled") and not pos:
+        # 只有真持仓才进仓位表（用户 2026-11-02 拍板）：空仓时整行不显示，
+        # 策略状态看「标的动态」的超跌腿子表，仓位表只放真仓位。
+        if not pos:
             return None
-        holding = bool(pos)
+        holding = True
         entry = _finite(pos.get("entry_price")) or 0.0
         mark = _finite(pos.get("mark")) or _finite(mr.get("mark"))
         exit_line = _finite(pos.get("exit_line")) or _finite(sig.get("exit_line"))
@@ -1898,7 +1900,7 @@ _CSS = """
   }
 }
 * { box-sizing: border-box; }
-body { margin: 0; padding: 12px; background: var(--bg); color: var(--text);
+body { margin: 0; padding: 12px; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; background: var(--bg); color: var(--text);
        font: 13px/1.45 -apple-system, "Segoe UI", "Noto Sans SC", sans-serif; }
 h1 { font-size: 15px; margin: 0 0 6px; font-weight: 600; letter-spacing: .02em; }
 h2 { font-size: 13px; margin: 0 0 8px; font-weight: 600; color: var(--muted);
