@@ -91,6 +91,7 @@ from app.store import StateStore
 __all__ = [
     "ADMIN_TOKEN_ENV", "CONFIRM_VALUES", "CREDENTIAL_ENV_KEYS", "DB_PATH_ENV", "DB_URL_ENV",
     "PanelCache", "SQLITE_URL_PREFIX", "StorePathError", "TICK_MINUTES", "TickScheduler",
+    "MR_TICK_MINUTES",
     "VERSION", "create_app", "credential_status", "default_store_factory",
     "default_tick_runner", "next_tick_at", "record_tick_outcomes", "resolve_store_path",
 ]
@@ -119,6 +120,11 @@ MR_FLATTEN_SLIPPAGE_BPS = 15
 #: 4h bar 收盘后 tick 的分钟位（UTC）：`:03`（收盘 +3 分钟，等交易所把 bar 落定）
 #: 与 `:33`（同一根 bar 的复检 —— 执行器按 `(symbol, bar_ms)` 幂等，重跑只会产生 skip）。
 TICK_MINUTES: Tuple[int, ...] = (3, 33)
+#: MR 腿（QQQ）单独一轮的分钟位。**刻意错开**主 tick 的 :03/:33 与 HL 的 :02/:07…
+#  为什么 MR 要 5 分钟而 crypto 30 分钟就够：crypto 的 4h 策略每根 bar 只看 8 次即可，
+#  而 MR 的入场窗口只有 3 小时（36 次尝试 vs 6 次），且这条腿没有止损 —— 收盘后的
+#  离场评估拖 30 分钟就是白送风险（2026-11-02 用户拍板统一到 5 分钟）。
+MR_TICK_MINUTES: Tuple[int, ...] = (1, 6, 11, 16, 21, 26, 31, 36, 41, 46, 51, 56)
 
 HEARTBEAT_KIND = watchdog.HEARTBEAT_KIND
 
@@ -800,7 +806,9 @@ class TickScheduler:
                  store_factory: Optional[Callable[[], Any]] = None,
                  minutes: Sequence[int] = TICK_MINUTES,
                  clock: Callable[[], float] = time.time,
-                 sleep: Optional[Callable[[float], Awaitable[None]]] = None) -> None:
+                 sleep: Optional[Callable[[float], Awaitable[None]]] = None,
+                 mr_runner: Optional[Callable[[], Any]] = None,
+                 mr_minutes: Sequence[int] = ()) -> None:
         if runner is None:
             raise ValueError("TickScheduler requires a runner")
         self.runner = runner
@@ -810,6 +818,11 @@ class TickScheduler:
         #: 关闭它会把别人的库抽走。`store_factory=` 建出来的才是本对象的。
         self._store_owned = False
         self.minutes = tuple(int(m) % 60 for m in minutes)
+        #: MR 腿的独立节拍（可选）。两条都命中同一分钟时只跑主 tick（它内部会跑 MR）。
+        self.mr_runner = mr_runner
+        self.mr_minutes = tuple(int(m) % 60 for m in mr_minutes) if mr_runner else ()
+        self.mr_runs = 0
+        self.mr_failures = 0
         self.clock = clock
         self._sleep = sleep or asyncio.sleep
         self.started = False
@@ -922,12 +935,44 @@ class TickScheduler:
         except Exception as exc:                              # noqa: BLE001
             logger.warning("could not record %s: %s", kind, exc)
 
+    def next_due(self, now: float) -> Tuple[str, float]:
+        """下一个该跑的是谁、什么时候。`("main"|"mr", epoch 秒)`。"""
+        due_main = next_tick_at(now, self.minutes)
+        if not self.mr_minutes:
+            return "main", due_main
+        due_mr = next_tick_at(now, self.mr_minutes)
+        # 同一分钟：主 tick 内部会跑 MR，不重复跑
+        if due_mr < due_main - 1e-6:
+            return "mr", due_mr
+        return "main", due_main
+
+    async def mr_tick(self) -> Dict[str, Any]:
+        """只跑 MR 腿的一轮（**永不抛**）。失败只记事件，不影响主 tick 的计数。"""
+        started = float(self.clock())
+        status, detail = "ok", ""
+        try:
+            result = self.mr_runner()          # type: ignore[misc]
+            if inspect.isawaitable(result):
+                result = await result
+            detail = "" if result is None else str(result)[:200]
+        except Exception as exc:                              # noqa: BLE001 - 同规则 1
+            status = "error"
+            self.mr_failures += 1
+            logger.exception("mr tick failed — the scheduler keeps running")
+            self._event(self.store(), "mr_tick_failed",
+                        f"MR tick failed: {type(exc).__name__}: {exc}"[:500],
+                        {"error": f"{type(exc).__name__}: {exc}", "runs": self.mr_runs})
+        finally:
+            self.mr_runs += 1
+        return {"status": status, "detail": detail, "runs": self.mr_runs,
+                "failures": self.mr_failures, "ts": started}
+
     # ---------------------------------------------------------------- 循环
 
     async def run_forever(self) -> None:
         self.started = True
         while not self._stopping:
-            due = next_tick_at(float(self.clock()), self.minutes)
+            which, due = self.next_due(float(self.clock()))
             try:
                 # 分段睡：`stop()` 最多等 30s 就生效，而不是等满一个 30 分钟窗口。
                 while not self._stopping:
@@ -939,7 +984,10 @@ class TickScheduler:
                 raise
             if self._stopping:
                 break
-            await self.tick()
+            if which == "mr":
+                await self.mr_tick()
+            else:
+                await self.tick()
         self.started = False
 
     def start(self) -> None:
@@ -1895,7 +1943,9 @@ def _build_scheduler(store_factory: Callable[[], Any], *,
                                          sources_getter=sources_getter)
         except Exception as exc:                              # noqa: BLE001
             return f"无法装配 tick runner: {type(exc).__name__}: {exc}"
-    return TickScheduler(runner, store_factory=store_factory, clock=clock)
+    return TickScheduler(runner, store_factory=store_factory, clock=clock,
+                         mr_runner=getattr(runner, "mr_runner", None),
+                         mr_minutes=MR_TICK_MINUTES)
 
 
 def _stored_flows_for_replay(store: Any) -> List[Dict[str, float]]:
@@ -2006,7 +2056,10 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
     reader = LighterAccountReader(base_url=config.base_url,
                                   account_index=config.account_index,
                                   auth_provider=lambda: exchange.auth.get())
-    box: Dict[str, Any] = {"store": None}
+    box: Dict[str, Any] = {"store": None, "last_risk_state": None}
+    #: MR 腿的重入锁：主 tick（30 分钟）与 5 分钟节拍都可能在同一秒想跑 MR，
+    #  账户读与下单都不能并发（会重复读、也可能重复重试）。
+    mr_lock = asyncio.Lock()
 
     def _limits() -> RiskLimits:
         """每轮重读 kill 开关：环境变量 kill 与 DB 里的 admin kill **任一**为真即生效。"""
@@ -2046,6 +2099,7 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
                             grace_ticks=grace_ticks(),
                             max_signal_age_min=max_signal_age_minutes())
         report = await executor.run_once()
+        box["last_risk_state"] = getattr(executor, "last_risk_state", None)
         record_tick_outcomes(store, report, ts=time.time())
         # 面板复用本轮取到的 K 线：不额外取数、且与决策用同一份序列（含同一个起点）
         for symbol, bars in (getattr(executor, "_bars", {}) or {}).items():
@@ -2071,12 +2125,13 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
                             market_client=market,
                             alert=notify.notifier_from_env())
                 box["mr_leg"] = leg
-            cache.set_mr(await leg.on_tick(
-                account=account,
-                # 基金级闸门（回撤熔断 / 日亏 / kill）复用 crypto 腿这一轮的同一份
-                # RiskState 与阈值 —— 两条腿各算一套是「熔断只挡一条腿」的根源。
-                risk_state=getattr(executor, "last_risk_state", None),
-                limits=_limits()))
+            async with mr_lock:
+                cache.set_mr(await leg.on_tick(
+                    account=account,
+                    # 基金级闸门（回撤熔断 / 日亏 / kill）复用 crypto 腿这一轮的同一份
+                    # RiskState 与阈值 —— 两条腿各算一套是「熔断只挡一条腿」的根源。
+                    risk_state=getattr(executor, "last_risk_state", None),
+                    limits=_limits()))
         except Exception as exc:                              # noqa: BLE001 - MR 不拖死主腿
             logger.warning("mr leg tick failed: %s: %s", type(exc).__name__, exc)
             cache.set_mr({"enabled": None, "state": "error", "recon": "unknown",
@@ -2147,6 +2202,31 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
     _tick.close = _close                                     # type: ignore[attr-defined]
 
     sources_getter()                                          # 保持接口对称（见 docstring）
+    async def _mr_tick() -> Any:
+        """MR 腿单独一轮（5 分钟节拍）：只做 QQQ，不碰 crypto 腿。
+
+        与主 tick 的区别只有两点：不跑执行器（省掉 4h 信号扫描与整账户对账），
+        账户由 `MrLeg.on_tick(account=None)` 自己读。风控沿用主 tick 最近一次的
+        `RiskState`（最多 30 分钟旧；没有就退化为 `state_unavailable` 拒单，fail-closed）。
+        """
+        if mr_lock.locked():                                  # 主 tick 正在跑：让给它
+            return {"state": "busy"}
+        store = box["store"]
+        if store is None:
+            store = box["store"] = StateStore.from_config(config)
+        leg = box.get("mr_leg")
+        if leg is None:
+            leg = box["mr_leg"] = MrLeg(store=store, exchange=exchange, reader=reader,
+                                        market_client=market,
+                                        alert=notify.notifier_from_env())
+        async with mr_lock:
+            status = await leg.on_tick(risk_state=box.get("last_risk_state"),
+                                       limits=_limits())
+        cache.set_mr(status)
+        return (status or {}).get("state")
+
+    #: 调度器按这条属性把 MR 单独拉起来（主 tick 仍是 30 分钟）
+    _tick.mr_runner = _mr_tick                                        # type: ignore[attr-defined]
     return _tick
 
 

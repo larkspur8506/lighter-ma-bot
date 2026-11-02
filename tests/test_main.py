@@ -300,6 +300,49 @@ class NextTickTests(unittest.TestCase):
     def test_tick_minutes_are_the_documented_ones(self) -> None:
         self.assertEqual(main.TICK_MINUTES, (3, 33))
 
+    def test_mr_minutes_do_not_collide_with_main_or_hl(self) -> None:
+        """MR 5 分钟节拍：不落在 :03/:33（主 tick），也不落在 :02/:07…（HL 的 job）。"""
+        self.assertEqual(len(main.MR_TICK_MINUTES), 12)
+        self.assertEqual(set(main.MR_TICK_MINUTES) & set(main.TICK_MINUTES), set())
+        self.assertEqual(set(main.MR_TICK_MINUTES) & set(range(2, 60, 5)), set())
+
+    def test_next_due_prefers_whichever_comes_first(self) -> None:
+        sched = main.TickScheduler(lambda: None, mr_runner=lambda: None,
+                                   mr_minutes=main.MR_TICK_MINUTES)
+        # 00:00 之后：MR 在 :01（比主 tick 的 :03 早）
+        self.assertEqual(sched.next_due(utc(2026, 1, 1, 0, 0, 0)), ("mr", utc(2026, 1, 1, 0, 1, 0)))
+        # 00:02 之后：主 tick :03 先到
+        self.assertEqual(sched.next_due(utc(2026, 1, 1, 0, 2, 0)), ("main", utc(2026, 1, 1, 0, 3, 0)))
+        # 00:05 之后：MR :06
+        self.assertEqual(sched.next_due(utc(2026, 1, 1, 0, 5, 30)), ("mr", utc(2026, 1, 1, 0, 6, 0)))
+
+    def test_next_due_without_mr_runner_is_main_only(self) -> None:
+        sched = main.TickScheduler(lambda: None)
+        self.assertEqual(sched.next_due(utc(2026, 1, 1, 0, 0, 0)), ("main", utc(2026, 1, 1, 0, 3, 0)))
+
+    def test_mr_tick_swallows_failures_and_counts(self) -> None:
+        async def boom() -> None:
+            raise RuntimeError("mr down")
+
+        sched = main.TickScheduler(lambda: None, mr_runner=boom)
+        out = asyncio.run(sched.mr_tick())
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["failures"], 1)
+        self.assertEqual(sched.mr_runs, 1)
+
+    def test_mr_tick_runs_the_runner(self) -> None:
+        calls = []
+
+        async def ok() -> str:
+            calls.append(1)
+            return "flat"
+
+        sched = main.TickScheduler(lambda: None, mr_runner=ok)
+        out = asyncio.run(sched.mr_tick())
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["detail"], "flat")
+        self.assertEqual(len(calls), 1)
+
 
 # --------------------------------------------------------------------------- 4. 调度器
 
