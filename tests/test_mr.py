@@ -633,7 +633,8 @@ class TestExecutorGuard(unittest.TestCase):
             open_notional_by_symbol={}, dd_index=1.0, dd_peak_index=1.0))
         state = ex._risk_state_for_sizing(snap)
         self.assertAlmostEqual(state.equity, 246.04, places=6)
-        self.assertAlmostEqual(state.day_start_equity, 497.04, places=6)  # 守护口径不动
+        # 2026-11-02 第五轮：日初权益必须同幅下移 —— 否则日亏闸把「基数缩小」当成亏损
+        self.assertAlmostEqual(state.day_start_equity, 246.04, places=6)
 
         bars = [strategy.Bar(open_ms=i * 4 * 3600_000, open=100.0, high=101.0,
                              low=99.0, close=100.0) for i in range(3)]
@@ -642,8 +643,9 @@ class TestExecutorGuard(unittest.TestCase):
                               ma_max=101.0, ma_min=99.0, band=0.02, side=1)
         decision = decide("BTC", bars, i=2, signal=sig, equity=ex._crypto_equity,
                           market_info=None, risk_state=state)
-        self.assertNotIn("equity_mismatch",
-                         [r.code for r in decision.rejections])
+        codes = [r.code for r in decision.rejections]
+        self.assertNotIn("equity_mismatch", codes)
+        self.assertNotIn("daily_loss", codes)
 
 
 class TestFundGateAndResiduals(unittest.TestCase):
