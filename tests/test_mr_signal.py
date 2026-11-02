@@ -71,13 +71,23 @@ class TestAggregateSessions(unittest.TestCase):
         rows = _hourly("2026-04-04", 100.0) + _hourly("2026-04-05", 101.0)
         self.assertEqual(mr_signal.aggregate_sessions(rows), [])
 
-    def test_half_day_session_usable(self):
-        # 半日市：13:00 ET 收盘 → 最后的 bar 开盘 12:00 ET（17:00 UTC EST）。
+    def test_short_session_dropped_as_data_gap(self):
+        # 只有 3 根（10:00/11:00/12:00 ET）的会话在 24/7 永续上等于「午后缺数」：
+        # 拿 12:00 收盘当全天收盘会喂给 RSI/离场一条假收盘 → 整日弃用（MIN_SESSION_BARS=5）。
         rows = _hourly("2025-12-24", 60.0, hours=(15, 16, 17))
+        self.assertEqual(mr_signal.aggregate_sessions(rows), [])
+
+    def test_four_bar_session_dropped(self):
+        # 缺 14:00/15:00 两根 → 仍不足以代表全天收盘
+        rows = _hourly("2026-01-06", 50.0, hours=(15, 16, 17, 18))
+        self.assertEqual(mr_signal.aggregate_sessions(rows), [])
+
+    def test_five_bar_session_kept(self):
+        # 允许缺 1 小时（末根 14:00 ET，收盘最多早 1 小时）
+        rows = _hourly("2026-01-06", 50.0, hours=(15, 16, 17, 18, 19))
         sessions = mr_signal.aggregate_sessions(rows)
         self.assertEqual(len(sessions), 1)
-        self.assertEqual(sessions[0].bars, 3)
-        self.assertEqual(sessions[0].last_bar_et, "12:00")
+        self.assertEqual(sessions[0].bars, 5)
 
     def test_session_with_stale_last_bar_dropped(self):
         # 交易所盘中缺数：最后一根 bar 11:00 ET（16:00 UTC EST）→ 会话弃用

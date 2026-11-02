@@ -2388,12 +2388,19 @@ _ADMIN_JS = """
     if (!reason || !reason.trim()) { return; }
     post('/admin/dd/reset', {reason: reason.trim()});
   });
+  bind('btn-mr-on', function () {
+    if (!confirm('启用 MR 腿（QQQ 超跌反弹）？只影响新入场，已持仓仍按信号离场。')) { return; }
+    post('/admin/mr', {on: '1', reason: 'panel: enable mr'});
+  });
+  bind('btn-mr-off', function () {
+    post('/admin/mr', {on: '0', reason: 'panel: disable mr'});
+  });
 })();
 """
 
 
 def _admin_html() -> str:
-    """⑦ 人工操作区：kill / 强制清仓 / 重置回撤峰值（三个写操作的唯一 UI 入口）。"""
+    """⑦ 人工操作区：kill / 强制清仓 / 重置回撤峰值 / MR 开关（写操作的唯一 UI 入口）。"""
     return (
         '<section id="block-admin"><h2>⑥ 人工操作（admin token）</h2>'
         '<div class="adminbar">'
@@ -2401,11 +2408,14 @@ def _admin_html() -> str:
         '<button id="btn-kill-off" type="button">▶ 恢复开仓（kill OFF）</button>'
         '<button id="btn-flatten" type="button" class="danger">强制清仓 + 撤销全部挂单</button>'
         '<button id="btn-dd-reset" type="button">↺ 重置回撤峰值</button>'
+        '<button id="btn-mr-on" type="button">＋ 启用 MR 腿</button>'
+        '<button id="btn-mr-off" type="button">− 停用 MR 腿</button>'
         '</div>'
         '<div class="kv dim" id="admin-note" style="margin-top:8px">'
         '用带 <code>?k=ADMIN_TOKEN</code> 的面板链接打开一次，令牌会存进本浏览器并从地址栏抹掉，'
         '之后直接点按钮。kill 只停开新仓（离场与交易所侧止损照常）；'
-        '清仓市价成交、不可撤销，需二次确认。</div>'
+        '清仓市价成交、不可撤销，需二次确认。'
+        'MR 开关只挡新入场，停用后已持仓仍按信号离场。</div>'
         '<div id="admin-msg" class="warnlist" style="display:none"></div>'
         '</section>'
     )
