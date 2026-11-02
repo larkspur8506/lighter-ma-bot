@@ -1496,6 +1496,9 @@ class Executor:
         #: 记账用的权益（`apply_entry` 的 `equity_at_entry`），每轮刷新。
         self._equity: Optional[float] = None
         self._mr_contribution: float = 0.0
+        #: 本轮 crypto 腿用的 `RiskState`（含 DD / 日亏口径）。MR 腿的基金级闸门复用
+        #: 同一份状态，避免两条腿各算一套权益/阈值（2026-11-02 第五轮）。
+        self.last_risk_state: Optional[Any] = None
 
     def __repr__(self) -> str:
         return (f"Executor(symbols={self.symbols}, failures={self._failures}, "
@@ -1624,6 +1627,7 @@ class Executor:
         self.assembler.ensure_day_start(now_ts=now_s)
         snapshot = self.assembler.snapshot(now_ts=now_s)
         risk_state = self._risk_state_for_sizing(snapshot)
+        self.last_risk_state = risk_state      # MR 腿的基金级闸门复用同一份状态
 
         if self._circuit_open and BLOCK_CIRCUIT_OPEN not in blocks:
             blocks.append(BLOCK_CIRCUIT_OPEN)
@@ -1722,14 +1726,23 @@ class Executor:
             risk_state=risk_state)
 
     def _mr_contribution_of(self, account: "ExchangeAccount") -> float:
-        """MR 腿（mkt129）在本账户的占用 = 逐仓保证金 + uPnL（账户权益已含）。"""
+        """MR 腿（mkt129）在本账户占走的风险预算 = **价格敞口（数量 × 标记价）**。
+
+        2026-11-02 第五轮：原来是「逐仓保证金 + uPnL」，即按保证金扣。1x 时它恰好等于
+        名义，5x 时只扣 1/5 —— 扣多少取决于杠杆设置而不是风险大小（HL 侧就是这样，
+        MR 持仓期间 crypto 腿被放大 1.8 倍）。改用名义后两所一致。
+        """
         total = 0.0
         for pos in (account.positions or []):
             if getattr(pos, "market_id", None) != _MR_MARKET_ID:
                 continue
+            value = getattr(pos, "position_value", None)
+            if value is not None:
+                total += abs(float(value))
+                continue
             total += float(getattr(pos, "allocated_margin", None) or 0.0)
             total += float(getattr(pos, "unrealized_pnl", None) or 0.0)
-        return total
+        return max(total, 0.0)
 
     @property
     def _crypto_equity(self) -> Optional[float]:

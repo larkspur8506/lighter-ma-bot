@@ -211,5 +211,55 @@ class TestNextBusinessDay(unittest.TestCase):
         self.assertEqual(mr_signal.next_business_day("2026-04-07"), "2026-04-08")
 
 
+class TestMarketCalendar(unittest.TestCase):
+    """2026-11-02 第五轮：交易日历（规则假日）与「假日次日仍可入场」。"""
+
+    def test_rule_holidays(self):
+        self.assertTrue(mr_signal.is_market_holiday("2026-11-26"))   # 感恩节
+        self.assertTrue(mr_signal.is_market_holiday("2026-07-03"))   # 独立日周六 → 周五
+        self.assertTrue(mr_signal.is_market_holiday("2026-04-03"))   # Good Friday
+        self.assertTrue(mr_signal.is_market_holiday("2026-01-19"))   # MLK
+        self.assertTrue(mr_signal.is_market_holiday("2027-06-18"))   # 六月节周六 → 周五
+        self.assertFalse(mr_signal.is_market_holiday("2026-11-02"))
+        self.assertFalse(mr_signal.is_market_holiday("2026-11-27"))  # 半日市不是休市
+
+    def test_next_business_day_skips_holidays(self):
+        self.assertEqual(mr_signal.next_business_day("2026-11-25"), "2026-11-27")
+        self.assertEqual(mr_signal.next_business_day("2026-11-06"), "2026-11-09")
+        self.assertEqual(mr_signal.next_business_day("2026-12-24"), "2026-12-28")
+
+    def test_entry_survives_holiday_after_signal(self):
+        """周五信号 + 周一休市（劳工节）→ 周二开盘仍要入场（旧版整天丢弃）。"""
+        rows = []
+        for date, c in [("2026-08-31", 100.0), ("2026-09-01", 100.4),
+                        ("2026-09-02", 100.8), ("2026-09-03", 101.2),
+                        ("2026-09-04", 97.0)]:
+            rows.extend(_hourly(date, c))          # EDT：14:00–19:00 UTC
+        sessions = mr_signal.aggregate_sessions(rows)
+        self.assertEqual(sessions[-1].date, "2026-09-04")
+        self.assertTrue(mr_signal.session_signals(sessions)[-1]["entry"])
+        self.assertTrue(mr_signal.is_market_holiday("2026-09-07"))     # 劳工节
+        # 假日当天（09-07 10:00 ET）不该入场
+        self.assertIsNone(mr_signal.entry_decision(
+            sessions=sessions, flat=True, now_ms=_ms("2026-09-07T14:00:00Z")))
+        # 周二 09-08 10:00 ET —— 该入场
+        d = mr_signal.entry_decision(sessions=sessions, flat=True,
+                                     now_ms=_ms("2026-09-08T14:00:00Z"))
+        self.assertIsNotNone(d)
+        self.assertEqual(d["signal_date"], "2026-09-04")
+        self.assertEqual(d["entry_session_date"], "2026-09-08")
+
+    def test_dropped_sessions_are_reported(self):
+        """缺末根/根数不足的会话要能被调用方看见（不是静默消失）。"""
+        rows = _hourly("2026-04-14", 94.0, hours=(14, 15, 16, 17))     # 4 根
+        rows += _hourly("2026-04-15", 93.0, hours=(14, 15, 16, 17, 18))  # 5 根但末根 14:00 ET
+        rows += _hourly("2026-04-16", 93.5)
+        sessions, dropped = mr_signal.aggregate_sessions_ex(rows)
+        self.assertEqual([s.date for s in sessions], ["2026-04-16"])
+        reasons = {d["date"]: d["reason"] for d in dropped}
+        self.assertEqual(reasons["2026-04-14"], "too_few_bars")
+        self.assertEqual(reasons["2026-04-15"], "missing_close_bar")
+
+
 if __name__ == "__main__":
     unittest.main()

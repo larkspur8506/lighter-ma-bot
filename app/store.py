@@ -2076,6 +2076,32 @@ class StateStore:
                  None if raw is None else json.dumps(dict(raw), sort_keys=True, default=str),
                  now(), int(trade_id)))
 
+    def mr_trade_append_partial(self, trade_id: int, *, qty: float, price: float,
+                                ts: float) -> None:
+        """把一次「部分平仓」片段追加进台账 `raw.partial_exits`。
+
+        2026-11-02 第五轮：Lighter 离场 IOC 部分成交时，下一轮只按**剩余**数量决算，
+        前面平掉那一截的盈亏会从 `net_pnl` 里消失。这里按参考价先记下来，
+        最终关账时加回（见 `app.mr._partial_exits`）。
+        """
+        with self.write_transaction() as conn:
+            row = conn.execute("SELECT raw FROM mr_trades WHERE id=?",
+                               (int(trade_id),)).fetchone()
+            raw: dict = {}
+            if row is not None and row["raw"]:
+                try:
+                    parsed = json.loads(row["raw"])
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    raw = dict(parsed)
+            parts = list(raw.get("partial_exits") or [])
+            parts.append({"qty": float(qty), "price": float(price), "ts": float(ts)})
+            raw["partial_exits"] = parts
+            conn.execute(
+                "UPDATE mr_trades SET raw=?, updated_at=? WHERE id=?",
+                (json.dumps(raw, sort_keys=True, default=str), now(), int(trade_id)))
+
     def mr_trade_update_raw(self, trade_id: int, raw: Mapping[str, Any]) -> None:
         with self.write_transaction() as conn:
             conn.execute(

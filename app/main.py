@@ -1960,7 +1960,12 @@ def default_tick_runner(*, limits: RiskLimits, cache: PanelCache,
                             market_client=market,
                             alert=notify.notifier_from_env())
                 box["mr_leg"] = leg
-            cache.set_mr(await leg.on_tick(account=account))
+            cache.set_mr(await leg.on_tick(
+                account=account,
+                # 基金级闸门（回撤熔断 / 日亏 / kill）复用 crypto 腿这一轮的同一份
+                # RiskState 与阈值 —— 两条腿各算一套是「熔断只挡一条腿」的根源。
+                risk_state=getattr(executor, "last_risk_state", None),
+                limits=_limits()))
         except Exception as exc:                              # noqa: BLE001 - MR 不拖死主腿
             logger.warning("mr leg tick failed: %s: %s", type(exc).__name__, exc)
             cache.set_mr({"enabled": None, "state": "error", "recon": "unknown",
