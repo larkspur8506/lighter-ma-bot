@@ -52,24 +52,49 @@ class FakeReader:
     def __init__(self, account: ExchangeAccount):
         self.account = account
         self.calls = 0
+        self.pending: list = []          # 逐次覆盖（模拟「晚几拍才看到持仓」）
 
     async def read(self) -> ExchangeAccount:
         self.calls += 1
+        if self.pending:
+            self.account = self.pending.pop(0)
         return self.account
 
 
 class FakeExchange:
+    """假交易所：**默认成交**（下单后改 reader 的账户），可切换成「受理但零成交」。"""
+
     def __init__(self):
         self.orders = []
         self.isolated = []
+        self.reader: FakeReader | None = None
+        self.fill = True                 # False = 受理但交易所没有持仓（IOC 零成交）
+        self.fill_qty = None             # None = 按订单数量成交；给数 = 部分成交
+        self.fill_price = None           # None = 用 ref_price
+
+    def _positions_after(self, kw) -> tuple:
+        if not kw["is_entry"]:
+            return ()
+        qty = self.fill_qty if self.fill_qty is not None else kw["qty_int"] / 10000
+        px = self.fill_price if self.fill_price is not None else kw["ref_price"]
+        return (ExchangePosition(
+            symbol="QQQ", side=1, qty=Decimal(str(qty)), market_id=129,
+            avg_entry_price=float(px), unrealized_pnl=3.0, position_value=250.0,
+            allocated_margin=250.0, funding_paid=0.25),)
 
     async def ensure_isolated(self, *, market_id: int, leverage: float):
         self.isolated.append((market_id, leverage))
 
     async def place_market(self, **kwargs):
         self.orders.append(kwargs)
+        if self.fill and self.reader is not None:
+            acct = self.reader.account
+            self.reader.account = ExchangeAccount(
+                equity=acct.equity, positions=self._positions_after(kwargs),
+                orders=(), orders_error="", as_of=0.0, transaction_time=0.0)
         return SimpleNamespace(order_id=f"OID-{len(self.orders)}", accepted=True,
                                ok=True, kind="ok")
+
 
 
 class FakeMarket:
@@ -95,8 +120,11 @@ def _leg(tmpdir: str, *, equity=500.0, mr_qty="0", market_now=EXIT_NOW_MS):
     exchange = FakeExchange()
     market = FakeMarket()
     market.now_ms = market_now
-    leg = MrLeg(store=store, exchange=exchange, reader=FakeReader(_account(equity, mr_qty=mr_qty)),
-                market_client=market, config=MrConfig(),
+    reader = FakeReader(_account(equity, mr_qty=mr_qty))
+    exchange.reader = reader
+    leg = MrLeg(store=store, exchange=exchange, reader=reader,
+                market_client=market,
+                config=MrConfig(fill_confirm_s=0.0),   # 测试不做真实轮询
                 clock=lambda: EXIT_NOW_MS / 1000.0)
     return leg, store, exchange
 
@@ -133,7 +161,9 @@ class TestMrEntry(unittest.TestCase):
             self.assertIsNotNone(row)
             self.assertEqual(row["signal_date"], "2026-04-15")
             self.assertEqual(row["entry_session"], "2026-04-16")
-            self.assertAlmostEqual(row["notional"], 250.0, places=6)
+            # 数量 floor 到 4 位 ⇒ 名义略小于计划值；台账记的是交易所口径
+            self.assertAlmostEqual(row["notional"], 250.0, delta=0.02)
+            self.assertAlmostEqual(row["qty"], 2.6881, places=4)
 
     def test_second_tick_same_signal_does_not_reorder(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -325,6 +355,7 @@ class TestMrReviewP3(unittest.TestCase):
             leg.reader = FakeReader(ExchangeAccount(
                 equity=500.0, positions=(rich,), orders=(), orders_error="",
                 as_of=0.0, transaction_time=0.0))
+            exchange.reader = leg.reader              # 假交易所要用同一份读数改仓位
             status = _run(leg.on_tick(now_ms=EXIT_NOW_MS))
             self.assertEqual(status["state"], "exited")
             self.assertFalse(leg._mr_enabled())            # 自动停用已生效
@@ -356,6 +387,92 @@ class TestMrReviewP3(unittest.TestCase):
             self.assertTrue(leg._mr_enabled())
 
 
+class TestMrFillConfirmation(unittest.TestCase):
+    """2026-11-02 复核 P1：「受理 ≠ 成交」——成交只认交易所持仓。
+
+    Lighter 的 `ok=True` 只代表 code=200 进了 sequencer；拿它当成交会写出
+    假 OPEN（零成交）或假 CLOSED（离场零成交 ⇒ 台账说空仓、交易所还有裸多仓）。
+    """
+
+    def test_entry_accepted_but_no_fill_writes_no_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, market_now=ENTRY_NOW_MS)
+            _enable(store)
+            exchange.fill = False                       # 受理成功，但交易所没有仓
+            status = _run(leg.on_tick(now_ms=ENTRY_NOW_MS))
+            self.assertEqual(status["state"], "entry_not_filled")
+            self.assertIsNone(store.mr_open_trade())    # 不写假台账
+            # 下一轮（仍在窗口内）会重试，用新的 coi
+            again = _run(leg.on_tick(now_ms=ENTRY_NOW_MS + 30 * 60_000))
+            self.assertEqual(again["state"], "entry_not_filled")
+            self.assertEqual(len(exchange.orders), 2)
+            self.assertNotEqual(exchange.orders[0]["client_order_index"],
+                                exchange.orders[1]["client_order_index"])
+
+    def test_entry_partial_fill_records_exchange_qty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, market_now=ENTRY_NOW_MS)
+            _enable(store)
+            exchange.fill_qty = 1.5                     # 计划 2.6881，实际 1.5
+            exchange.fill_price = 93.4                  # 交易所成交价（非参考价）
+            _run(leg.on_tick(now_ms=ENTRY_NOW_MS))
+            row = store.mr_open_trade()
+            self.assertAlmostEqual(row["qty"], 1.5, places=6)
+            self.assertAlmostEqual(row["entry_price"], 93.4, places=6)
+            self.assertAlmostEqual(row["notional"], 1.5 * 93.4, places=6)
+            self.assertIsNotNone(
+                store.events(kind="mr_entry_partial_fill", limit=1))
+
+    def test_entry_waits_for_position_to_appear(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, market_now=ENTRY_NOW_MS)
+            _enable(store)
+            leg.config = MrConfig(fill_confirm_s=0.05, fill_poll_s=0.01)
+            exchange.fill = False                     # 不自动成交，靠 reader 逐次给真相
+            # 第 1 次读（tick 开头）空仓；第 2 次读（确认轮询）才看到仓
+            leg.reader.pending = [_account(500.0), _account(500.0, mr_qty="2.6881")]
+            status = _run(leg.on_tick(now_ms=ENTRY_NOW_MS))
+            self.assertEqual(status["state"], "entered")
+            self.assertIsNotNone(store.mr_open_trade())
+            self.assertGreaterEqual(leg.reader.calls, 2)  # 真的多读了一次
+
+    def test_exit_accepted_but_position_remains_keeps_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, mr_qty="2.6737")
+            _enable(store)
+            store.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.6737,
+                qty_int=26737, entry_price=ENTRY_DAY_CLOSE, entry_order_id="x",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=250.0, margin=250.0,
+                equity_at_entry=500.0)
+            exchange.fill = False                       # 离场受理但 IOC 零成交
+            status = _run(leg.on_tick(now_ms=EXIT_NOW_MS))
+            self.assertEqual(status["state"], "exit_not_filled")
+            self.assertIsNotNone(store.mr_open_trade())  # 仍是 OPEN（不许写假 CLOSED）
+            self.assertEqual(store.mr_open_trade()["state"], "OPEN")
+
+    def test_alert_is_throttled_on_repeated_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, mr_qty="2.6737")
+            _enable(store)
+            store.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.6737,
+                qty_int=26737, entry_price=ENTRY_DAY_CLOSE, entry_order_id="x",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=250.0, margin=250.0,
+                equity_at_entry=500.0)
+
+            async def reject(**kwargs):
+                exchange.orders.append(kwargs)
+                return SimpleNamespace(order_id="", accepted=False, ok=False,
+                                       error="boom", kind="rejected")
+            exchange.place_market = reject
+            _run(leg.on_tick(now_ms=EXIT_NOW_MS))
+            first = len(store.events(kind="mr_admin_alert", limit=50))
+            _run(leg.on_tick(now_ms=EXIT_NOW_MS + 300_000))
+            second = len(store.events(kind="mr_admin_alert", limit=50))
+            self.assertEqual(first, second)             # 30 分钟内不重复告警
+
+
 class TestExecutorGuard(unittest.TestCase):
     """executor 的 sizing 基数剔除 MR 占用；_MR_MARKET_ID 与 MrConfig 钉死一致。"""
 
@@ -378,6 +495,35 @@ class TestExecutorGuard(unittest.TestCase):
         acct = _account(500.0, mr_qty="2.6737")       # margin 250 + uPnL 3
         self.assertAlmostEqual(ex._mr_contribution_of(acct), 253.0)
         self.assertAlmostEqual(ex._mr_contribution_of(_account()), 0.0)
+
+    def test_risk_state_equity_matches_sizing_equity(self):
+        """MR 持仓时风控权益必须与定仓基数同源（否则每次开仓都撞 equity_mismatch）。"""
+        from types import SimpleNamespace
+        from app import executor as ex_mod
+        from app import strategy
+        from app.lifecycle import decide
+        from app.risk import RiskState
+
+        ex = ex_mod.Executor.__new__(ex_mod.Executor)
+        ex._equity = 497.04
+        ex._mr_contribution = 251.0
+        snap = SimpleNamespace(to_risk_state=lambda: RiskState(
+            equity=497.04, day_start_equity=497.04, trades_today=0,
+            open_positions=(), open_notional_total=0.0,
+            open_notional_by_symbol={}, dd_index=1.0, dd_peak_index=1.0))
+        state = ex._risk_state_for_sizing(snap)
+        self.assertAlmostEqual(state.equity, 246.04, places=6)
+        self.assertAlmostEqual(state.day_start_equity, 497.04, places=6)  # 守护口径不动
+
+        bars = [strategy.Bar(open_ms=i * 4 * 3600_000, open=100.0, high=101.0,
+                             low=99.0, close=100.0) for i in range(3)]
+        sig = strategy.Signal(symbol="BTC", bar_index=2, bar_open_ms=bars[2].open_ms,
+                              entry_price=100.0, stop_price=98.0, stop_dist=0.02,
+                              ma_max=101.0, ma_min=99.0, band=0.02, side=1)
+        decision = decide("BTC", bars, i=2, signal=sig, equity=ex._crypto_equity,
+                          market_info=None, risk_state=state)
+        self.assertNotIn("equity_mismatch",
+                         [r.code for r in decision.rejections])
 
 
 if __name__ == "__main__":

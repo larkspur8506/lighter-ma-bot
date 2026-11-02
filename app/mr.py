@@ -9,9 +9,11 @@
 - **纯市价零挂单**：入场/离场都是 MARKET+IOC，`reduce_only` 只在离场为 1。
   绝不调用任何账户级撤单（`cancel_all_orders()` 会误伤 crypto 腿的止损单；
   `cancel_all(market_id)` 只在 mr market 上是安全的，但 MR 根本不挂单，用不到）。
-- **幂等**：入场 coi 以信号会话日期为键（`client_order_index(symbol, signal_ms,
-  "mr_entry")`）；台账 `signal_date` 唯一约束。崩溃重启后同信号重试同键 ——
-  交易所拒重、台账拒重，双重保险。
+- **幂等**：台账 `mr_trades.signal_date` 唯一约束 + 「只在空仓时入场」是真正的护栏；
+  coi 按「当前 tick 分钟」派生（同一轮重放同键，跨轮重试换键——交易所会拒已消耗的 coi）。
+- **成交只认交易所持仓**：`ok=True` 只代表 code=200 进了 sequencer（见 `OrderResult`
+  docstring）。入场必须看到 mkt129 持仓出现才写 OPEN（数量/价格取交易所口径），
+  离场必须看到持仓消失才写 CLOSED；确认窗口内没发生 → 不记账、下轮重试。
 - **对账 fail-closed**：本地台账与交易所 mkt129 持仓不一致（任一方向）→
   不做任何动作 + 事件告警，等人工。**不自动吃掉未知仓位**。
 - **kill 语义**：全局 `/admin/kill` 与 MR 专属 `/admin/mr` 都只挡**新入场**，
@@ -21,6 +23,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -43,6 +46,9 @@ MR_EVENT_KIND = "mr_admin"
 _KILL_EVENT_KIND = "admin_kill"
 #: 对账不一致告警的最小间隔（秒）——同一问题不刷屏。
 _RECON_ALERT_INTERVAL_S = 6 * 3600.0
+#: 重复拒单/未成交告警的最小间隔（秒）。
+_ORDER_ALERT_INTERVAL_S = 30 * 60.0
+
 
 
 @dataclass(frozen=True)
@@ -60,6 +66,11 @@ class MrConfig:
     entry_slippage_bps: int = 15        # 最差价带宽（IOC 保护）
     exit_slippage_bps: int = 15
     candle_count: int = 500             # 1h×500 ≈ 21 天会话
+    #: 成交确认：下单后轮询交易所持仓，确认「仓真的出现/真的消失」才记账。
+    #: Lighter 的 `ok=True` 只代表 code=200 进了 sequencer（见 OrderResult docstring），
+    #: 拿它当成交会写出假 OPEN/假 CLOSED —— crypto 腿已用同一套确认（PR #40）。
+    fill_confirm_s: float = 12.0
+    fill_poll_s: float = 1.0
     #: funding 基线（%名义/小时）。实测 2026-01-22~11-01 中位 0.0004%/h（3.5%/年）。
     funding_baseline_pct_per_h: float = 0.0004
 
@@ -78,6 +89,8 @@ class MrLeg:
     alert: Optional[Callable[[str], Awaitable[None]]] = None
     _recon_bad_since: Optional[float] = None
     _recon_alerted_at: float = 0.0
+    #: 订单类告警的去重时间戳（key → 上次发送时刻）；入场窗口内每轮重试不刷屏。
+    _order_alerted_at: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # `_to_int` 硬编码 ×10000；size_decimals 若被改，台账 qty_int 与下单数量错位
@@ -124,6 +137,38 @@ class MrLeg:
                 await self.alert(message)
             except Exception as exc:                          # noqa: BLE001
                 logger.warning("mr: alert delivery failed: %s", exc)
+
+    async def _alert_throttled(self, key: str, message: str,
+                               interval_s: float = _ORDER_ALERT_INTERVAL_S) -> None:
+        """同一类订单问题在 `interval_s` 内只发一次（入场窗口每轮重试不刷屏）。"""
+        now_s = self.clock()
+        last = float(self._order_alerted_at.get(key, 0.0) or 0.0)
+        if last and now_s - last < interval_s:
+            logger.warning("mr: %s（同类告警已去重）", message)
+            return
+        self._order_alerted_at[key] = now_s
+        await self._alert_once(message)
+
+    async def _await_position(self, *, want: bool,
+                              confirm_s: Optional[float] = None):
+        """轮询交易所持仓，直到「出现」（want=True）或「消失」（want=False）。
+
+        返回最后一次读到的 mkt129 持仓（None = 没有仓）。`ok=True` 只代表受理，
+        **成交只认交易所持仓** —— 超时就按当前真相返回，由调用方决定记不记账。
+        """
+        cfg = self.config
+        budget = float(cfg.fill_confirm_s if confirm_s is None else confirm_s)
+        poll = max(float(cfg.fill_poll_s), 0.0)
+        attempts = 1 if poll <= 0 or budget <= 0 else int(budget / poll) + 1
+        pos = None
+        for i in range(max(attempts, 1)):
+            account = await self.reader.read()
+            pos = self._exchange_mr_position(account)
+            if (pos is not None) is bool(want):
+                return pos
+            if i + 1 < attempts:
+                await asyncio.sleep(poll)
+        return pos
 
     # ------------------------------------------------------------------ 主流程
 
@@ -263,9 +308,16 @@ class MrLeg:
             self.store.mr_mark_skipped(signal_date, "notional > equity（保证金不足保护）")
             return
 
-        coi = client_order_index(cfg.symbol, _signal_ms(signal_date), "mr_entry")
-        await self.exchange.ensure_isolated(market_id=cfg.market_id,
-                                            leverage=cfg.leverage)
+        coi = _attempt_coi(cfg.symbol, "mr_entry", now_ms)
+        try:
+            await self.exchange.ensure_isolated(market_id=cfg.market_id,
+                                                leverage=cfg.leverage)
+        except Exception as exc:                              # noqa: BLE001 - 前置失败不下单
+            status.update(state="margin_mode_failed",
+                          error=f"{type(exc).__name__}: {exc}")
+            await self._alert_throttled(
+                "entry_margin", f"MR 入场前置失败（保证金模式）：{type(exc).__name__}: {exc}")
+            return
         result = await self.exchange.place_market(
             symbol=cfg.symbol, market_id=cfg.market_id, qty_int=_to_int(qty),
             price_decimals=cfg.price_decimals, ref_price=last_close, is_entry=True,
@@ -275,19 +327,43 @@ class MrLeg:
             status.update(state="order_rejected",
                           error=str(getattr(result, "error", "")
                                     or getattr(result, "kind", "") or "unknown"))
-            await self._alert_once(
+            await self._alert_throttled(
+                "entry_rejected",
                 f"MR 入场单被拒（不下台账，下轮重试）：{status['error'][:200]}")
             return
+        # 「受理」不等于「成交」：必须看到交易所真的有 mkt129 持仓才记账（PR #40 同一课）
+        filled = await self._await_position(want=True)
+        if filled is None:
+            status.update(state="entry_not_filled",
+                          error="受理但确认窗口内没有持仓（IOC 零成交）")
+            await self._alert_throttled(
+                "entry_not_filled",
+                "MR 入场单已受理但交易所没有出现持仓（IOC 零成交）——不写台账，下轮重试")
+            return
+        filled_qty = float(getattr(filled, "qty", 0) or 0)
+        if filled_qty <= 0:
+            status.update(state="entry_not_filled", error="交易所持仓数量为 0")
+            return
+        fill_px = getattr(filled, "avg_entry_price", None)
+        entry_price = float(fill_px) if fill_px and float(fill_px) > 0 else float(last_close)
+        actual_notional = filled_qty * entry_price
         trade_id = self.store.mr_record_entry(
             signal_date=signal_date, entry_session=decision["entry_session_date"],
-            qty=qty, qty_int=_to_int(qty), entry_price=last_close,
+            qty=filled_qty, qty_int=_to_int(filled_qty), entry_price=entry_price,
             entry_order_id=str(getattr(result, "order_id", "") or ""),
-            entry_ts=now_ms / 1000.0, notional=notional, margin=notional,
-            equity_at_entry=equity, raw={"ref_price": last_close,
-                                         "result": _result_brief(result)})
+            entry_ts=now_ms / 1000.0, notional=actual_notional,
+            margin=actual_notional, equity_at_entry=equity,
+            raw={"ref_price": last_close, "planned_qty": qty,
+                 "filled_qty": filled_qty, "fill_source": "exchange_position",
+                 "result": _result_brief(result)})
+        if abs(filled_qty - qty) > 1e-9:
+            self.store.log_event("mr_entry_partial_fill",
+                                 f"MR 入场部分成交：计划 {qty} / 实际 {filled_qty}",
+                                 data={"signal_date": signal_date, "planned": qty,
+                                       "filled": filled_qty})
         status.update(state="entered", last_fill_at=now_ms / 1000.0)
         await self._alert_once(
-            f"MR 入场：QQQ {qty} @≈{last_close:.2f}（名义 {notional:.2f}，"
+            f"MR 入场：QQQ {filled_qty} @≈{entry_price:.2f}（名义 {actual_notional:.2f}，"
             f"信号 {signal_date}），台账 #{trade_id}")
 
     def _mark_expired_signal(self, *, sessions, now_ms: int) -> None:
@@ -323,13 +399,16 @@ class MrLeg:
         }
         if exit_date is None:
             return
+        if pos is None:
+            # 台账有 OPEN 但交易所还没看到仓（刚下单的宽限窗口）——没有仓可平
+            status["state"] = "holding"
+            return
         last_close = float(rows[-1]["c"])
-        # 数量优先取交易所实际持仓（部分成交时台账 qty 会偏大 → 超量平仓被拒）；
-        # 持仓行缺失（刚下单未对上）才退回台账数量
-        pos_qty = getattr(pos, "qty", None) if pos is not None else None
+        # 数量优先取交易所实际持仓（部分成交时台账 qty 会偏大 → 超量平仓被拒）
+        pos_qty = getattr(pos, "qty", None)
         exit_qty_int = (int(round(float(pos_qty) * 10000)) if pos_qty is not None
                         else int(open_row["qty_int"]))
-        coi = client_order_index(cfg.symbol, _signal_ms(str(exit_date)), "mr_exit")
+        coi = _attempt_coi(cfg.symbol, "mr_exit", now_ms)
         result = await self.exchange.place_market(
             symbol=cfg.symbol, market_id=cfg.market_id,
             qty_int=exit_qty_int,
@@ -341,14 +420,25 @@ class MrLeg:
             status.update(state="order_rejected",
                           error=str(getattr(result, "error", "")
                                     or getattr(result, "kind", "") or "unknown"))
-            await self._alert_once(f"MR 离场被拒（下轮重试）：{status['error'][:200]}")
+            await self._alert_throttled(
+                "exit_rejected", f"MR 离场被拒（下轮重试）：{status['error'][:200]}")
+            return
+        # 受理 ≠ 成交：必须看到交易所的仓真的没了才关账 —— 否则「台账 CLOSED + 裸多仓」
+        left = await self._await_position(want=False)
+        if left is not None:
+            status.update(state="exit_not_filled",
+                          error=f"确认窗口内仍有持仓 {getattr(left, 'qty', '?')}")
+            await self._alert_throttled(
+                "exit_not_filled",
+                "MR 离场单已受理但交易所仍有持仓（IOC 零成交/部分成交）——台账保持 OPEN，"
+                "下轮重试")
             return
         funding_paid = getattr(pos, "funding_paid", None)
         notional = float(open_row.get("notional") or 0.0)
         funding_pct = (float(funding_paid) / notional * 100.0
                        if funding_paid is not None and notional > 0 else None)
         entry_price = float(open_row.get("entry_price") or 0.0)
-        qty = float(open_row.get("qty") or 0.0)
+        qty = float(pos_qty) if pos_qty is not None else float(open_row.get("qty") or 0.0)
         net_pnl = ((last_close - entry_price) * qty
                    - (float(funding_paid) if funding_paid is not None else 0.0))
         self.store.mr_close_trade(
@@ -394,10 +484,15 @@ def _event_payload(row: Mapping[str, Any]) -> dict:
     return {}
 
 
-def _signal_ms(signal_date: str) -> int:
-    """会话日期 → 确定性毫秒键（UTC 零点）。coi 只需要稳定，不要求语义。"""
-    dt = datetime.strptime(signal_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
+def _attempt_coi(symbol: str, purpose: str, now_ms: int) -> int:
+    """按「当前 tick 分钟」派生 coi：同一轮重放同键（交易所侧去重），跨轮重试自然换键。
+
+    为什么不再用 signal_date 当键：交易所对**已消耗**的 coi 会拒单，而 MR 的重试
+    （零成交/拒单/部分成交）必然跨 tick —— 固定键会让重试永远被 duplicate 拒掉。
+    真正的幂等保护是台账 `mr_trades.signal_date` 唯一约束 + 「只在空仓时入场」。
+    """
+    return client_order_index(symbol, max(int(now_ms) // 60_000, 1), purpose)
+
 
 
 def _to_int(qty: float) -> int:

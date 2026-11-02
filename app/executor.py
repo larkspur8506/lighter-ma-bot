@@ -1623,7 +1623,7 @@ class Executor:
             self.assembler.price_provider = lambda sym: self._prices.get(str(sym).upper())
         self.assembler.ensure_day_start(now_ts=now_s)
         snapshot = self.assembler.snapshot(now_ts=now_s)
-        risk_state = snapshot.to_risk_state()
+        risk_state = self._risk_state_for_sizing(snapshot)
 
         if self._circuit_open and BLOCK_CIRCUIT_OPEN not in blocks:
             blocks.append(BLOCK_CIRCUIT_OPEN)
@@ -1738,6 +1738,20 @@ class Executor:
         if eq is None:
             return None
         return eq - self._mr_contribution
+
+    def _risk_state_for_sizing(self, snapshot: Any) -> Any:
+        """把风控看到的权益对齐到 crypto 腿的定仓基数。
+
+        `decide_entry` ⑤ 用 1e-9 容差比对 `equity`（定仓）与 `risk_state.equity`（风控），
+        而 `AccountSnapshot.equity` 是**账户总权益**、定仓基数是「总权益 − MR 占用」——
+        不对齐的话，MR 一持仓 crypto 腿的每次开仓都会撞 `equity_mismatch` 被静默拒掉
+        （2026-11-02 复核复现）。回撤/日亏守护读的是 snapshot 自己的权益，不受影响。
+        """
+        state = snapshot.to_risk_state()
+        eq = self._crypto_equity
+        if eq is None or getattr(state, "equity", None) is None:
+            return state
+        return replace(state, equity=float(eq))
 
     @staticmethod
     def _apply_entry_guard(decision: Decision, *, blocks: Sequence[str] = ()
