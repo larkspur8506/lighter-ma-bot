@@ -53,9 +53,12 @@ class FakeReader:
         self.account = account
         self.calls = 0
         self.pending: list = []          # 逐次覆盖（模拟「晚几拍才看到持仓」）
+        self.fail_calls: set = set()     # 第 N 次读抛错（模拟 503/429 抖动）
 
     async def read(self) -> ExchangeAccount:
         self.calls += 1
+        if self.calls in self.fail_calls:
+            raise RuntimeError("503 simulated maintenance page")
         if self.pending:
             self.account = self.pending.pop(0)
         return self.account
@@ -471,6 +474,103 @@ class TestMrFillConfirmation(unittest.TestCase):
             _run(leg.on_tick(now_ms=EXIT_NOW_MS + 300_000))
             second = len(store.events(kind="mr_admin_alert", limit=50))
             self.assertEqual(first, second)             # 30 分钟内不重复告警
+
+
+class TestMrConfirmationResilience(unittest.TestCase):
+    """2026-11-02 第四轮复核：确认窗口容错 + 丢失成交的认领。
+
+    旧实现里确认轮询不捕读错误：一次 503 就把 tick 打崩，已成交的仓没有台账 →
+    下一轮 recon_err 冻结（MR 无止损，入场方向就是裸多）。
+    """
+
+    def test_confirmation_survives_read_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, market_now=ENTRY_NOW_MS)
+            _enable(store)
+            leg.config = MrConfig(fill_confirm_s=0.05, fill_poll_s=0.01)
+            exchange.fill = False                     # 不自动成交，靠 reader 逐次给真相
+            leg.reader.pending = [_account(500.0),
+                                  _account(500.0, mr_qty="2.6881")]
+            leg.reader.fail_calls = {2}               # 确认轮询第一次读就撞 503
+            status = _run(leg.on_tick(now_ms=ENTRY_NOW_MS))
+            self.assertEqual(status["state"], "entered")
+            self.assertIsNotNone(store.mr_open_trade())
+
+    def test_entry_adopted_after_confirmation_lost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, market_now=ENTRY_NOW_MS)
+            _enable(store)
+            exchange.fill = False                     # 受理成功，但确认窗口内看不到仓
+            status = _run(leg.on_tick(now_ms=ENTRY_NOW_MS))
+            self.assertEqual(status["state"], "entry_not_filled")
+            self.assertIsNone(store.mr_open_trade())
+            # 下一轮：交易所其实有仓（成交回报/确认读失败）→ 凭意图认领，不再 recon_err
+            leg.reader.account = _account(500.0, mr_qty="2.6881")
+            again = _run(leg.on_tick(now_ms=ENTRY_NOW_MS + 300_000))
+            self.assertEqual(again.get("adopted"), "entry")
+            self.assertEqual(again["state"], "holding")   # 补记后本轮即按持仓评估离场
+            row = store.mr_open_trade()
+            self.assertIsNotNone(row)
+            self.assertAlmostEqual(row["qty"], 2.6881, places=6)
+            self.assertTrue(store.events(kind="mr_entry_adopted", limit=1))
+
+    def test_exit_adopted_after_confirmation_lost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, mr_qty="2.6737")
+            _enable(store)
+            store.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.6737,
+                qty_int=26737, entry_price=ENTRY_DAY_CLOSE, entry_order_id="x",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=250.0, margin=250.0,
+                equity_at_entry=500.0)
+            exchange.fill = False                     # 卖单受理，但确认窗口内仍读到仓
+            status = _run(leg.on_tick(now_ms=EXIT_NOW_MS))
+            self.assertEqual(status["state"], "exit_not_filled")
+            self.assertEqual(store.mr_open_trade()["state"], "OPEN")
+            # 下一轮：交易所已空仓（平仓成交了，只是确认丢了）→ 凭离场意图补记 CLOSED
+            leg.reader.account = _account(500.0)
+            again = _run(leg.on_tick(now_ms=EXIT_NOW_MS + 300_000))
+            self.assertEqual(again.get("adopted"), "exit")
+            self.assertIsNone(store.mr_open_trade())
+            row = store.mr_recent_trades(1)[0]
+            self.assertEqual(row["state"], "CLOSED")
+            self.assertEqual(row["exit_reason"], "sma5_adopted")
+            self.assertTrue(store.events(kind="mr_exit_adopted", limit=1))
+
+    def test_blind_confirmation_never_closes_position(self):
+        """确认窗口整轮读不到真相 ≠ 仓位已消失：绝不许写出假 CLOSED。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, mr_qty="2.6737")
+            _enable(store)
+            store.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.6737,
+                qty_int=26737, entry_price=ENTRY_DAY_CLOSE, entry_order_id="x",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=250.0, margin=250.0,
+                equity_at_entry=500.0)
+            leg.reader.fail_calls = set(range(2, 40))   # 第 1 次（tick 开头）读到仓，之后全失败
+            status = _run(leg.on_tick(now_ms=EXIT_NOW_MS))
+            self.assertEqual(status["state"], "exit_not_filled")
+            self.assertEqual(store.mr_open_trade()["state"], "OPEN")
+
+    def test_adoption_requires_matching_intent(self):
+        """没有下单意图的未知仓仍然 fail-closed（不自动吃掉）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, mr_qty="1.0")
+            _enable(store)
+            status = _run(leg.on_tick(now_ms=ENTRY_NOW_MS))
+            self.assertEqual(status["state"], "recon_err")
+            self.assertIsNone(store.mr_open_trade())
+
+    def test_same_day_missed_window_marks_skipped(self):
+        after_window = int(datetime.fromisoformat(
+            "2026-04-16T20:00:00+00:00").timestamp() * 1000)
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, store, exchange = _leg(tmp, market_now=after_window)
+            _enable(store)
+            _run(leg.on_tick(now_ms=after_window))
+            row = store.mr_trade_by_signal("2026-04-15")
+            self.assertIsNotNone(row)
+            self.assertEqual(row["state"], "SKIPPED")
 
 
 class TestExecutorGuard(unittest.TestCase):

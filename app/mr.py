@@ -14,6 +14,9 @@
 - **成交只认交易所持仓**：`ok=True` 只代表 code=200 进了 sequencer（见 `OrderResult`
   docstring）。入场必须看到 mkt129 持仓出现才写 OPEN（数量/价格取交易所口径），
   离场必须看到持仓消失才写 CLOSED；确认窗口内没发生 → 不记账、下轮重试。
+  下单前先写一条 `mr_entry_intent` / `mr_exit_intent` 事件：确认因读错误或进程重启
+  丢失时，下一轮凭这条意图把交易所真实持仓补记进台账（只认同一 signal_date），
+  避免「有仓无台账 → recon_err 冻结、要人工改库」。
 - **对账 fail-closed**：本地台账与交易所 mkt129 持仓不一致（任一方向）→
   不做任何动作 + 事件告警，等人工。**不自动吃掉未知仓位**。
 - **kill 语义**：全局 `/admin/kill` 与 MR 专属 `/admin/mr` 都只挡**新入场**，
@@ -28,7 +31,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Mapping, Optional
 from zoneinfo import ZoneInfo
 
@@ -48,6 +51,9 @@ _KILL_EVENT_KIND = "admin_kill"
 _RECON_ALERT_INTERVAL_S = 6 * 3600.0
 #: 重复拒单/未成交告警的最小间隔（秒）。
 _ORDER_ALERT_INTERVAL_S = 30 * 60.0
+#: 下单意图事件（成交确认丢失时的认领凭据）：写在下单**之前**，每轮重试各一条。
+_ENTRY_INTENT_KIND = "mr_entry_intent"
+_EXIT_INTENT_KIND = "mr_exit_intent"
 
 
 
@@ -73,6 +79,16 @@ class MrConfig:
     fill_poll_s: float = 1.0
     #: funding 基线（%名义/小时）。实测 2026-01-22~11-01 中位 0.0004%/h（3.5%/年）。
     funding_baseline_pct_per_h: float = 0.0004
+    #: 自动停用门槛：实际 funding 超过基线的这个倍数，**且**已付金额超过
+    #: `funding_disable_min_pct`（%名义）。2026-11-02 第四轮复核：旧值 2 倍落在正常
+    #: 分布中间 —— 用实测费率复算 9 个月 12 笔回合有 7 笔触发（持仓时段均值
+    #: 10.19%/年 vs 全史中位 3.5%/年）；10 倍 + 0.10% 绝对门槛在样本内 0/12 触发，
+    #: 只拦真正的费率尖峰（年化 ≥35%）。
+    funding_disable_multiple: float = 10.0
+    funding_disable_min_pct: float = 0.10
+    #: 下单意图的认领窗口（秒）：成交确认因读错误/进程重启而丢失时，下一轮可凭
+    #: 这条意图把交易所真实持仓补记进台账，避免「有仓无台账 → recon_err 冻结」。
+    adopt_window_s: float = 6 * 3600.0
 
 
 @dataclass
@@ -153,22 +169,34 @@ class MrLeg:
                               confirm_s: Optional[float] = None):
         """轮询交易所持仓，直到「出现」（want=True）或「消失」（want=False）。
 
-        返回最后一次读到的 mkt129 持仓（None = 没有仓）。`ok=True` 只代表受理，
+        返回最后一次读到的 mkt129 持仓（None = 没有仓/没读到）。`ok=True` 只代表受理，
         **成交只认交易所持仓** —— 超时就按当前真相返回，由调用方决定记不记账。
+
+        单次读失败（503/429/网络抖动）**不中断轮询**：确认窗口只有 12s，一次抖动就
+        把整轮打崩会让「已成交但没有台账」变成对账冻结（MR 没有止损，裸仓更贵）。
+        返回 ``(pos, read_ok)``：`read_ok=False` 表示整轮都没读到真相 —— 离场方
+        必须按「未知」处理（绝不当成「仓已消失」写出假 CLOSED）。
         """
         cfg = self.config
         budget = float(cfg.fill_confirm_s if confirm_s is None else confirm_s)
         poll = max(float(cfg.fill_poll_s), 0.0)
         attempts = 1 if poll <= 0 or budget <= 0 else int(budget / poll) + 1
         pos = None
+        read_ok = False
         for i in range(max(attempts, 1)):
-            account = await self.reader.read()
-            pos = self._exchange_mr_position(account)
-            if (pos is not None) is bool(want):
-                return pos
+            try:
+                account = await self.reader.read()
+            except Exception as exc:                              # noqa: BLE001
+                logger.warning("mr: 成交确认读账户失败（继续轮询）：%s: %s",
+                               type(exc).__name__, exc)
+            else:
+                read_ok = True
+                pos = self._exchange_mr_position(account)
+                if (pos is not None) is bool(want):
+                    return pos, True
             if i + 1 < attempts:
                 await asyncio.sleep(poll)
-        return pos
+        return pos, read_ok
 
     # ------------------------------------------------------------------ 主流程
 
@@ -201,6 +229,16 @@ class MrLeg:
             account = await self.reader.read()
         pos = self._exchange_mr_position(account)
 
+        # ---- 认领：确认窗口丢失的成交（读错误 / 进程重启）-------------------------
+        # 有意图、无台账才认领；没有意图的未知仓仍然 fail-closed（不自动吃掉）。
+        if open_row is None and pos is not None:
+            if await self._adopt_entry(pos, now, status):
+                open_row = self.store.mr_open_trade()
+        if (open_row is not None and pos is None
+                and not self._entry_is_fresh(open_row, now)):
+            if await self._adopt_exit(open_row, now, status):
+                open_row = None
+
         # ---- 对账（双向）：本地 OPEN ↔ 交易所持仓 --------------------------------
         holding = False
         recon_ok = True
@@ -222,6 +260,8 @@ class MrLeg:
         if status.get("recon") == "err":
             status["state"] = "recon_err"
             return status
+        if status.get("adopted") == "exit":
+            return status            # 本轮刚补记完离场，不再评估新入场
 
         # 停用且空仓：连 K 线都不拉（省一次 API/tick）；有仓或启用才继续
         if not enabled and not holding:
@@ -259,6 +299,97 @@ class MrLeg:
         if not ts:
             return False
         return (now_ms / 1000.0 - float(ts)) < 2 * 3600.0
+
+    # ------------------------------------------------------------------ 认领
+
+    def _recent_intent(self, kind: str, now_s: float):
+        """最近一条「下单意图」事件 → (ts, payload)；超出认领窗口返回 None。"""
+        for row in self.store.events(kind=kind, limit=5):
+            ts = float(row.get("ts") or 0.0)
+            if ts <= 0 or abs(now_s - ts) > float(self.config.adopt_window_s):
+                continue
+            payload = _event_payload(row)
+            if payload.get("signal_date"):
+                return ts, payload
+        return None
+
+    async def _adopt_entry(self, pos: Any, now_ms: int, status: dict) -> bool:
+        """有意图、无台账、交易所有仓 → 按交易所口径补记 OPEN（不再要求人工改库）。"""
+        found = self._recent_intent(_ENTRY_INTENT_KIND, now_ms / 1000.0)
+        if found is None:
+            return False
+        ts, payload = found
+        signal_date = str(payload.get("signal_date") or "")
+        if not signal_date or self.store.mr_trade_by_signal(signal_date) is not None:
+            return False
+        qty = float(getattr(pos, "qty", 0) or 0)
+        fill_px = getattr(pos, "avg_entry_price", None)
+        entry_price = float(fill_px) if fill_px and float(fill_px) > 0 else float(payload.get("ref_price") or 0)
+        if qty <= 0 or entry_price <= 0:
+            return False
+        notional = qty * entry_price
+        trade_id = self.store.mr_record_entry(
+            signal_date=signal_date,
+            entry_session=str(payload.get("entry_session") or signal_date),
+            qty=qty, qty_int=_to_int(qty), entry_price=entry_price,
+            entry_order_id="", entry_ts=ts, notional=notional, margin=notional,
+            equity_at_entry=payload.get("equity"),
+            raw={"adopted": True, "adopt_reason": "fill_confirmation_lost",
+                 "intent_ts": ts, "fill_source": "exchange_position"})
+        status["state"] = "entered"
+        status["adopted"] = "entry"
+        self.store.log_event(
+            "mr_entry_adopted",
+            f"MR 入场成交确认丢失，按交易所持仓补记台账 #{trade_id}："
+            f"QQQ {qty} @≈{entry_price:.2f}（信号 {signal_date}）",
+            data={"signal_date": signal_date, "qty": qty, "entry_price": entry_price})
+        await self._alert_once(
+            f"MR 入场确认丢失，已按交易所持仓补记台账 #{trade_id}："
+            f"QQQ {qty} @≈{entry_price:.2f}（信号 {signal_date}）")
+        return True
+
+    async def _adopt_exit(self, open_row: Mapping[str, Any], now_ms: int,
+                          status: dict) -> bool:
+        """有离场意图、台账 OPEN、交易所已无仓 → 按最近 1h 收盘补记 CLOSED。
+
+        只认同一 signal_date 的离场意图（防止把外部平仓/手工干预吃成策略离场）。
+        """
+        found = self._recent_intent(_EXIT_INTENT_KIND, now_ms / 1000.0)
+        if found is None:
+            return False
+        ts, payload = found
+        if str(payload.get("signal_date")) != str(open_row.get("signal_date")):
+            return False
+        try:
+            rows = self.market_client.candles_1h(self.config.market_id, count_back=5)
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning("mr: 认领离场时取价失败（下轮再试）：%s", exc)
+            return False
+        if not rows:
+            return False
+        px = float(rows[-1]["c"])
+        qty = float(open_row.get("qty") or 0)
+        entry_price = float(open_row.get("entry_price") or 0)
+        if px <= 0 or qty <= 0:
+            return False
+        net_pnl = (px - entry_price) * qty
+        self.store.mr_close_trade(
+            int(open_row["id"]), exit_price=px, exit_order_id="",
+            exit_ts=now_ms / 1000.0, exit_reason="sma5_adopted",
+            exit_signal_date=(str(payload.get("exit_signal_date") or "") or None),
+            funding_pct=None, net_pnl=net_pnl,
+            raw={"adopted": True, "price_source": "last_1h_close", "intent_ts": ts})
+        status["state"] = "exited"
+        status["adopted"] = "exit"
+        self.store.log_event(
+            "mr_exit_adopted",
+            f"MR 离场成交确认丢失，交易所已空仓 → 按最近收盘 {px:.2f} 补记 CLOSED"
+            f"（信号 {open_row.get('signal_date')}）",
+            data={"signal_date": open_row.get("signal_date"), "exit_price": px})
+        await self._alert_once(
+            f"MR 离场确认丢失，交易所已空仓 → 按最近收盘 {px:.2f} 补记 CLOSED"
+            f"（台账 #{open_row.get('id')}，净 {net_pnl:+.2f} USDC，价格为估算）")
+        return True
 
     async def _recon_fail(self, message: str, status: dict) -> None:
         status["recon"] = "err"
@@ -318,6 +449,13 @@ class MrLeg:
             await self._alert_throttled(
                 "entry_margin", f"MR 入场前置失败（保证金模式）：{type(exc).__name__}: {exc}")
             return
+        self.store.log_event(
+            _ENTRY_INTENT_KIND,
+            f"MR 入场下单意图：QQQ {qty} @≈{last_close:.2f}（信号 {signal_date}）",
+            data={"signal_date": signal_date,
+                  "entry_session": decision["entry_session_date"],
+                  "planned_qty": qty, "ref_price": last_close,
+                  "equity": equity, "coi": coi}, ts=now_ms / 1000.0)
         result = await self.exchange.place_market(
             symbol=cfg.symbol, market_id=cfg.market_id, qty_int=_to_int(qty),
             price_decimals=cfg.price_decimals, ref_price=last_close, is_entry=True,
@@ -332,7 +470,7 @@ class MrLeg:
                 f"MR 入场单被拒（不下台账，下轮重试）：{status['error'][:200]}")
             return
         # 「受理」不等于「成交」：必须看到交易所真的有 mkt129 持仓才记账（PR #40 同一课）
-        filled = await self._await_position(want=True)
+        filled, _seen = await self._await_position(want=True)
         if filled is None:
             status.update(state="entry_not_filled",
                           error="受理但确认窗口内没有持仓（IOC 零成交）")
@@ -367,17 +505,29 @@ class MrLeg:
             f"信号 {signal_date}），台账 #{trade_id}")
 
     def _mark_expired_signal(self, *, sessions, now_ms: int) -> None:
-        """信号日已整体错过（入场日已是过去时）却没有台账 → 记 SKIPPED，可审计。"""
+        """信号日已整体错过（含「当天窗口已过」）却没有台账 → 记 SKIPPED，可审计。
+
+        旧实现要求 `entry_day < today`，所以当天 12:30 之后才恢复运行的信号
+        （entry_day == today 但 deadline 已过）永远不会有审计行。现在按
+        **入场截止时刻**判定，并回看最近 5 个会话（覆盖多日停机）。
+        """
         sigs = mr_signal.session_signals(sessions)
         k = mr_signal.completed_upto(sessions, now_ms)
-        if k <= 0 or not sigs[k - 1]["entry"]:
-            return
-        s = sessions[k - 1]
-        entry_day = mr_signal.next_business_day(s.date)
-        today = (datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
-                 .astimezone(ZoneInfo(mr_signal.SESSION_TZ)).strftime("%Y-%m-%d"))
-        if entry_day < today and self.store.mr_trade_by_signal(s.date) is None:
-            self.store.mr_mark_skipped(s.date, "窗口错过（停机/延迟）")
+        tz = ZoneInfo(mr_signal.SESSION_TZ)
+        for i in range(max(k - 5, 0), k):
+            if not sigs[i]["entry"]:
+                continue
+            s = sessions[i]
+            entry_day = mr_signal.next_business_day(s.date)
+            open_ms = int(datetime.strptime(entry_day, "%Y-%m-%d")
+                          .replace(hour=9, minute=30, tzinfo=tz).timestamp() * 1000)
+            deadline_ms = open_ms + int(mr_signal.ENTRY_WINDOW_H * 3600_000)
+            if now_ms <= deadline_ms:
+                continue
+            if now_ms - deadline_ms > 14 * 86400_000:      # 太老的信号不追溯
+                continue
+            if self.store.mr_trade_by_signal(s.date) is None:
+                self.store.mr_mark_skipped(s.date, "窗口错过（停机/延迟）")
 
     # ------------------------------------------------------------------ 离场
 
@@ -409,6 +559,12 @@ class MrLeg:
         exit_qty_int = (int(round(float(pos_qty) * 10000)) if pos_qty is not None
                         else int(open_row["qty_int"]))
         coi = _attempt_coi(cfg.symbol, "mr_exit", now_ms)
+        self.store.log_event(
+            _EXIT_INTENT_KIND,
+            f"MR 离场下单意图：QQQ {exit_qty_int}（信号日 {open_row.get('signal_date')}）",
+            data={"signal_date": open_row.get("signal_date"),
+                  "exit_signal_date": exit_date, "qty_int": exit_qty_int,
+                  "ref_price": last_close, "coi": coi}, ts=now_ms / 1000.0)
         result = await self.exchange.place_market(
             symbol=cfg.symbol, market_id=cfg.market_id,
             qty_int=exit_qty_int,
@@ -424,14 +580,14 @@ class MrLeg:
                 "exit_rejected", f"MR 离场被拒（下轮重试）：{status['error'][:200]}")
             return
         # 受理 ≠ 成交：必须看到交易所的仓真的没了才关账 —— 否则「台账 CLOSED + 裸多仓」
-        left = await self._await_position(want=False)
-        if left is not None:
+        left, left_seen = await self._await_position(want=False)
+        if left is not None or not left_seen:
             status.update(state="exit_not_filled",
                           error=f"确认窗口内仍有持仓 {getattr(left, 'qty', '?')}")
             await self._alert_throttled(
                 "exit_not_filled",
-                "MR 离场单已受理但交易所仍有持仓（IOC 零成交/部分成交）——台账保持 OPEN，"
-                "下轮重试")
+                "MR 离场单已受理但交易所仍有持仓或读不到持仓（IOC 零成交/部分成交/"
+                "确认读失败）——台账保持 OPEN，下轮重试")
             return
         funding_paid = getattr(pos, "funding_paid", None)
         notional = float(open_row.get("notional") or 0.0)
@@ -447,14 +603,18 @@ class MrLeg:
             exit_ts=now_ms / 1000.0, exit_reason="sma5", exit_signal_date=exit_date,
             funding_pct=funding_pct, net_pnl=net_pnl,
             raw={"ref_price": last_close, "result": _result_brief(result)})
-        # 即时止损触发器：实际付出 funding 超基线（0.0004%/h，2026-01-22~11-01 实测
-        # 中位）2 倍且绝对值 >0.01% → 自动停用 MR 腿（写 mr_admin 事件，只挡新入场）
+        # 即时止损触发器：实际付出 funding 超基线 10 倍且绝对额 >0.10% 名义 → 自动停用
+        # （2026-11-02 第四轮复核：旧值 2 倍会在多数正常交易后自停 —— 实测 12 笔回合
+        # 有 7 笔触发；10 倍 + 绝对门槛在样本内 0/12 触发，只拦真正的费率尖峰）
         if funding_pct is not None and funding_pct > 0:
             hours = max(now_ms / 1000.0 - float(open_row.get("entry_ts") or 0.0),
                         0.0) / 3600.0
             expected = cfg.funding_baseline_pct_per_h * hours
-            if expected > 0 and funding_pct > 2.0 * expected and funding_pct > 0.01:
-                reason = (f"funding {funding_pct:.3f}% 超基线 2 倍"
+            if (expected > 0
+                    and funding_pct > cfg.funding_disable_multiple * expected
+                    and funding_pct > cfg.funding_disable_min_pct):
+                reason = (f"funding {funding_pct:.3f}% 超基线 "
+                          f"{cfg.funding_disable_multiple:g} 倍"
                           f"（预期 {expected:.3f}%，持仓 {hours:.1f}h）")
                 self.store.log_event(MR_EVENT_KIND, f"MR 腿自动停用：{reason}",
                                      data={"enabled": False, "by": "auto",
