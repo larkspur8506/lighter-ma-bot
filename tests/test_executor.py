@@ -1059,8 +1059,8 @@ class FailureHandlingTests(Base):
                 roots.update(alias.name.split(".")[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 roots.add(node.module.split(".")[0])
-        allowed = {"__future__", "asyncio", "json", "logging", "math", "time", "urllib",
-                   "dataclasses", "decimal", "typing", "app", "tests"}
+        allowed = {"__future__", "asyncio", "datetime", "json", "logging", "math", "time",
+                   "urllib", "dataclasses", "decimal", "typing", "app", "tests"}
         self.assertEqual(roots - allowed, set(), f"unexpected imports: {sorted(roots - allowed)}")
 
 

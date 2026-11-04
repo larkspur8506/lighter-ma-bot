@@ -2104,7 +2104,7 @@ class Executor:
                         self._settled_close_alert(
                             symbol=symbol, kind=kind,
                             price=exit_price_int / (10.0 ** price_decimals),
-                            pnl=self._closed_pnl(pid, kind="stop")))
+                            pnl=self._closed_pnl(pid, kind="stop"), row=row))
             return SymbolOutcome(
                 symbol=symbol, action=ACTION_STOP, bar_ms=bar_ms,
                 reason="stop fill confirmed by the exchange read — settled",
@@ -2245,7 +2245,8 @@ class Executor:
         return _opt_float(rows[0].get("fee")) if rows else None
 
     def _settled_close_alert(self, *, symbol: str, kind: str, price: float,
-                             pnl: Optional[float]) -> str:
+                             pnl: Optional[float],
+                             row: Optional[Mapping[str, Any]] = None) -> str:
         """**离线结案**（交易所在先成交、本地事后认账）的告警文案 —— 措辞按 `kind`。
 
         为什么不能一律写「止损成交」（2026-10-30 审查 M2）：grace 结案的 kind 既有
@@ -2253,23 +2254,15 @@ class Executor:
         会把「信号平仓」说成「止损打掉」—— 而这两件事在手机上要做的判断恰好相反
         （前者该怀疑信号、后者该查单/查保证金）。措辞与事件 kind 保持一一对应。
         """
-        side = 1
-        entry_px = fees = risk_u = opened_at = None
-        try:
-            rows = self.store.open_positions() or []
-        except Exception:                                          # noqa: BLE001 - 纯展示
-            rows = []
-        for r in rows:                                             # 仓可能已 CLOSED，退化为 None
-            if str(r.get("symbol") or "").upper() == str(symbol).upper():
-                side = int(r.get("side") or 1)
-                entry_px = _opt_float(r.get("entry_price"))
-                risk_u = r.get("risk_amount")
-                opened_at = _opt_float(r.get("opened_at"))
-                break
+        row = row or {}
+        side = int(row.get("side") or 1)
         return fmt_exit_alert(
-            coin=str(symbol), side=side, entry_px=entry_px, exit_px=price,
-            reason=str(kind), net_pnl=pnl, fees=fees,
-            r_multiple=_r_multiple(pnl, risk_u), opened_at=opened_at,
+            coin=str(symbol), side=side,
+            entry_px=_opt_float(row.get("entry_price")), exit_px=price,
+            reason=str(kind), net_pnl=pnl,
+            fees=_opt_float(row.get("fee")),
+            r_multiple=_r_multiple(pnl, row.get("risk_amount")),
+            opened_at=_opt_float(row.get("opened_at")),
             when=dt.datetime.now(DISPLAY_TZ), settled=True)
 
     def _stop_fill_evidence(self, row: Mapping[str, Any], account: ExchangeAccount) -> bool:
@@ -2804,7 +2797,7 @@ class Executor:
                 self._alert("stop_fill_settled",
                             self._settled_close_alert(
                                 symbol=str(issue.symbol), kind=kind,
-                                price=settle_price, pnl=float(fill["pnl"])))
+                                price=settle_price, pnl=float(fill["pnl"]), row=row))
                 continue
             opened_at = float(row.get("opened_at") or 0.0)
             provable = trades is not None and _trades_cover(trades, opened_at)

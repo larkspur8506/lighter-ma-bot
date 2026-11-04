@@ -172,8 +172,10 @@ def fmt_exit_alert(*, coin: str, side: int, entry_px: Optional[float], exit_px: 
         "",
         _row("离场原因", why),
         _row("平仓价", f"{_fmt_u(exit_px, 3)}（开仓 {_fmt_u(entry_px, 3)}）"),
-        _row("本次盈亏", f"{_fmt_signed(net)} U（{_fmt_signed(r_multiple)}R）"
-                        if r_multiple is not None else "—"),
+        _row("本次盈亏",
+             ("—" if net is None else
+              f"{_fmt_signed(net)} U"
+              + (f"（{_fmt_signed(r_multiple)}R）" if r_multiple is not None else ""))),
         _row("盈亏构成", f"价差 {_fmt_signed(gross)} U · 手续费 {_fmt_u(fees)} U"
                         if gross is not None else "—"),
     ]

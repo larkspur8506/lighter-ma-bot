@@ -381,13 +381,14 @@ class ExecutorNotifyTests(ExecutorCase):
         texts = self._texts("entry")
         self.assertEqual(len(texts), 1, self.sent)
         text = texts[0]
-        self.assertIn("【Lighter】", text)
+        self.assertIn("【Lighter】✅ 已开仓", text)
         self.assertIn("开仓", text)
         self.assertIn(BTC, text)
-        self.assertIn("多", text)                    # 信号是做多
-        self.assertIn("止损", text)
-        self.assertIn("风险", text)
-        self.assertTrue(text.endswith("U"), text)
+        self.assertIn("做多", text)                  # 信号是做多
+        # 与 HL 同一模板：字段顺序固定，两列排版
+        for label in ("成交价", "数量", "止损价", "保证金", "强平价", "风险", "时间"):
+            self.assertIn(label, text)
+        self.assertIn("U（权益的", text)
 
     def test_failed_entry_paths_do_not_emit_a_success_alert(self):
         """止损单挂失败 → 只允许 `stop_order_failed`（那是裸仓，比「开仓成功」更要紧）。"""
@@ -416,13 +417,14 @@ class ExecutorNotifyTests(ExecutorCase):
         texts = self._texts("stop")
         self.assertEqual(len(texts), 1, self.sent)
         text = texts[0]
-        self.assertIn("【Lighter】", text)
-        self.assertIn("离场", text)
+        self.assertIn("【Lighter】🛑 止损离场", text)
         self.assertIn(BTC, text)
-        self.assertIn("105", text)                   # 止损价 105.0（交易所口径整数还原）
-        # pnl 是**数值**不是「有 pnl 字样」：(105.0 − 112.0) × 4.156 = −29.092 → −29.09U
+        self.assertIn("止损单被触发", text)             # 离场原因
+        self.assertIn("105.000", text)                # 平仓价（交易所口径整数还原）
+        self.assertIn("112.000", text)                # 开仓价
+        # pnl 是**数值**不是「有 pnl 字样」：(105.0 − 112.0) × 4.156 = −29.092 → −29.09
         #   qty 415600 @ 5 位 = 4.156；entry_price_int 1120 / 10 = 112.0
-        self.assertIn("pnl -29.09U", text)
+        self.assertIn("-29.09 U", text)
 
     def test_offline_stop_fill_settlement_pushes_one_alert(self):
         """`_settle_grace_issues` 的 settled 分支：真实成交在交易所发生，本地事后认账。"""
@@ -441,10 +443,10 @@ class ExecutorNotifyTests(ExecutorCase):
         texts = self._texts("stop_fill_settled")
         self.assertEqual(len(texts), 1, self.sent)
         text = texts[0]
-        self.assertIn("【Lighter】", text)
-        self.assertIn("止损成交（离线结案）", text)
+        self.assertIn("【Lighter】🛑 止损离场", text)
+        self.assertIn("（离线结案）", text)
         self.assertIn(BTC, text)
-        self.assertIn("-12.50U", text)               # pnl 来自成交回报，不是本地价差
+        self.assertIn("-12.50 U", text)              # pnl 来自成交回报，不是本地价差
 
     def test_stop_fill_evidence_settlement_pushes_one_alert(self):
         """止损成交**自证**分支（审查 B1）：交易所有证据 + 查不到成交回报时也要推送。
@@ -468,21 +470,24 @@ class ExecutorNotifyTests(ExecutorCase):
         texts = self._texts("stop_fill_settled")
         self.assertEqual(len(texts), 1, self.sent)
         text = texts[0]
-        self.assertIn("止损成交（离线结案）", text)
+        self.assertIn("（离线结案）", text)
+        self.assertIn("🛑 止损离场", text)
         self.assertIn(BTC, text)
-        self.assertIn("105", text)                   # 仓位冻结的止损价
+        self.assertIn("105.000", text)               # 仓位冻结的止损价
         # 本地价差口径（无成交回报时只能这样）：(105.0 − 112.0) × 4.156 = −29.09U
-        self.assertIn("pnl -29.09U", text)
+        self.assertIn("-29.09 U", text)
 
     def test_offline_settlement_wording_follows_kind(self):
         """审查 M2：kind='exit' 不许写成「止损成交」（那是两种完全不同的处置）。"""
         ex = self.make_executor()
         stop_text = ex._settled_close_alert(symbol=BTC, kind="stop", price=105.0, pnl=-1.0)
-        self.assertIn("止损成交（离线结案）", stop_text)
+        self.assertIn("🛑 止损离场", stop_text)
+        self.assertIn("（离线结案）", stop_text)
         exit_text = ex._settled_close_alert(symbol=BTC, kind="exit", price=105.0, pnl=-1.0)
-        self.assertIn("平仓成交（离线结案）", exit_text)
-        self.assertNotIn("止损成交", exit_text)
-        self.assertIn("pnl -1.00U", exit_text)
+        self.assertIn("（离线结案）", exit_text)
+        self.assertNotIn("止损", exit_text)          # kind=exit 不许写成止损
+        self.assertIn("策略离场", exit_text)          # 亏损 → 策略离场
+        self.assertIn("-1.00 U", exit_text)
 
     def test_a_broken_alert_callback_never_breaks_the_trade(self):
         """fail-open：推送回调抛异常时，开仓照样记账（DB 里必须有仓位）。"""
