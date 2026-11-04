@@ -72,6 +72,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import logging
 import math
@@ -85,6 +86,7 @@ from typing import (Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Opt
                     Sequence, Tuple)
 
 from app import strategy, symbol_registry
+from app.alerts import DISPLAY_TZ, fmt_entry_alert, fmt_exit_alert
 from app.exchange import OrderResult, _site_root, client_order_index
 
 #: MR 腿（feat/mr-leg）的 market_id。与 app/mr.py 的 MrConfig.market_id 同源；
@@ -409,6 +411,17 @@ def positions_from_payload(payload: Mapping[str, Any], *,
             allocated_margin=_opt_float(row.get("allocated_margin")),
             raw=dict(row)))
     return tuple(out)
+
+
+def _r_multiple(pnl: Optional[float], risk_u: Any) -> Optional[float]:
+    """R 倍数 = 净盈亏 / 该仓冻结的单笔风险；风险缺失或为 0 时返回 None（不猜）。"""
+    try:
+        risk = float(risk_u)
+    except (TypeError, ValueError):
+        return None
+    if risk <= 0 or pnl is None:
+        return None
+    return float(pnl) / risk
 
 
 def _opt_float(value: Any) -> Optional[float]:
@@ -1458,6 +1471,8 @@ class Executor:
         self.enforce_in_dry_run = bool(enforce_in_dry_run)
         #: 止损守护（补挂/换单）。默认开；`LIGHTER_STOP_GUARD=0` 关。
         self.stop_guard = bool(stop_guard)
+        #: 成交确认时读到的交易所仓位（只为告警取强平价；不参与任何判定）
+        self._entry_fill_positions: Dict[str, Any] = {}
         #: 逐仓保证金：开仓前把市场切到 isolated + 目标杠杆（幂等），成交后划入抵押
         #: （≈名义/杠杆，交易所会归一；平仓时交易所自动释放，无需 REMOVE）。
         #: 默认开（账户 2026-10-29 起已切逐仓）；`LIGHTER_ISOLATED_MARGIN=0` 关。
@@ -2034,12 +2049,20 @@ class Executor:
             ref_int = (entry_ref if entry_ref is not None
                        else to_int_price(float(plan.entry_price), int(plan.price_decimals)))
             ref_price = ref_int / (10.0 ** int(plan.price_decimals))
-            side_text = "多" if int(plan.side) == 1 else "空"
+            fill_pos = self._entry_fill_positions.pop(str(symbol).upper(), None)
             self._alert(
                 "entry",
-                f"【Lighter】开仓 {symbol} {side_text} {plan.base_qty:g} @ {ref_price:g}"
-                f" ｜ 止损 {plan.stop_price:g} ｜ 风险 {float(plan.risk_amount):.2f}U"
-                + ("（dry-run）" if self.dry_run else ""))
+                fmt_entry_alert(
+                    coin=symbol, side=int(plan.side), qty=float(plan.base_qty),
+                    entry_px=ref_price, stop_px=float(plan.stop_price),
+                    notional=float(plan.notional), margin=float(plan.margin),
+                    liq=(getattr(fill_pos, "liquidation_price", None) if fill_pos else None),
+                    risk_u=float(plan.risk_amount),
+                    equity=float(plan.equity or self._equity or 0.0) or None,
+                    signal_px=float(plan.entry_price),
+                    oid=f"coi:{entry_coi}", stop_oid=(f"coi:{stop_coi}" if stop_ok else None),
+                    when=dt.datetime.now(DISPLAY_TZ), leverage=float(plan.leverage or 0) or None,
+                    isolated=bool(self.margin_isolated), dry_run=bool(self.dry_run)))
         if not stop_ok:
             self._failures += 1
             self._maybe_open_circuit()
@@ -2181,11 +2204,16 @@ class Executor:
         # 优先、本地价差兜底」算好了，这里**不复刻**那套公式）。
         exit_price = exit_price_int / (10.0 ** price_decimals)
         pnl = self._closed_pnl(pid, kind=kind)
-        pnl_text = "—" if pnl is None else f"{pnl:+.2f}U"
         self._alert(
             kind,
-            f"【Lighter】离场 {symbol} {kind} @ {exit_price:g} ｜ pnl {pnl_text}"
-            + ("（dry-run）" if self.dry_run else ""))
+            fmt_exit_alert(
+                coin=symbol, side=int(row.get("side") or (1 if plan.is_long else -1)),
+                entry_px=_opt_float(row.get("entry_price")), exit_px=exit_price,
+                reason=str(kind), net_pnl=pnl,
+                fees=self._closed_fee(pid, kind=kind),
+                r_multiple=_r_multiple(pnl, row.get("risk_amount")),
+                opened_at=_opt_float(row.get("opened_at")),
+                when=dt.datetime.now(DISPLAY_TZ), dry_run=bool(self.dry_run)))
         return SymbolOutcome(symbol=symbol, action=decision.action, bar_ms=bar_ms,
                              reason=f"{kind} filled", decision=decision.as_dict(),
                              order=order.as_dict(), filled=True,
@@ -2207,6 +2235,15 @@ class Executor:
             return None
         return _opt_float(rows[0].get("realized_pnl")) if rows else None
 
+    def _closed_fee(self, position_id: int, *, kind: str) -> Optional[float]:
+        """平仓腿手续费（`trades.fee`）。读不到 → None（告警里显 `—`，不当 0）。"""
+        try:
+            rows = self.store.trades(limit=1, position_id=int(position_id), kind=str(kind))
+        except Exception as exc:                                  # noqa: BLE001 - 纯展示
+            logger.warning("could not read the closed fee for the alert: %s", exc)
+            return None
+        return _opt_float(rows[0].get("fee")) if rows else None
+
     def _settled_close_alert(self, *, symbol: str, kind: str, price: float,
                              pnl: Optional[float]) -> str:
         """**离线结案**（交易所在先成交、本地事后认账）的告警文案 —— 措辞按 `kind`。
@@ -2216,10 +2253,24 @@ class Executor:
         会把「信号平仓」说成「止损打掉」—— 而这两件事在手机上要做的判断恰好相反
         （前者该怀疑信号、后者该查单/查保证金）。措辞与事件 kind 保持一一对应。
         """
-        label = "止损成交" if str(kind) == "stop" else "平仓成交"
-        pnl_text = "—" if pnl is None else f"{pnl:+.2f}U"
-        return (f"【Lighter】{label}（离线结案）{symbol} {kind} @ {price:g}"
-                f" ｜ pnl {pnl_text}")
+        side = 1
+        entry_px = fees = risk_u = opened_at = None
+        try:
+            rows = self.store.open_positions() or []
+        except Exception:                                          # noqa: BLE001 - 纯展示
+            rows = []
+        for r in rows:                                             # 仓可能已 CLOSED，退化为 None
+            if str(r.get("symbol") or "").upper() == str(symbol).upper():
+                side = int(r.get("side") or 1)
+                entry_px = _opt_float(r.get("entry_price"))
+                risk_u = r.get("risk_amount")
+                opened_at = _opt_float(r.get("opened_at"))
+                break
+        return fmt_exit_alert(
+            coin=str(symbol), side=side, entry_px=entry_px, exit_px=price,
+            reason=str(kind), net_pnl=pnl, fees=fees,
+            r_multiple=_r_multiple(pnl, risk_u), opened_at=opened_at,
+            when=dt.datetime.now(DISPLAY_TZ), settled=True)
 
     def _stop_fill_evidence(self, row: Mapping[str, Any], account: ExchangeAccount) -> bool:
         """止损成交的**正面证据**：该标的在交易所已无仓，且我们挂的止损单也不在了。
@@ -2370,6 +2421,8 @@ class Executor:
                         f"entry intent {int(side):+d} — refusing to book it")
                 got = _qty_int_from_decimal(pos.qty, size_decimals)
                 if got > 0:
+                    # 只给告警用（强平价）；不参与记账/风控判定。
+                    self._entry_fill_positions[str(symbol).upper()] = pos
                     # 部分成交会「长」：数量还在变就继续等，连续两次一致才算落定。
                     # 用最大观测值记账（宁可少买不可多买，但也不能记少了让止损盖不住）。
                     best = max(best, got)
