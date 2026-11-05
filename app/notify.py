@@ -38,6 +38,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -45,6 +46,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import weakref
 from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
@@ -52,9 +54,44 @@ __all__ = [
     "TELEGRAM_CHAT_ID_ENV", "TELEGRAM_MAX_CHARS", "WECHAT_MAX_BYTES", "WECHAT_WEBHOOK_ENV",
     "Notifier", "TelegramBot", "WeChatWebhook", "build_notifier",
     "notifier_from_env", "split_message", "split_message_bytes",
+    "wait_for_pending_notifications",
 ]
 
 logger = logging.getLogger(__name__)
+
+#: 在飞的发送线程（`__call__` 起的 daemon 线程）。**短命进程**（一次性脚本、`docker exec
+#: python -` 跑一轮 tick）退出时 daemon 线程会被直接杀掉：企微先发出去、Telegram 还没轮到，
+#: 于是「只有微信有、TG 没收到」且零日志（2026-11-05 补单实测踩到）。⇒ 登记 + atexit 等一等。
+_INFLIGHT: "weakref.WeakSet[threading.Thread]" = weakref.WeakSet()
+_INFLIGHT_LOCK = threading.Lock()
+
+#: atexit 时最多等这么久（正常进程退出不会走这条；卡住的 HTTP 不能拖住重启）。
+ATEXIT_JOIN_TIMEOUT_S = 8.0
+
+
+def wait_for_pending_notifications(timeout_s: float = ATEXIT_JOIN_TIMEOUT_S) -> int:
+    """等所有在飞的发送线程收尾；返回实际等待的线程数。
+
+    长驻进程（gateway/uvicorn）用不到它；短命进程在**退出前**必须调一次（`atexit` 已注册），
+    否则 `threading.Thread(daemon=True)` 会在解释器收尾时被无声杀掉 —— 表现为「只到了一个
+    渠道」，日志里什么都没有。
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    joined = 0
+    with _INFLIGHT_LOCK:
+        pending = list(_INFLIGHT)
+    for thread in pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.warning("notifier: %d 条发送未在 %.1fs 内完成（进程退出）",
+                           len(pending) - joined, float(timeout_s))
+            break
+        thread.join(remaining)
+        joined += 1
+    return joined
+
+
+atexit.register(wait_for_pending_notifications)
 
 #: 与 HL 侧完全同名（凭据只维护一份）。三个都**不是**必填项。
 WECHAT_WEBHOOK_ENV = "WECHAT_WEBHOOK_URL"
@@ -358,8 +395,11 @@ class Notifier:
         message = "" if text is None else str(text)
         if not message.strip() or not self.senders:
             return
-        threading.Thread(target=self.deliver, args=(message,),
-                         name=f"notify:{kind or 'alert'}", daemon=True).start()
+        thread = threading.Thread(target=self.deliver, args=(message,),
+                                  name=f"notify:{kind or 'alert'}", daemon=True)
+        with _INFLIGHT_LOCK:
+            _INFLIGHT.add(thread)          # 短命进程靠 atexit 的 join 兜住（见模块顶部）
+        thread.start()
 
     def deliver(self, message: str) -> None:
         """同步投递（测试/脚本直接调用）。单个渠道失败不影响其它渠道，且绝不抛出。

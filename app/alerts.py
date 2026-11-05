@@ -92,13 +92,39 @@ def _stamp(when: Optional[dt.datetime]) -> str:
     return f"{when.strftime('%m-%d %H:%M')} {TZ_LABEL}"
 
 
+def _drift_row(drift: Optional[float], signal_px: Optional[float],
+               signal_age_min: Optional[float]) -> str:
+    """「滑点 / 延迟」那一行：晚于信号收盘超过 `DELAY_LABEL_MIN` 分钟就不再叫滑点。"""
+    if drift is None:
+        return _row("滑点", "—")
+    base = f"{drift:+.2f}%（信号价 {_fmt_u(signal_px, 3)}"
+    try:
+        age = float(signal_age_min) if signal_age_min is not None else None
+    except (TypeError, ValueError):
+        age = None
+    if age is not None and age > DELAY_LABEL_MIN:
+        return _row("延迟", f"{base}，晚 {age:.0f} 分钟）")
+    return _row("滑点", f"{base}）")
+
+
+#: 超过这个分钟数就不叫「滑点」了 —— 那已经不是下单瞬间的成交质量，而是信号价到成交价的
+#: 延迟漂移（补单 / 被闸门挡住后补跑）。正常路径 tick 在 bar 收盘后 3 分钟就下单，取 10 分钟
+#: 既能覆盖正常抖动，又能把「晚了半小时才成交」的单明确区分出来。
+DELAY_LABEL_MIN = 10.0
+
+
 def fmt_entry_alert(*, coin: str, side: int, qty: float, entry_px: float,
                     stop_px: float, notional: Optional[float], margin: Optional[float],
                     liq: Optional[float], risk_u: Optional[float], equity: Optional[float],
                     signal_px: Optional[float], oid: Any = None, stop_oid: Any = None,
                     when: Optional[dt.datetime] = None, leverage: Optional[float] = None,
-                    isolated: bool = True, dry_run: bool = False) -> str:
-    """开仓回报（字段顺序与 HL 完全一致）。"""
+                    isolated: bool = True, dry_run: bool = False,
+                    signal_age_min: Optional[float] = None) -> str:
+    """开仓回报（字段顺序与 HL 完全一致）。
+
+    `signal_age_min` = 成交距信号 bar 收盘的分钟数。> `DELAY_LABEL_MIN` 时那一行的标签从
+    「滑点」改成「延迟」并标出晚了几分钟 —— 2026-11-05 补单晚了 31 分钟，成交价与信号价差
+    1.16%，继续写「滑点 +1.16%」等于把「信号过期」报成「下单滑点」。"""
     lev = f"{float(leverage):g}x" if leverage else "—"
     mode = " 逐仓" if isolated else ""
     stop_pct = None
@@ -132,7 +158,7 @@ def fmt_entry_alert(*, coin: str, side: int, qty: float, entry_px: float,
         _row("保证金", f"≈{_fmt_u(margin, 1)} U"),
         _row("强平价", _fmt_u(liq, 3)),
         _row("风险", f"{_fmt_u(risk_u)} U（权益的 {risk_pct:.1f}%）" if risk_pct is not None else f"{_fmt_u(risk_u)} U"),
-        _row("滑点", f"{drift:+.2f}%（信号价 {_fmt_u(signal_px, 3)}）" if drift is not None else "—"),
+        _drift_row(drift, signal_px, signal_age_min),
         _row("时间", _stamp(when)),
     ]
     if oid is not None or stop_oid is not None:
