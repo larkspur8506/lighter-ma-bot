@@ -234,6 +234,35 @@ class DailyLossTests(unittest.TestCase):
         self.assertIn(GATE_DAILY_LOSS, codes(decision(st=state(equity=9700.0), limits=limits)))
         self.assertTrue(decision(st=state(equity=9810.0), limits=limits).allowed)
 
+    def test_account_equity_is_the_denominator(self) -> None:
+        """日亏必须量账户口径 —— 定仓基数被 MR 占用调低后，同一笔亏损会被放大。
+
+        2026-11-05 实盘（MR 腿持 QQQ、名义占用 ~233U）：账户 496.08 → 482.84 只亏
+        2.67%，但按定仓基数 263 算成 −5.04% → ETH 空单被 daily_loss 拒掉。
+        """
+        st = state(equity=249.9, day_start_equity=263.1,       # 定仓口径（已扣 MR 名义）
+                   account_equity=482.84, account_day_start_equity=496.08)
+        result = decision(notional=100.0, st=st)
+        self.assertTrue(result.allowed)
+        gate = result.gate(GATE_DAILY_LOSS)
+        assert gate is not None
+        self.assertAlmostEqual(gate.detail["loss_pct"], 13.24 / 496.08, places=9)
+        self.assertAlmostEqual(gate.detail["sizing_equity"], 249.9, places=9)
+
+    def test_account_wide_loss_still_blocks(self) -> None:
+        """账户口径真的亏到 5% 仍然要拒（放宽的是分母，不是阈值）。"""
+        st = state(equity=235.0, day_start_equity=248.0,
+                   account_equity=470.0, account_day_start_equity=496.0)   # −5.24%
+        result = decision(st=st)
+        self.assertFalse(result.allowed)
+        self.assertIn(GATE_DAILY_LOSS, codes(result))
+
+    def test_falls_back_to_sizing_pair_without_account_fields(self) -> None:
+        """老调用方不填账户口径 → 退回原来的 equity/day_start 口径，行为不变。"""
+        st = state(equity=9400.0, day_start_equity=10000.0)
+        self.assertIsNone(st.account_equity)
+        self.assertIn(GATE_DAILY_LOSS, codes(decision(st=st)))
+
 
 class DailyTradeCountTests(unittest.TestCase):
     def test_limit_is_four(self) -> None:

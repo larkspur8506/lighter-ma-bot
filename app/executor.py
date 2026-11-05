@@ -1807,6 +1807,14 @@ class Executor:
         MR 一旦持仓，crypto 腿就会被 `daily_loss` 全量拒单（容器内实测：
         equity 246 / day_start 497 → `allowed=False, codes=('daily_loss',)`）。
         回撤闸读 dd_index/peak，不受这条影响。
+
+        **但定仓基数只回答「还能开多大仓」，不能拿来当日亏的分母**（2026-11-05 第三波）：
+        上面这条把 `day_start` 一起下移只能保证「MR 不动时比值不变」；MR 一旦有浮亏，
+        同一笔账户亏损就被除上一个更小的分母 → 按 1/(1−占用率) 倍放大。实盘账户
+        496.08 → 482.84（−2.67%，全部是 MR 腿浮亏）被算成 −5.04%，ETH 空单被
+        `daily_loss` 拒掉。⇒ 这里同时把**账户口径**的 `account_equity` /
+        `account_day_start_equity` 塞进 RiskState，日亏闸只读那一对（见
+        `app.risk._gate_daily_loss`）；无 MR 占用时两对数值相同，行为不变。
         """
         state = snapshot.to_risk_state()
         eq = self._crypto_equity
@@ -1817,7 +1825,9 @@ class Executor:
         new_day_start = day_start
         if contrib > 0 and day_start is not None:
             new_day_start = max(float(day_start) - contrib, 0.0)
-        return replace(state, equity=float(eq), day_start_equity=new_day_start)
+        return replace(state, equity=float(eq), day_start_equity=new_day_start,
+                       account_equity=state.equity,
+                       account_day_start_equity=day_start)
 
     @staticmethod
     def _apply_entry_guard(decision: Decision, *, blocks: Sequence[str] = ()

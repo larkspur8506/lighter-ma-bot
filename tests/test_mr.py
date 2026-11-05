@@ -635,6 +635,9 @@ class TestExecutorGuard(unittest.TestCase):
         self.assertAlmostEqual(state.equity, 246.04, places=6)
         # 2026-11-02 第五轮：日初权益必须同幅下移 —— 否则日亏闸把「基数缩小」当成亏损
         self.assertAlmostEqual(state.day_start_equity, 246.04, places=6)
+        # 2026-11-05：定仓口径之外还必须留一份**账户口径**，日亏闸只读那一对
+        self.assertAlmostEqual(state.account_equity, 497.04, places=6)
+        self.assertAlmostEqual(state.account_day_start_equity, 497.04, places=6)
 
         bars = [strategy.Bar(open_ms=i * 4 * 3600_000, open=100.0, high=101.0,
                              low=99.0, close=100.0) for i in range(3)]
