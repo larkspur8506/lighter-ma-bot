@@ -166,6 +166,8 @@ class FakeExchange:
         self.no_fill = set()
         #: 部分成交：给了就按这个数量开仓（小于 plan.qty_int）
         self.partial_entry_qty_int = None
+        #: 交易所成交均价：给了就当作 `avg_entry_price`（记账价必须用它，不是 plan 价）
+        self.fill_price = None
 
     # -- 下单 ---------------------------------------------------------------
     def _result(self, action, *, symbol="", **extra):
@@ -212,6 +214,8 @@ class FakeExchange:
                                            "qty_int": qty,
                                            "market_id": int(plan.market_id),
                                            "size_decimals": int(plan.size_decimals)}
+            if self.fill_price is not None:
+                self.positions[plan.symbol]["avg_entry_price"] = float(self.fill_price)
         return self._result("entry", symbol=plan.symbol, market_id=int(plan.market_id),
                             side=int(plan.side), qty_int=int(plan.qty_int),
                             client_order_index=coi, tx_hash=f"0xentry{int(bar_ms)}")
@@ -278,7 +282,8 @@ class FakeExchange:
             sdec = int(pos.get("size_decimals", 5))
             qty = Decimal(int(pos["qty_int"])).scaleb(-sdec)
             out.append(ExchangePosition(symbol=symbol, side=int(pos["side"]), qty=qty,
-                                        qty_str=str(qty), market_id=pos.get("market_id")))
+                                        qty_str=str(qty), market_id=pos.get("market_id"),
+                                        avg_entry_price=pos.get("avg_entry_price")))
         return tuple(out)
 
 
@@ -1512,6 +1517,50 @@ class EntryFillVerificationTests(Base):
         self.assertEqual(self.exchange.stops[0]["qty_int"], PLAN_QTY_INT // 2,
                          "止损数量必须跟着真实成交量")
         self.assertIn("entry_partial_fill", [e["kind"] for e in self.events()])
+        self.assertEqual(self.store.audit(), [])
+
+    def test_entry_books_the_exchange_fill_price_not_the_plan_price(self):
+        """记账价必须是**交易所成交均价**（plan 价是 bar 收盘，IOC 晚了就偏）。
+
+        2026-11-05 实盘：plan 2251.16、真实成交 2276.92（差 1.14%），面板「入场价」
+        与交易所标记价对不上、空单浮盈符号甚至反了；平仓 realized_pnl 会一直错。
+        这里把成交价做成 104.4（plan 是 104.2，差 0.2 = 一个 tick 的整数倍，便于断言）。
+        """
+        self.exchange.fill_price = 104.4
+        ex = self.make_executor(fill_confirm_s=0)
+        self.run_tick(ex)
+
+        row = self.store.open_positions()[0]
+        qty = int(row["qty_int"]) / 10 ** 5
+        self.assertAlmostEqual(float(row["entry_price"]), 104.4, places=9)
+        self.assertAlmostEqual(float(row["notional"]), qty * 104.4, places=6)
+        # 风险按真实成交价重算：104.4 − 100.1 = 4.3 而不是 plan 的 4.1
+        self.assertAlmostEqual(float(row["risk_amount"]), qty * 4.3, places=6)
+        # 止损价是信号给的，不跟着成交价动
+        self.assertEqual(self.exchange.stops[0]["trigger_price_int"], STOP_PRICE_INT)
+
+        trade = [t for t in self.store.trades(limit=10, symbol=BTC)
+                 if t["kind"] == "entry"][0]
+        self.assertAlmostEqual(float(trade["price"]), 104.4, places=9)
+
+        events = {e["kind"]: e for e in self.events()}
+        self.assertIn("entry_fill_price", events)
+        data = json.loads(events["entry_fill_price"]["data"])
+        self.assertAlmostEqual(data["fill_price"], 104.4, places=9)
+        self.assertAlmostEqual(data["plan_price"], ENTRY_REF, places=9)
+        # 推送里的成交价也是真实成交价（信号价另行保留，滑点才有意义）
+        text = dict(self.alerts)["entry"]
+        self.assertIn("104.4", text)
+        self.assertEqual(self.store.audit(), [], "账务不变式仍然成立")
+
+    def test_missing_fill_price_keeps_the_plan_price(self):
+        """读不到交易所成交均价 → 退回 plan 价（与旧行为一致，不能因此拒单/炸单）。"""
+        ex = self.make_executor(fill_confirm_s=0)
+        self.run_tick(ex)
+
+        row = self.store.open_positions()[0]
+        self.assertAlmostEqual(float(row["entry_price"]), ENTRY_REF, places=9)
+        self.assertNotIn("entry_fill_price", [e["kind"] for e in self.events()])
         self.assertEqual(self.store.audit(), [])
 
     def test_fill_qty_is_taken_after_it_settles(self):

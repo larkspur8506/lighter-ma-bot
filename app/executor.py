@@ -645,6 +645,41 @@ def _plan_with_qty(plan: Any, *, qty_int: int) -> Any:
                    risk_amount=base * abs(entry - stop))
 
 
+def _optional_positive_float(value: Any) -> Optional[float]:
+    """交易所读数 → 正的 float；缺失/脏值/非正数一律 `None`（调用方据此回退）。"""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out) or out <= 0:
+        return None
+    return out
+
+
+def _plan_with_entry_price(plan: Any, *, entry_price: float) -> Any:
+    """按**交易所真实成交均价**重建 `OrderPlan`（记账口径对齐成交回报）。
+
+    `plan.entry_price` 是信号 bar 的收盘价（下单意图的参考价），而 IOC 在收盘后几秒到
+    几十分钟才成交；两者可能差一个百分点以上（2026-11-05 实测 1.14%：补单晚了 31 分钟、
+    行情反弹 25.76 U）。继续按 plan 价记账的后果：`positions.entry_price` /
+    `trades.price` / `notional` / `risk_amount` / 平仓 `realized_pnl` 全部偏掉，面板
+    「入场价」与交易所标记价对不上（浮盈符号都能反）。
+
+    只改「记账用的价」：止损价、数量、市场、杠杆都不动 —— 止损是信号给的，不是成交价给的。
+    """
+    entry = _optional_positive_float(entry_price)
+    if entry is None:
+        return plan
+    base = float(plan.base_qty)
+    stop = float(plan.stop_price)
+    notional = base * entry
+    leverage = float(plan.leverage or 1.0)
+    stop_dist = abs(entry - stop) / entry if entry > 0 else float(plan.stop_dist)
+    return replace(plan, entry_price=entry, notional=notional,
+                   margin=(notional / leverage) if leverage > 0 else notional,
+                   risk_amount=base * abs(entry - stop), stop_dist=stop_dist)
+
+
 def _qty_int_from_decimal(value: Any, decimals: int) -> int:
     """交易所给的 base 数量（字符串/Decimal）→ 整数 tick（**向下取整**，宁可少算）。"""
     try:
@@ -1935,6 +1970,9 @@ class Executor:
             raise ExecutorError(f"{decision.symbol}: entry intent without an OrderPlan")
         bar_ms = int(decision.bar_ms or 0)
         symbol = str(plan.symbol)
+        # 信号价（= plan 价，bar 收盘）：告警里的「滑点」要拿它当基准，所以先存下来 ——
+        # 下面按交易所成交均价重建 plan 之后 `plan.entry_price` 就不再是信号价了。
+        signal_entry_price = float(plan.entry_price)
         # entry coi 按 (symbol, bar) 确定性推导 = 崩溃重放的幂等键。但「受理未成交」之后
         # 的重试若复用同一个 coi，会被交易所以 duplicate 拒掉 → 白吃失败计数，3 次可误开
         # 熔断（对抗审查 P3）。有 not_filled 记录的 bar，重试 coi 掺尝试序号；
@@ -2010,6 +2048,24 @@ class Executor:
                             data={"filled_qty_int": filled_qty_int,
                                   "planned_qty_int": int(decision.plan.qty_int)
                                   if decision.plan is not None else None})
+            # 记账价对齐**交易所成交均价**（2026-11-05）：成交确认那一步本来就读过交易所
+            # 仓位（`_entry_fill_positions`，此前只用来展示强平价），这里直接拿它的
+            # `avg_entry_price` 重建 plan —— 否则 `positions.entry_price` / `trades.price`
+            # / `notional` / `risk_amount` / 平仓 `realized_pnl` 全部按 bar 收盘价记账，
+            # 实测与真实成交差 1.14%（空单浮盈符号都能反）。读不到就保持 plan 价（fail-open）。
+            fill_pos = self._entry_fill_positions.get(str(symbol).upper())
+            fill_px = _optional_positive_float(getattr(fill_pos, "avg_entry_price", None)) \
+                if fill_pos is not None else None
+            if fill_px is not None and abs(fill_px - float(plan.entry_price)) > 0:
+                self._event(
+                    "entry_fill_price",
+                    f"{symbol}: booked at exchange avg_entry_price {fill_px:g} "
+                    f"(plan {signal_entry_price:g})", symbol=symbol,
+                    data={"fill_price": fill_px, "plan_price": signal_entry_price,
+                          "entry_coi": entry_coi,
+                          "qty_int": int(plan.qty_int)})
+                plan = _plan_with_entry_price(plan, entry_price=fill_px)
+                decision_used = replace(decision_used, plan=plan)
 
         try:
             stop = await self._place(self.exchange.place_stop(plan, bar_ms=bar_ms),
@@ -2079,6 +2135,11 @@ class Executor:
                        else to_int_price(float(plan.entry_price), int(plan.price_decimals)))
             ref_price = ref_int / (10.0 ** int(plan.price_decimals))
             fill_pos = self._entry_fill_positions.pop(str(symbol).upper(), None)
+            # 「成交价」优先用交易所成交均价；拿不到才退回下单时的实时 mid 限价。
+            fill_px_alert = (_optional_positive_float(getattr(fill_pos, "avg_entry_price", None))
+                             if fill_pos is not None else None)
+            if fill_px_alert is not None:
+                ref_price = fill_px_alert
             self._alert(
                 "entry",
                 fmt_entry_alert(
@@ -2088,7 +2149,7 @@ class Executor:
                     liq=(getattr(fill_pos, "liquidation_price", None) if fill_pos else None),
                     risk_u=float(plan.risk_amount),
                     equity=float(plan.equity or self._equity or 0.0) or None,
-                    signal_px=float(plan.entry_price),
+                    signal_px=signal_entry_price,
                     oid=f"coi:{entry_coi}", stop_oid=(f"coi:{stop_coi}" if stop_ok else None),
                     when=dt.datetime.now(DISPLAY_TZ), leverage=float(plan.leverage or 0) or None,
                     isolated=bool(self.margin_isolated), dry_run=bool(self.dry_run)))
