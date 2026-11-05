@@ -2134,6 +2134,15 @@ class Executor:
             ref_int = (entry_ref if entry_ref is not None
                        else to_int_price(float(plan.entry_price), int(plan.price_decimals)))
             ref_price = ref_int / (10.0 ** int(plan.price_decimals))
+            # 成交距信号 bar 收盘多少分钟：>10 分钟时告警里那一行不再叫「滑点」（见 alerts.py）
+            signal_age_min = None
+            try:
+                if bar_ms:
+                    signal_age_min = max(
+                        0.0, (float(self.clock()) * 1000.0
+                              - (int(bar_ms) + SIGNAL_BAR_MS)) / 60_000.0)
+            except (TypeError, ValueError):                       # pragma: no cover - 脏 bar
+                signal_age_min = None
             fill_pos = self._entry_fill_positions.pop(str(symbol).upper(), None)
             # 「成交价」优先用交易所成交均价；拿不到才退回下单时的实时 mid 限价。
             fill_px_alert = (_optional_positive_float(getattr(fill_pos, "avg_entry_price", None))
@@ -2152,7 +2161,8 @@ class Executor:
                     signal_px=signal_entry_price,
                     oid=f"coi:{entry_coi}", stop_oid=(f"coi:{stop_coi}" if stop_ok else None),
                     when=dt.datetime.now(DISPLAY_TZ), leverage=float(plan.leverage or 0) or None,
-                    isolated=bool(self.margin_isolated), dry_run=bool(self.dry_run)))
+                    isolated=bool(self.margin_isolated), dry_run=bool(self.dry_run),
+                    signal_age_min=signal_age_min))
         if not stop_ok:
             self._failures += 1
             self._maybe_open_circuit()

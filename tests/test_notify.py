@@ -352,6 +352,22 @@ class ThreadingTests(unittest.TestCase):
         self.assertEqual(seen, [True])
         self.assertGreaterEqual(time.monotonic() - started, 0.0)
 
+    def test_short_lived_process_waits_for_in_flight_sends(self):
+        """短命进程（一次性脚本跑一轮 tick）必须等发送线程收尾，否则消息无声丢失。
+
+        2026-11-05 补单手跑 `run_once()`：进程退出时 daemon 线程被直接杀掉，企微先发出去、
+        Telegram 还没轮到 —— 用户只收到微信，日志里什么都没有。
+        `wait_for_pending_notifications()`（已 `atexit` 注册）负责补这一刀。
+        """
+        http = StubHttp(delay=0.3)
+        notifier = notifier_from_env({"TELEGRAM_BOT_TOKEN": TG_TOKEN,
+                                      "TELEGRAM_CHAT_ID": TG_CHAT}, http=http)
+        notifier("entry", "【Lighter】开仓 ETH 空 0.0313 @ 2276.92")
+        self.assertEqual(http.calls, [], "刚调用时还没发完")
+        joined = notify.wait_for_pending_notifications(timeout_s=5.0)
+        self.assertGreaterEqual(joined, 1)
+        self.assertEqual(len(http.calls), 1, "等待之后必须真的发出去")
+
     def test_a_notifier_without_channels_is_falsy_and_silent(self):
         notifier = Notifier(())
         self.assertFalse(notifier)

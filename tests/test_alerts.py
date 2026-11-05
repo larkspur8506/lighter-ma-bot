@@ -37,6 +37,36 @@ class EntryAlertTests(unittest.TestCase):
         self.assertIn("权益的 1.3%", self.text)
         self.assertIn("20:03", self.text)
 
+    def test_delayed_entry_is_labelled_as_delay_not_slippage(self):
+        """晚成交 ≠ 滑点：2026-11-05 补单晚 31 分钟，信号价差 1.16% 被写成「滑点」。
+
+        正常路径 tick 在收盘后 3 分钟下单；超过 `DELAY_LABEL_MIN` 分钟仍成交的，这一行
+        必须叫「延迟」并标出晚了多久，否则读起来像「下单滑了 1.16%」。
+        """
+        text = alerts.fmt_entry_alert(
+            coin="ETH", side=-1, qty=0.0313, entry_px=2276.92, stop_px=2356.87,
+            notional=71.27, margin=14.25, liq=2700.45, risk_u=2.50, equity=485.8,
+            signal_px=2251.16, oid="coi:1", stop_oid="coi:2",
+            when=dt.datetime(2026, 11, 5, 0, 36, tzinfo=alerts.DISPLAY_TZ),
+            leverage=5, isolated=True, signal_age_min=34.0)
+        labels = [ln.split("  ")[0].strip() for ln in text.splitlines()[2:]]
+        self.assertIn("延迟", labels)
+        self.assertNotIn("滑点", labels)
+        self.assertIn("晚 34 分钟", text)
+        self.assertIn("2,251.160", text)
+
+    def test_prompt_entry_still_says_slippage(self):
+        """正常 3 分钟内的成交仍然是「滑点」——标签不能被这次改动带到常态路径上。"""
+        text = alerts.fmt_entry_alert(
+            coin="ETH", side=-1, qty=0.0313, entry_px=2250.4, stop_px=2356.87,
+            notional=70.4, margin=14.1, liq=2700.45, risk_u=3.31, equity=483.0,
+            signal_px=2251.16, oid="coi:1", stop_oid="coi:2",
+            when=dt.datetime(2026, 11, 5, 0, 3, tzinfo=alerts.DISPLAY_TZ),
+            leverage=5, isolated=True, signal_age_min=3.0)
+        labels = [ln.split("  ")[0].strip() for ln in text.splitlines()[2:]]
+        self.assertIn("滑点", labels)
+        self.assertNotIn("延迟", labels)
+
     def test_missing_values_render_dash(self):
         text = alerts.fmt_entry_alert(
             coin="BTC", side=1, qty=0.001, entry_px=100.0, stop_px=98.0,
