@@ -338,6 +338,14 @@ class RiskState:
 
     equity: Optional[float] = None
     day_start_equity: Optional[float] = None
+    # **账户口径**权益（含 MR 等其它腿）：日亏闸只看这一对。
+    # `equity` / `day_start_equity` 是「本腿还能用多少」的定仓基数，已被其它腿的
+    # 名义占用调低；拿它当日亏分母会把其它腿的浮亏按 1/(1−占用率) 倍放大
+    # （2026-11-05 实盘：账户 496.08 → 482.84 = −2.67%，被算成 −5.04%，
+    # ETH 空单被 `daily_loss` 拒掉而 HL 同根 bar 正常开仓）。
+    # None → 退回 `equity` / `day_start_equity`（无其它腿占用时两者本就相等）。
+    account_equity: Optional[float] = None
+    account_day_start_equity: Optional[float] = None
     trades_today: Optional[int] = None
     open_positions: Tuple[str, ...] = ()
     open_notional_total: Optional[float] = None
@@ -361,6 +369,8 @@ class RiskState:
         return {
             "equity": self.equity,
             "day_start_equity": self.day_start_equity,
+            "account_equity": self.account_equity,
+            "account_day_start_equity": self.account_day_start_equity,
             "trades_today": self.trades_today,
             "open_positions": list(self.symbols()),
             "open_notional_total": self.open_notional_total,
@@ -507,17 +517,34 @@ def _gate_state(state: RiskState) -> GateResult:
 
 
 def _gate_daily_loss(state: RiskState, limits: RiskLimits) -> GateResult:
-    equity = _num(getattr(state, "equity", None))
-    day_start = _num(getattr(state, "day_start_equity", None))
+    """日亏闸：量的是**整个账户今天亏了多少**，所以分子分母都用账户口径。
+
+    曾经直接拿 `state.equity` / `state.day_start_equity` —— 而这一对在多腿账户里是
+    「本腿定仓基数」（已被 MR 腿的名义占用扣减）。于是同一笔账户亏损被除上一个更小的
+    分母，按 1/(1−占用率) 倍放大：2026-11-05 实盘账户 496.08 → 482.84（−2.67%，
+    且全部来自 MR 腿浮亏）被算成 −5.04%，ETH 空单被拒、HL 同根 bar 正常开仓。
+    ⇒ 有 `account_equity` / `account_day_start_equity` 就用它们；没有（单腿账户、
+    老调用方）退回 `equity` / `day_start_equity`，行为不变。
+    """
+    equity = _num(state.account_equity) if state.account_equity is not None \
+        else _num(getattr(state, "equity", None))
+    day_start = _num(state.account_day_start_equity) \
+        if state.account_day_start_equity is not None \
+        else _num(getattr(state, "day_start_equity", None))
     if day_start is None or day_start <= 0 or equity is None:
         return GateResult(GATE_DAILY_LOSS, SEVERITY_BLOCK, GATE_DAILY_LOSS,
                           "day-start equity is unavailable — cannot evaluate the daily "
                           "loss limit (fail-closed)",
                           {"state_unavailable": True, "day_start_equity": state.day_start_equity,
-                           "equity": state.equity})
+                           "equity": state.equity,
+                           "account_day_start_equity": state.account_day_start_equity,
+                           "account_equity": state.account_equity})
     loss = (day_start - equity) / day_start
     detail = {"day_start_equity": day_start, "equity": equity,
-              "loss_pct": loss, "max_daily_loss_pct": float(limits.max_daily_loss_pct)}
+              "loss_pct": loss, "max_daily_loss_pct": float(limits.max_daily_loss_pct),
+              # 同一条 detail 里带上定仓基数，面板/复盘能一眼看出「两条口径差多少」
+              "sizing_equity": state.equity,
+              "sizing_day_start_equity": state.day_start_equity}
     if loss >= float(limits.max_daily_loss_pct):
         return GateResult(GATE_DAILY_LOSS, SEVERITY_BLOCK, GATE_DAILY_LOSS,
                           f"daily loss {loss:.2%} reached the limit "
