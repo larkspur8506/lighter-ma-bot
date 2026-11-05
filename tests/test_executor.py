@@ -1891,5 +1891,28 @@ class SignalAgeGateTests(Base):
                          30.0)
 
 
+class StrategyPositionsTests(unittest.TestCase):
+    """crypto 腿的仓位集合不能包含 MR 腿（mkt129）。
+
+    2026-11-05 线上：MR 持仓期间 ETH 信号连续 5 轮被 total-notional 闸 fail-closed 拒单 ——
+    交易所侧 QQQ 仓被并进快照、库里却没有对应行，总名义算不出来。
+    """
+
+    def test_mr_position_is_filtered_out(self):
+        account = executor.ExchangeAccount(positions=(
+            executor.ExchangePosition(symbol="BTC", side=1, qty=Decimal("4.156"), market_id=1),
+            executor.ExchangePosition(symbol="QQQ", side=1, qty=Decimal("0.3575"), market_id=129),
+        ), orders=())
+        kept = executor.strategy_positions(account.positions, ("BTC", "ETH", "SOL"))
+        self.assertEqual([p.symbol for p in kept], ["BTC"])
+        self.assertTrue(all(p.market_id != 129 for p in kept))
+
+    def test_universe_match_is_case_insensitive(self):
+        account = executor.ExchangeAccount(positions=(
+            executor.ExchangePosition(symbol="eth", side=-1, qty=Decimal("1"), market_id=0),), orders=())
+        self.assertEqual(len(executor.strategy_positions(account.positions, ("BTC", "ETH"))), 1)
+        self.assertEqual(len(executor.strategy_positions(account.positions, ("BTC", "SOL"))), 0)
+
+
 if __name__ == "__main__":                                        # pragma: no cover
     unittest.main()

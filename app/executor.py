@@ -312,6 +312,19 @@ class ExchangeAccount:
 
 # ------------------------------------------------------------------ 解析（纯函数）
 
+def strategy_positions(positions: Any, universe: Sequence[str]) -> Tuple[Any, ...]:
+    """只保留本策略标的的交易所持仓。
+
+    同一账户上还有 MR 腿（QQQ / mkt129）：它的仓位不存在 `positions` 表里，
+    一旦混进快照，`_notional` 会因「no stored position row」把总名义算成 None，
+    total-notional 闸随即 fail-closed，整个 crypto 腿被拒单（2026-11-05 实测）。
+    MR 的风险占用已通过「权益 − MR 名义」扣减，不应再进 crypto 腿的仓位集合。
+    """
+    allowed = {str(sym).strip().upper() for sym in universe}
+    return tuple(pos for pos in positions
+                 if str(getattr(pos, "symbol", "")).strip().upper() in allowed)
+
+
 def _dec(value: Any, what: str) -> Decimal:
     """`str/float/int` → `Decimal`；不可解析 → `ReaderError`（不猜 0）。"""
     if isinstance(value, Decimal):
@@ -1644,7 +1657,13 @@ class Executor:
         if self.assembler.equity_provider is None:
             self.assembler.equity_provider = lambda: account.equity
         if self.assembler.positions_provider is None:
-            self.assembler.positions_provider = lambda: tuple(account.positions)
+            # 只喂本策略标的的持仓：同一账户上还有 MR 腿（QQQ / mkt129），它不在 positions 表里，
+            # 混进快照会让 total-notional 闸算不出总名义（no stored position row）→ 整个 crypto 腿
+            # 被 fail-closed 拒单（2026-11-05 实测：MR 持仓期间 ETH 信号连续 5 轮被拒）。
+            # MR 的风险占用已通过「权益 − MR 名义」扣减，不该再进 crypto 腿的仓位集合。
+            _universe = tuple(str(sym).strip().upper() for sym in self.symbols)
+            self.assembler.positions_provider = lambda: strategy_positions(
+                account.positions, _universe)
         if self.assembler.price_provider is None:
             self.assembler.price_provider = lambda sym: self._prices.get(str(sym).upper())
         self.assembler.ensure_day_start(now_ts=now_s)
