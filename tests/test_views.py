@@ -455,6 +455,15 @@ class HtmlTests(PanelFixture):
         self.assertIn("<svg", html)                     # 曲线是内联 SVG
         self.assertIn("<style>", html)                  # 样式内联
 
+    def test_tables_get_a_right_edge_scroll_fade(self) -> None:
+        """横滚提示：遮罩 + 判滚 JS + tabular-nums；遮罩走 alpha 渐变，不写死颜色。"""
+        for page in (self._html(), self.seeded_panel().records_page()):
+            with self.subTest(page_len=len(page)):
+                self.assertIn("can-scroll", page)
+                self.assertIn("mask-image", page)        # 右缘渐隐遮罩
+                self.assertIn("scrollWidth", page)       # 只有真可滚且未到最右才显示
+                self.assertIn("font-variant-numeric: tabular-nums", page)
+
     def test_theme_follows_the_system_without_a_toggle(self) -> None:
         """明暗跟随系统：只有 prefers-color-scheme，没有按钮、没有 localStorage 偏好。
 
@@ -1389,6 +1398,115 @@ class SymbolIndicatorsCacheTests(unittest.TestCase):
         self.assertEqual(self.calls["n"], 6)             # 换代后重算
         # 缓存只留当前一代（三标的各一条）
         self.assertEqual(len(panel._symbol_ind_cache), 3)
+
+
+class SqueezeRawFlagTests(unittest.TestCase):
+    """`_indicators_for` 缓存的 min_bars=1 **原始**旗标 == explain_entry 内部重算的那份。
+
+    背景（2026-11-07 面板审查实测）：`_symbol_row` 调 `explain_entry` 不传
+    `squeeze_raw` 时，`dense_run` 对全历史重算一次 `squeeze_flags(min_bars=1)`
+    （~4000 根 ≈0.24–0.99s/标的）——每次首页 //symbols 请求都付的纯 CPU 热点，
+    K 线缓存再热也躲不掉。回归钉三件事：
+    ① 缓存的 raw 参数与 strategy 内部完全一致（BAND_WINDOW / BAND_QUANTILE / 1）；
+    ② 同一 bars 下传/不传 `squeeze_raw` 的 `explain_entry` 输出**完全相等**
+       （多标的、多个 i —— 传错参数或算错旗标在这里立刻红）；
+    ③ `_symbol_row` 真的把缓存的 raw 传了进去（漏传 = 热点回归）。
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = make_store(tmp.name)
+        self.addCleanup(self.store.close)
+
+    @staticmethod
+    def _walk_bars(start_ms: int, count: int, base: float, step: float) -> List[strategy.Bar]:
+        """确定性锯齿行情：band 时宽时窄，raw 旗标真 True/False 混合（flat 序列是退化形状）。"""
+        bars: List[strategy.Bar] = []
+        price = base
+        for i in range(count):
+            price *= 1.0 + (step if i % 7 < 4 else -step * 0.6)
+            bars.append(strategy.Bar(open_ms=start_ms + i * BAR_MS, open=price,
+                                     high=price * 1.002, low=price * 0.998,
+                                     close=price, volume=1.0))
+        return bars
+
+    def _bars_by_symbol(self) -> Dict[str, List[strategy.Bar]]:
+        start = int(T0 * 1000)
+        return {"BTC": self._walk_bars(start, 400, 65000.0, 0.004),
+                "ETH": self._walk_bars(start, 400, 3200.0, 0.006),
+                "SOL": self._walk_bars(start, 400, 140.0, 0.010)}
+
+    def _panel(self, bars_by_symbol: Dict[str, List[Any]]) -> views.Panel:
+        return views.Panel(
+            lambda: self.store,
+            sources=views.Sources(bars=lambda symbol: bars_by_symbol[symbol],
+                                  prices=lambda: {}),
+            now=lambda: T0)
+
+    def test_cached_raw_flags_match_the_strategy_recompute(self) -> None:
+        panel = self._panel(self._bars_by_symbol())
+        for symbol, bars in self._bars_by_symbol().items():
+            with self.subTest(symbol=symbol):
+                bundle = panel._indicators_for(symbol, bars)
+                self.assertEqual(len(bundle), 3,
+                                 "_indicators_for 应返回 (ind, squeeze, squeeze_raw)")
+                ind, _gated, raw = bundle
+                self.assertEqual(
+                    raw,
+                    strategy.squeeze_flags(ind["band"], strategy.BAND_WINDOW,
+                                           strategy.BAND_QUANTILE, 1))
+                self.assertIn(True, raw, "锯齿行情应有密集段，退化形状测不出参数错")
+
+    def test_explain_entry_with_and_without_squeeze_raw_identical(self) -> None:
+        bars_by_symbol = self._bars_by_symbol()
+        panel = self._panel(bars_by_symbol)
+        for symbol, bars in bars_by_symbol.items():
+            ind, gated, raw = panel._indicators_for(symbol, bars)
+            n = len(bars)
+            for i in (strategy.BAND_WINDOW, n // 2, n - 1):
+                with self.subTest(symbol=symbol, i=i):
+                    with_raw = strategy.explain_entry(symbol, bars, ind, gated, i,
+                                                      squeeze_raw=raw)
+                    recompute = strategy.explain_entry(symbol, bars, ind, gated, i)
+                    self.assertEqual(with_raw, recompute)
+
+    def test_symbol_row_passes_cached_raw_to_explain_entry(self) -> None:
+        bars = self._walk_bars(int(T0 * 1000), 400, 65000.0, 0.004)
+        by_symbol = {"BTC": bars, "ETH": bars, "SOL": bars}
+        seen: Dict[str, Any] = {}
+        real = strategy.explain_entry
+
+        def spy(symbol: str, bars_: Any, ind: Any, squeeze: Any, i: int, **kw: Any):
+            seen["squeeze_raw"] = kw.get("squeeze_raw")
+            return real(symbol, bars_, ind, squeeze, i, **kw)
+
+        with unittest.mock.patch.object(strategy, "explain_entry", side_effect=spy):
+            panel = self._panel(by_symbol)
+            panel.symbols_block()
+        self.assertIsNotNone(seen.get("squeeze_raw"),
+                             "_symbol_row 没传 squeeze_raw = 每请求全量重算热点回归")
+
+
+class MrStatusChipTests(unittest.TestCase):
+    """状态条 MR 徽标：浮亏 .neg / 浮盈 .pos（复用现成类），零值与缺值保持无色。"""
+
+    def test_negative_upnl_uses_neg(self) -> None:
+        out = views._mr_status_chip({"enabled": True, "pos": {"upnl": -12.34}})
+        self.assertIn("MR 在场", out)
+        self.assertIn('<b class="neg">-12.34 U</b>', out)
+
+    def test_positive_upnl_uses_pos(self) -> None:
+        out = views._mr_status_chip({"enabled": True, "pos": {"upnl": 3.21}})
+        self.assertIn('<b class="pos">3.21 U</b>', out)
+
+    def test_zero_and_missing_upnl_stay_plain(self) -> None:
+        for upnl in (0, 0.0, None):
+            with self.subTest(upnl=upnl):
+                out = views._mr_status_chip({"enabled": True, "pos": {"upnl": upnl}})
+                self.assertIn("MR 在场", out)
+                self.assertNotIn("class=\"neg\"", out)
+                self.assertNotIn("class=\"pos\"", out)
 
 
 
