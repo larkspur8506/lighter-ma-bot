@@ -1313,8 +1313,15 @@ class Panel:
     def symbols_block(self) -> Dict[str, Any]:
         return self._guard(BLOCK_SYMBOLS, self._symbols, _symbols_fallback)
 
-    def _indicators_for(self, symbol: str, bars: Sequence[Any]) -> Tuple[Any, Any]:
-        """`compute_indicators` + `squeeze_flags` 的按代记忆化（见 `__init__` 注释）。"""
+    def _indicators_for(self, symbol: str, bars: Sequence[Any]) -> Tuple[Any, Any, Any]:
+        """`compute_indicators` + 两份 squeeze 旗标的按代记忆化（见 `__init__` 注释）。
+
+        第 2 份是 `min_bars=1` 的**原始**旗标，参数与 `strategy.explain_entry` 内部
+        `dense_run` 的重算完全一致（BAND_WINDOW / BAND_QUANTILE / 1）。把它传给
+        `explain_entry(squeeze_raw=…)`，`dense_run` 就不再对全历史重算一遍分位 ——
+        那是 2026-11-07 实测的每请求纯 CPU 热点（~4000 根 ≈0.24–0.99s/标的，
+        K 线缓存再热也躲不掉）。
+        """
         gen = (int(_row_get(bars[-1], "open_ms") or 0), len(bars))
         if gen != self._symbol_ind_gen:
             self._symbol_ind_gen = gen
@@ -1322,7 +1329,10 @@ class Panel:
         cached = self._symbol_ind_cache.get(symbol)
         if cached is None:
             ind = strategy.compute_indicators(bars)
-            cached = (ind, strategy.squeeze_flags(ind["band"]))
+            band = ind["band"]
+            cached = (ind, strategy.squeeze_flags(band),
+                      strategy.squeeze_flags(band, strategy.BAND_WINDOW,
+                                             strategy.BAND_QUANTILE, 1))
             self._symbol_ind_cache[symbol] = cached
         return cached
 
@@ -1467,7 +1477,7 @@ class Panel:
         bars = list(self.sources.bars(symbol) or [])          # type: ignore[misc]
         if not bars:
             return _symbol_empty(symbol, reason="没有 K 线")
-        ind, squeeze = self._indicators_for(symbol, bars)
+        ind, squeeze, squeeze_raw = self._indicators_for(symbol, bars)
         i = len(bars) - 1
         price = _finite(prices.get(symbol))
         if price is None:
@@ -1475,7 +1485,8 @@ class Panel:
         why = strategy.explain_entry(symbol, bars, ind, squeeze, i,
                                      entry_price=price if price else None,
                                      allow_long=(1 in self.sides),
-                                     allow_short=(-1 in self.sides))
+                                     allow_short=(-1 in self.sides),
+                                     squeeze_raw=squeeze_raw)
         values = why.get("values") or {}
         band = _finite(values.get("band_prev"))
         thr = _finite(values.get("band_thr"))
@@ -1950,7 +1961,8 @@ _CSS = """
 }
 * { box-sizing: border-box; }
 body { margin: 0; padding: 12px; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; background: var(--bg); color: var(--text);
-       font: 13px/1.45 -apple-system, "Segoe UI", "Noto Sans SC", sans-serif; }
+       font: 13px/1.45 -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+       font-variant-numeric: tabular-nums; }
 h1 { font-size: 15px; margin: 0 0 6px; font-weight: 600; letter-spacing: .02em; }
 h2 { font-size: 13px; margin: 0 0 8px; font-weight: 600; color: var(--muted);
      text-transform: uppercase; letter-spacing: .06em; }
@@ -1970,6 +1982,11 @@ a { color: var(--link); }
            background: var(--bad-bg); border: 1px solid var(--bad-bd); color: var(--bad-fg); }
 section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
           padding: 12px; margin-bottom: 12px; overflow-x: auto; }
+/* 横滚提示：只有 JS 判定「可横滚且未滚到最右」时才加 can-scroll。
+   遮罩走 alpha 渐变（currentColor→transparent），不含任何写死颜色，亮暗主题天然都对。 */
+section.can-scroll {
+  -webkit-mask-image: linear-gradient(to right, currentColor calc(100% - 26px), transparent);
+  mask-image: linear-gradient(to right, currentColor calc(100% - 26px), transparent); }
 table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
 th, td { text-align: right; padding: 5px 7px; border-bottom: 1px solid var(--row);
          white-space: nowrap; }
@@ -2128,7 +2145,11 @@ def _mr_status_chip(mr: Any) -> str:
         return '<span class="kv dim">MR 停用</span>'
     pos = mr.get("pos") or {}
     if isinstance(pos, Mapping) and pos:
-        return (f'<span class="kv">MR 在场 <b>{_money(pos.get("upnl"))} U</b></span>')
+        upnl = _finite(pos.get("upnl"))
+        # 浮亏 .neg / 浮盈 .pos（现成类）；零值与缺值保持无色（老样子）。
+        cls = "" if upnl is None or upnl == 0 else _cls(upnl)
+        bold = f'<b class="{cls}">' if cls else "<b>"
+        return f'<span class="kv">MR 在场 {bold}{_money(pos.get("upnl"))} U</b></span>'
     return f'<span class="kv dim">MR {html.escape(str(mr.get("state") or "空仓"))}</span>'
 
 
@@ -2650,6 +2671,25 @@ _ADMIN_JS = """
   bind('btn-mr-off', function () {
     post('/admin/mr', {on: '0', reason: 'panel: disable mr'});
   });
+})();
+
+/* 表格横滚提示：可横滚且未滚到最右时给 section 加 can-scroll（CSS 右缘渐隐遮罩），
+   滚到头自动消失；不能滚动就永不出现。 */
+(function () {
+  'use strict';
+  function hints() {
+    var els = document.querySelectorAll('section');
+    for (var i = 0; i < els.length; i++) {
+      var s = els[i];
+      var more = s.scrollWidth > s.clientWidth + 1 &&
+                 s.scrollLeft + s.clientWidth < s.scrollWidth - 1;
+      s.classList.toggle('can-scroll', more);
+    }
+  }
+  window.addEventListener('resize', hints);
+  window.addEventListener('load', hints);
+  document.addEventListener('scroll', hints, true);
+  hints();
 })();
 """
 
