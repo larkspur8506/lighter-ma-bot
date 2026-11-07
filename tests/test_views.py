@@ -464,6 +464,16 @@ class HtmlTests(PanelFixture):
                 self.assertIn("scrollWidth", page)       # 只有真可滚且未到最右才显示
                 self.assertIn("font-variant-numeric: tabular-nums", page)
 
+    def test_kv_b_neg_rule_beats_kv_b_in_css(self) -> None:
+        """class 挂上了还不够：.kv b（0-2-1）会压过裸 .neg（0-1-0）。
+
+        2026-11-07 线上实测：状态条输出 <b class="neg">-13.49 U</b>，但
+        computed color 仍是 --text —— 补 .kv b.neg/.kv b.pos 规则才真的红/绿。
+        """
+        html = self._html()
+        self.assertIn(".kv b.neg { color: var(--bad); }", html)
+        self.assertIn(".kv b.pos { color: var(--ok); }", html)
+
     def test_theme_follows_the_system_without_a_toggle(self) -> None:
         """明暗跟随系统：只有 prefers-color-scheme，没有按钮、没有 localStorage 偏好。
 
