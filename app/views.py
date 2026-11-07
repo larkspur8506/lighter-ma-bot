@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import bisect
 import html
+import datetime as dt
 import json
 import logging
 import math
@@ -67,6 +68,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from app import dd as dd_module
 from app import strategy
+from app.alerts import DISPLAY_TZ as _DISPLAY_TZ
 from app.dd import TWR_BASE, TWR_DISPLAY_BASE, TwrState, advance, bootstrap, net_flow, \
     normalise_points
 from app.risk import RiskLimits, drawdown as risk_drawdown
@@ -796,9 +798,9 @@ class Panel:
         last_tick_ts = _finite(_row_get(beat[0], "ts")) if beat else None
         last_tick_age = None if last_tick_ts is None else max(0.0, now - last_tick_ts)
         if last_tick_ts is None:
-            warnings.append("还没有任何 tick 心跳 —— 调度器可能没起来")
+            warnings.append("还没有任何巡检心跳 —— 调度器可能没起来")
         elif last_tick_age is not None and last_tick_age > self.heartbeat_max_age_s:
-            warnings.append(f"上次 tick {_dur(last_tick_age)}（超过 "
+            warnings.append(f"上次巡检 {_dur(last_tick_age)}（超过 "
                             f"{self.heartbeat_max_age_s / 3600:.0f}h 阈值）")
 
         verdict = self._dd_verdict(store, now, warnings)
@@ -1709,10 +1711,10 @@ class Panel:
             jumps = []
             warnings.append(f"权益跳变检测失败: {type(exc).__name__}: {exc}")
         for jump in jumps:
-            stamp = time.strftime("%m-%d %H:%M", time.gmtime(jump["ts"]))
+            stamp = _ts_text(jump["ts"])
             sign = "+" if jump["delta"] > 0 else ""
             warnings.append(
-                f"权益在 {stamp} UTC 跳变 {sign}{jump['delta']:.2f} U 且区间内无成交、"
+                f"权益在 {stamp} 跳变 {sign}{jump['delta']:.2f} U 且区间内无成交、"
                 "无流水覆盖 —— 如有出入金请用 scripts/backfill_flow.py 补录"
                 "（有持仓时的价格波动也会触发本提示，可忽略）")
         funds = {
@@ -2036,7 +2038,8 @@ footer { color: var(--dim); font-size: 11px; padding: 4px 2px 20px; }
   .dyn-row.head { display: none; }
   .dyn-row { display: flex; flex-wrap: wrap; gap: 2px 10px; }
   .dyn-row > span { white-space: nowrap; }
-  .dyn-row .next { display: none; }
+  /* 窄屏隐藏表头后数值没有标签，靠 data-l 补一列小字（此前「换行很乱」的主因） */
+  .dyn-row > span[data-l]::before { content: attr(data-l) " "; color: var(--muted); font-size: 11px; }
   .dyn-row .verdict { flex: 1 0 100%; margin-top: 4px; padding-top: 4px;
                       border-top: 1px dashed var(--line2); }
 }
@@ -2045,8 +2048,12 @@ footer { color: var(--dim); font-size: 11px; padding: 4px 2px 20px; }
   .mr-row.head { display: none; }
   .mr-row { display: flex; flex-wrap: wrap; gap: 2px 10px; }
   .mr-row > span { white-space: nowrap; }
+  .mr-row > span[data-l]::before { content: attr(data-l) " "; color: var(--muted); font-size: 11px; }
   .mr-row .verdict { flex: 1 0 100%; margin-top: 4px; padding-top: 4px;
                      border-top: 1px solid var(--line2); }
+  /* 手机上按钮要够手指点（此前 6px 内边距太小），清仓等危险项整行占满防误触邻居 */
+  button { padding: 12px 16px; font-size: 15px; min-height: 44px; }
+  #block-admin button { width: 100%; margin-top: 6px; }
 }
 """
 
@@ -2054,6 +2061,27 @@ footer { color: var(--dim); font-size: 11px; padding: 4px 2px 20px; }
 def _money(value: Any) -> str:
     out = _finite(value)
     return "—" if out is None else f"{out:,.2f}"
+
+
+def _ts_text(ts: Any, fmt: str = "%m-%d %H:%M") -> str:
+    """epoch 秒 → 显示时区文本（app.alerts.DISPLAY_TZ，默认北京时间）；坏值 → —。
+
+    面板此前全用 `time.gmtime` 显示 UTC（2026-11-07 用户指出推送是北京时间、
+    面板却全 UTC），统一收口到这一个换算点；JSON 字段仍是原始 epoch 秒，不动。
+    """
+    out = _finite(ts)
+    if out is None:
+        return "—"
+    try:
+        return dt.datetime.fromtimestamp(out, _DISPLAY_TZ).strftime(fmt)
+    except (OverflowError, OSError, ValueError):
+        return "—"
+
+
+#: 内部枚举 → 页面文案（只映射 HTML 渲染层；JSON 字段保持原值不破坏契约）。
+_EQUITY_SOURCE_TXT = {"provider": "实时读数", "store": "库内快照", "unavailable": "无读数"}
+_DD_ACTION_TXT = {"warn": "警戒", "kill": "熔断"}
+_DATA_SOURCE_TXT = {"bar": "K线", "equity_curve": "权益曲线", "unavailable": "无"}
 
 
 def _qty_text(value: Any) -> str:
@@ -2114,20 +2142,39 @@ def _svg_curve(points: Sequence[Mapping[str, Any]], *, width: int = 720,
         f'<polyline points="{solid}" fill="none" stroke="var(--ok)" stroke-width="1.8"/>',
         f'<polyline points="{dashed}" fill="none" stroke="var(--link)" stroke-width="1.6" '
         f'stroke-dasharray="5 4"/>',
-        f'<text x="{pad_l - 6}" y="{pad_t + 10}" fill="var(--ok)" font-size="11" '
-        f'text-anchor="end">{p_hi:+.2f}</text>',
-        f'<text x="{pad_l - 6}" y="{pad_t + inner_h:.1f}" fill="var(--ok)" font-size="11" '
-        f'text-anchor="end">{p_lo:+.2f}</text>',
-        f'<text x="{width - pad_r + 6}" y="{pad_t + 10}" fill="var(--link)" font-size="11">'
-        f'{t_hi:.2f}%</text>',
-        f'<text x="{width - pad_r + 6}" y="{pad_t + inner_h:.1f}" fill="var(--link)" '
-        f'font-size="11">{t_lo:.2f}%</text>',
         f'<text x="{pad_l}" y="{height - 6}" fill="var(--dim)" font-size="10">'
-        f'{time.strftime("%m-%d %H:%M", time.gmtime(ts0))} UTC</text>',
+        f'{_ts_text(ts0)}</text>',
         f'<text x="{width - pad_r}" y="{height - 6}" fill="var(--dim)" font-size="10" '
-        f'text-anchor="end">{time.strftime("%m-%d %H:%M", time.gmtime(ts1))} UTC</text>',
-        "</svg>",
+        f'text-anchor="end">{_ts_text(ts1)}</text>',
     ]
+    # 横向网格 + 左右轴各 5 档刻度（此前只有 min/max 两档，读不出中间值）。
+    for k in range(5):
+        frac = k / 4.0
+        gy = pad_t + inner_h * (1.0 - frac)
+        pv = p_lo + (p_hi - p_lo) * frac
+        tv = t_lo + (t_hi - t_lo) * frac
+        parts.append(
+            f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{width - pad_r}" y2="{gy:.1f}" '
+            f'stroke="var(--chart-grid)" stroke-width="0.6" stroke-dasharray="2 5"/>')
+        parts.append(
+            f'<text x="{pad_l - 6}" y="{gy + 3.5:.1f}" fill="var(--ok)" font-size="10" '
+            f'text-anchor="end">{pv:+.2f}</text>')
+        parts.append(
+            f'<text x="{width - pad_r + 6}" y="{gy + 3.5:.1f}" fill="var(--link)" '
+            f'font-size="10">{tv:.2f}%</text>')
+    # 两线各给末端值标签：双轴各自 min-max 归一后线形容易贴近，末端数值先把
+    # 「实线=盈亏、虚线=TWR」的口径钉死，别让读者靠猜。
+    last = pts[-1]
+    ly = y_pnl(_zero(last.get("cum_pnl")))
+    ty = y_twr(_zero(last.get("twr_pct")))
+    parts.append(
+        f'<text x="{width - pad_r - 4}" y="{max(pad_t + 10, ly - 5):.1f}" fill="var(--ok)" '
+        f'font-size="10" text-anchor="end">{_zero(last.get("cum_pnl")):+.2f} U</text>')
+    parts.append(
+        f'<text x="{width - pad_r - 4}" y="{min(pad_t + inner_h - 2, ty + 13):.1f}" '
+        f'fill="var(--link)" font-size="10" text-anchor="end">'
+        f'{_zero(last.get("twr_pct")):+.2f}%</text>')
+    parts.append("</svg>")
     return "".join(parts)
 
 
@@ -2170,18 +2217,18 @@ def _status_html(block: Mapping[str, Any], mode: str) -> str:
         f'<span class="dot {html.escape(level)}"></span>',
         f'<b>{html.escape(str(block.get("state") or "降级"))}</b>',
         f'<span class="kv">权益 <b>{_money(block.get("equity"))} U</b>'
-        f' <span class="dim">({html.escape(str(block.get("equity_source")))})</span></span>',
+        f' <span class="dim">（{_EQUITY_SOURCE_TXT.get(str(block.get("equity_source")), block.get("equity_source"))}）</span></span>',
         f'<span class="kv">持仓 <b>{int(block.get("open_count") or 0)}'
         f'/{int(block.get("max_positions") or 0)}</b></span>',
         f'<span class="kv">kill <b>{"ON" if block.get("kill") else "off"}</b></span>',
         _mr_status_chip(block.get("mr")),
         f'<span class="kv">回撤 <b>{_pct(dd.get("drawdown"))}</b>'
-        f' <span class="dim">({html.escape(str(dd.get("action") or "?"))})</span></span>',
+        f' <span class="dim">（{_DD_ACTION_TXT.get(str(dd.get("action")), dd.get("action") or "—")}）</span></span>',
         f'<span class="kv">模式 <b>{html.escape(mode)}</b></span>',
         f'<span class="kv">凭据 <b>{credentials_text}</b></span>',
-        f'<span class="kv">上次 tick <b>{html.escape(str(block.get("last_tick_text")))}</b></span>',
+        f'<span class="kv">上次巡检 <b>{html.escape(str(block.get("last_tick_text")))}</b></span>',
         f'<span class="kv">数据源 <b>{"ok" if (block.get("data_source") or {}).get("ok") else "异常"}</b>'
-        f' <span class="dim">{html.escape(str((block.get("data_source") or {}).get("name")))}</span></span>',
+        f' <span class="dim">{_DATA_SOURCE_TXT.get(str((block.get("data_source") or {}).get("name")), (block.get("data_source") or {}).get("name"))}</span></span>',
         "</section>",
     ]
     reasons = block.get("reasons") or []
@@ -2267,7 +2314,7 @@ def _stops_html(block: Mapping[str, Any]) -> str:
             f"<td class=\"{css}\">{html.escape(label)}</td>"
             f"<td>{_qty_text(row.get('order_qty'))}</td>"
             f"<td class=\"{css}\">{'是' if row.get('protected') else '否'}</td>"
-            f"<td>{html.escape(time.strftime('%m-%d %H:%M', time.gmtime(checked))) if checked else '—'}</td>"
+            f"<td>{_ts_text(checked)}</td>"
             f"<td>{html.escape(str(row.get('note')))}</td>"
             "</tr>")
     empty = "" if rows else ('<tr><td colspan="9" class="dim">没有持仓 —— 无需止损覆盖</td></tr>')
@@ -2301,7 +2348,7 @@ def _symbols_html(block: Mapping[str, Any]) -> str:
     """
     head = ("<div class='dyn-row head'><span>标的</span><span>当前价</span><span>密集</span>"
             "<span>距上轨（开多）</span><span>距下轨（开空）</span><span>MA200（做空）</span>"
-            "<span>破线后止损</span><span>收盘(UTC)</span><span>结论</span></div>")
+            "<span>破线后止损</span><span>收盘</span><span>结论</span></div>")
 
     def _mark(flag: Any) -> str:
         return "" if flag is None else ("✔" if flag else "✘")
@@ -2366,14 +2413,14 @@ def _symbols_html(block: Mapping[str, Any]) -> str:
         rows.append(
             "<div class='dyn-row'>"
             f"<span class='nm'>{html.escape(str(row.get('symbol')))}</span>"
-            f"<span>{_money(row.get('price'))}</span>"
-            f"<span class=\"{'pos' if dense_ok else 'neg'}\" title=\"{html.escape(dense_title)}\">"
+            f"<span data-l='现价'>{_money(row.get('price'))}</span>"
+            f"<span data-l='密集' class=\"{'pos' if dense_ok else 'neg'}\" title=\"{html.escape(dense_title)}\">"
             f"{dense_txt}</span>"
-            f"<span class=\"{css_long}\"><span class=\"dim\">↑{_money(row.get('ma_max'))}</span> {d_long}</span>"
-            f"<span class=\"{css_short}\"><span class=\"dim\">↓{_money(row.get('ma_min'))}</span> {d_short}</span>"
-            f"<span class=\"{m200_css}\">{m200_txt}</span>"
-            f"<span class=\"{stop_css}\">{stop_txt}</span>"
-            f"<span class=\"dim next\">{html.escape(time.strftime('%m-%d %H:%M', time.gmtime(nxt)) if nxt else '—')}</span>"
+            f"<span data-l='距上轨' class=\"{css_long}\"><span class=\"dim\">↑{_money(row.get('ma_max'))}</span> {d_long}</span>"
+            f"<span data-l='距下轨' class=\"{css_short}\"><span class=\"dim\">↓{_money(row.get('ma_min'))}</span> {d_short}</span>"
+            f"<span data-l='MA200' class=\"{m200_css}\">{m200_txt}</span>"
+            f"<span data-l='破线止损' class=\"{stop_css}\">{stop_txt}</span>"
+            f"<span data-l='收盘' class=\"dim next\">{_ts_text(nxt)}</span>"
             f"<span class=\"verdict {verdict_css}\">{html.escape(verdict)}</span>"
             "</div>")
     mr = block.get("mr") or None
@@ -2426,12 +2473,12 @@ def _mr_dyn_html(mr: Mapping[str, Any]) -> str:
             "<span>距离场%</span><span>结论</span></div>")
     row = ("<div class='mr-row'>"
            f"<span class='nm'>QQQ <span class='badge-mr'>MR</span></span>"
-           f"<span>{_money(price)}</span>"
-           f"<span>{html.escape(pos_txt)}</span>"
-           f"<span class='{e_css}'>{e_txt}</span>"
-           f"<span class='{rsi_css}'>{rsi_txt}</span>"
-           f"<span>{_money(exit_line) if holding else '—'}</span>"
-           f"<span class='{ex_css}'>{ex_txt}</span>"
+           f"<span data-l='现价'>{_money(price)}</span>"
+           f"<span data-l='持仓'>{html.escape(pos_txt)}</span>"
+           f"<span data-l='距入场' class='{e_css}'>{e_txt}</span>"
+           f"<span data-l='RSI2' class='{rsi_css}'>{rsi_txt}</span>"
+           f"<span data-l='离场线'>{_money(exit_line) if holding else '—'}</span>"
+           f"<span data-l='距离场' class='{ex_css}'>{ex_txt}</span>"
            f"<span class='verdict {status_css}'>{html.escape(status)}</span>"
            "</div>")
     return ("<div class='mr-sub'>"
@@ -2465,7 +2512,7 @@ def _equity_after(points: Sequence[Tuple[float, Optional[float]]], ts: float,
 
 
 def _events_html(block: Mapping[str, Any], *, heading: str = "") -> str:
-    head = ("<tr><th>时间(UTC)</th><th>标的</th><th>动作</th><th>事件</th>"
+    head = ("<tr><th>时间</th><th>标的</th><th>动作</th><th>事件</th>"
             "<th>内容</th></tr>")
     rows = []
     for item in block.get("events") or ():
@@ -2474,7 +2521,7 @@ def _events_html(block: Mapping[str, Any], *, heading: str = "") -> str:
         css = "tag skip" if item.get("skipped") else ("tag kill" if item.get("alert") else "tag")
         rows.append(
             "<tr>"
-            f"<td>{html.escape(time.strftime('%m-%d %H:%M:%S', time.gmtime(ts)) if ts else '—')}</td>"
+            f"<td>{_ts_text(ts, '%m-%d %H:%M:%S')}</td>"
             f"<td>{html.escape(str(item.get('symbol') or '—'))}</td>"
             f"<td><span class=\"{css}\">{html.escape(action)}</span></td>"
             f"<td class=\"dim\">{html.escape(str(item.get('kind') or ''))}</td>"
@@ -2512,7 +2559,7 @@ def _funds_html(block: Mapping[str, Any]) -> str:
     return ('<section id="funds"><h2>① 资金概览（库内权益与流水口径）</h2>'
             '<div class="kv">'
             f'最新权益 <b>{_money(equity)} U</b>'
-            f'{"（" + time.strftime("%m-%d %H:%M", time.gmtime(equity_ts)) + " UTC）" if equity_ts else ""}'
+            f'{("（" + _ts_text(equity_ts) + "）") if equity_ts else ""}'
             f' ｜ 净入金 {_money(funds.get("net_flow"))} U'
             f' ｜ TWR <b>{_pct(twr)}</b>'
             f' ｜ 峰值 {_pct(peak)} ｜ 当前回撤 {_pct(drawdown)}'
@@ -2533,7 +2580,7 @@ def _funds_html(block: Mapping[str, Any]) -> str:
 
 def _records_html(block: Mapping[str, Any]) -> str:
     """② 订单明细：标的 / 方向 / 数量 / 成交价 / 名义 / 手续费 / 成交后余额。"""
-    head = ("<tr><th>时间(UTC)</th><th>标的</th><th>方向</th><th>类型</th>"
+    head = ("<tr><th>时间</th><th>标的</th><th>方向</th><th>类型</th>"
             "<th>数量</th><th>成交价</th><th>名义 (U)</th><th>手续费 (U)</th>"
             "<th>已实现 (U)</th><th>成交后余额 (U)</th></tr>")
     rows = []
@@ -2549,7 +2596,7 @@ def _records_html(block: Mapping[str, Any]) -> str:
         realized = _finite(trade.get("realized_pnl"))
         rows.append(
             "<tr>"
-            f"<td>{html.escape(time.strftime('%m-%d %H:%M:%S', time.gmtime(ts)) if ts else '—')}</td>"
+            f"<td>{_ts_text(ts, '%m-%d %H:%M:%S')}</td>"
             f"<td>{html.escape(str(trade.get('symbol') or '—'))}</td>"
             f"<td class=\"{side_css}\">{html.escape(str(trade.get('side_text') or '—'))}</td>"
             f"<td>{html.escape(str(trade.get('kind_text') or '—'))}</td>"
@@ -2595,7 +2642,7 @@ def render_records_html(status: Mapping[str, Any], records: Mapping[str, Any],
 <body><div class="wrap">
 <h1>{html.escape(title)} <a class="navlink" href="/">← 返回概览</a></h1>
 {''.join(body)}
-<footer>生成于 {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(generated))} UTC ·
+<footer>生成于 {_ts_text(generated, '%Y-%m-%d %H:%M:%S')}（北京时间） ·
 记录页（只读：成交与权益均来自本地库；账号私有读数由 tick 注入）</footer>
 <script>{_ADMIN_JS}</script>
 </div></body></html>
@@ -2763,7 +2810,7 @@ def render_html(snapshot: Mapping[str, Any], *, symbols: Sequence[str] = DEFAULT
 <body><div class="wrap">
 <h1>{html.escape(title)} <a class="navlink" href="/records">记录页 →</a></h1>
 {''.join(body)}
-<footer>生成于 {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(generated))} UTC ·
+<footer>生成于 {_ts_text(generated, '%Y-%m-%d %H:%M:%S')}（北京时间） ·
 监控面板（读 DB + 公开行情；私有读数由 tick 注入） · 人工操作见⑥：
 kill / 清仓 / 重置回撤，用带 ?k=&lt;ADMIN_TOKEN&gt; 的链接打开一次即保存到本浏览器 ·
 成交与事件流见记录页</footer>

@@ -182,7 +182,7 @@ class ModuleBoundaryTests(unittest.TestCase):
         modules = self._imports(ROOT / "app" / "views.py")
         self.assertNotIn("lighter", modules)
         self.assertTrue(all(m.split(".")[0] in ("app", "__future__", "bisect", "html",
-                                                "json", "logging", "math", "time",
+                                            "datetime", "json", "logging", "math", "time",
                                                 "dataclasses", "decimal", "typing")
                             for m in modules), f"unexpected imports: {modules}")
 
@@ -524,6 +524,44 @@ class HtmlTests(PanelFixture):
         records = panel.records_page()                   # 记录页空库也要能开
         self.assertIn('id="block-records"', records)
         self.assertIn("还没有成交记录", records)
+
+
+class DisplayPolishTests(PanelFixture):
+    """2026-11-07 面板体验整改回归：北京时间、曲线刻度、内部术语映射、窄屏标签。
+
+    只钉 HTML 渲染层；JSON 字段（equity_source/dd.action/data_source.name/timestamp）
+    保持原值 —— 改口径只发生在 *_TXT 映射与 _ts_text 这一个换算点。
+    """
+
+    def test_ts_text_uses_display_tz(self) -> None:
+        # epoch 0 = 北京时间 08:00（DISPLAY_TZ_OFFSET 默认 +8）
+        self.assertEqual(views._ts_text(0.0), "01-01 08:00")
+        self.assertEqual(views._ts_text(None), "—")
+        self.assertEqual(views._ts_text("bad"), "—")
+
+    def test_curve_has_grid_ticks_end_labels_and_no_utc(self) -> None:
+        pts = [{"ts": T0 + i * 1800.0, "cum_pnl": i - 2.0, "twr_pct": (i - 2.0) / 10.0}
+               for i in range(6)]
+        svg = views._svg_curve(pts)
+        self.assertEqual(svg.count('stroke-dasharray="2 5"'), 5, "左右轴各 5 档网格")
+        self.assertNotIn("UTC", svg, "曲线轴与刻度不再标 UTC")
+        self.assertIn(" U</text>", svg, "实线末端值标签")
+        self.assertIn("%</text>", svg, "虚线末端值标签")
+
+    def test_no_internal_jargon_on_pages(self) -> None:
+        page = self.seeded_panel().page()
+        self.assertNotIn("(provider)", page, "权益来源不再显示内部枚举")
+        self.assertNotIn("上次 tick", page)
+        self.assertNotIn("时间(UTC)", page)
+        self.assertIn("上次巡检", page)
+        records = self.seeded_panel().records_page()
+        self.assertNotIn("时间(UTC)", records)
+        self.assertNotIn("(provider)", records)
+
+    def test_dyn_rows_carry_mobile_labels(self) -> None:
+        page = self.seeded_panel().page()
+        self.assertIn("data-l=", page, "窄屏数值标签（data-l）必须渲染出来")
+        self.assertIn("data-l='密集'", page)
 
 
 class RecordsTests(PanelFixture):
