@@ -1994,6 +1994,10 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 th:first-child, td:first-child { text-align: left; }
 tr:last-child td { border-bottom: none; }
 .pos { color: var(--ok); } .neg { color: var(--bad); } .dim { color: var(--dim); }
+/* .kv b { color: var(--text) } 的优先级（0-2-1）会压过裸 .neg/.pos（0-1-0）——
+   状态条里的 <b class="neg"> 由此失效（2026-11-07 线上实测：computed color 仍是 --text）。
+   显式给 .kv 里的 b 补同优先级规则，表格里的裸 td.neg/.pos 不受影响。 */
+.kv b.neg { color: var(--bad); } .kv b.pos { color: var(--ok); }
 .bad { color: var(--bad); font-weight: 600; }
 .warnlist { margin: 8px 0 0; padding: 6px 10px; border-radius: 6px;
             background: var(--warn-bg); border: 1px solid var(--warn-bd); color: var(--warn-fg);
