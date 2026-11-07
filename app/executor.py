@@ -136,6 +136,14 @@ SIGNAL_BAR_MS = 4 * 3600 * 1000
 #: 3 次连续硬失败几乎不可能是瞬时抖动。
 DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
 
+#: 读失败快速重试（2026-11-07 P1-3）：账户读 / 单标的 K 线读失败时等 75s 再试一次，
+#: 仍失败才走原来的整轮停手。动机：urltest 代理切换最长 3 分钟，tick 在 :03/:33，
+#: 时效闸 30 分钟 —— 一轮读失败 = 信号整单漏掉；75s 重试仍落在 :03-:06 入场窗口内。
+#: 只包**读**（失败时还没写过任何状态，重跑无副作用）；下单路径绝不重试。
+#: 重试成功不计 `_failures`（熔断看「连续硬失败」，瞬时抖动不该记进去）。
+READ_RETRY_DELAY_S = 75.0
+READ_RETRY_EVENT = "read_retried"                  # 第一次读失败、重试已排（留痕）
+
 # ------------------------------------------------------------------ 对账不变式
 
 SEVERITY_DANGER = "danger"          # 必须人工处置；阻断新开仓
@@ -1570,6 +1578,9 @@ class Executor:
         #: 本轮 crypto 腿用的 `RiskState`（含 DD / 日亏口径）。MR 腿的基金级闸门复用
         #: 同一份状态，避免两条腿各算一套权益/阈值（2026-11-02 第五轮）。
         self.last_risk_state: Optional[Any] = None
+        #: `market_details()` 的本轮缓存（每轮 `_run_tick` 开头重置；三个标的共用一份，
+        #: 原实现对每个标的各拉一遍 = 3 次相同 HTTP）。
+        self._details_cache: Optional[Mapping[str, Any]] = None
 
     def __repr__(self) -> str:
         return (f"Executor(symbols={self.symbols}, failures={self._failures}, "
@@ -1600,6 +1611,39 @@ class Executor:
                         data={"reason": reason})
 
     # ---------------------------------------------------------------- 一轮 tick
+
+    # ------------------------------------------------------------ 读重试（P1-3）
+
+    async def _read_with_retry(self, what: str, factory: Callable[[], Awaitable[Any]]) -> Any:
+        """读一次；失败等 `READ_RETRY_DELAY_S` 再试一次，仍失败**原样抛**。
+
+        只包「读」（账户快照 / K 线）：失败时还没写过任何状态，重跑无副作用。
+        下单路径**绝不**包 —— 重试下单 = 重复下单。第一次失败不进 `_failures`
+        （熔断看「连续硬失败」，75s 后重试成功的瞬时抖动不该记进去）。
+        """
+        try:
+            return await factory()
+        except Exception as exc:                              # noqa: BLE001 - 重试判定
+            try:
+                self._event(READ_RETRY_EVENT,
+                            f"{what}读取失败，{int(READ_RETRY_DELAY_S)}s 后重试一次: "
+                            f"{type(exc).__name__}: {exc}"[:400])
+            except Exception:                                 # noqa: BLE001 - 留痕失败不掩盖原错误
+                logger.warning("could not record %s for %s",
+                               READ_RETRY_EVENT, what, exc_info=True)
+            await self._sleep(READ_RETRY_DELAY_S)
+            return await factory()
+
+    async def _load_with_retry(self, symbol: str, stamp_ms: int) -> Dict[str, Any]:
+        """单标的取数 + 读重试（`_run_tick` ④ 的并行任务体）。"""
+        return await self._read_with_retry(
+            f"{symbol} K线", lambda: self._load_symbol(symbol, stamp_ms))
+
+    async def _market_details_once(self) -> Mapping[str, Any]:
+        """`market_details()` 每轮只拉一次（`_run_tick` 开头重置；三个标的共用一份）。"""
+        if self._details_cache is None:
+            self._details_cache = await asyncio.to_thread(self.market.market_details)
+        return self._details_cache
 
     async def run_once(self, now_ms: Optional[int] = None) -> TickReport:
         """跑一轮。**不抛异常**：所有失败都落 `events` + 反映在 `TickReport` 上。
@@ -1638,8 +1682,10 @@ class Executor:
     async def _run_tick(self, report: TickReport, stamp_ms: int) -> TickReport:
         now_s = float(self.clock())
         failures_at_start = self._failures
-        # ① 交易所真相（失败即整轮停手：没有读数就没有对账结论）
-        account = await self.reader.read()
+        # ① 交易所真相（失败即整轮停手：没有读数就没有对账结论）。
+        #    读失败先快速重试一次（READ_RETRY_DELAY_S），仍失败才整轮停手。
+        self._details_cache = None                       # 新的一轮：market_details 缓存失效
+        account = await self._read_with_retry("账户", self.reader.read)
         self.last_account = account
         # ①a 超龄 CLOSING 收尸（对抗审查 P1-1 的 tick 级兜底）：放在止损守护之前 ——
         #     abort 回 OPEN 的行，本轮的 _guard_stops 才能重新管到它的保护单。
@@ -1683,10 +1729,22 @@ class Executor:
         # 回撤/日亏守护仍看账户总权益——它们守的是整个账户。
         self._mr_contribution = self._mr_contribution_of(account)
 
-        # ④ 取数 + 信号（先全部取完，任何一个标的取数失败 → 本轮停手）
-        feeds: Dict[str, Dict[str, Any]] = {}
-        for symbol in self.symbols:
-            feeds[symbol] = await self._load_symbol(symbol, stamp_ms)
+        # ④ 取数 + 信号（三标的**并行**拉；任何一个标的取数失败 → 本轮停手，
+        #    fail-closed 不变）。并行安全：`_load_symbol` 的共享副作用（`_prices` /
+        #    `_bars`）都在事件循环的协程段写入；`market.bars()` 是各标的独立的同步
+        #    urllib 调用，无共享会话状态。原串行版三标的合计几十秒，是 tick 时长主项。
+        tasks = {symbol: asyncio.ensure_future(
+                     self._load_with_retry(symbol, stamp_ms))
+                 for symbol in self.symbols}
+        try:
+            feeds: Dict[str, Dict[str, Any]] = {
+                symbol: await task for symbol, task in tasks.items()}
+        except BaseException:
+            # 谁先炸就取消还没回来的兄弟任务（都是纯读，取消无害；to_thread 里的
+            # urllib 调用取消不了，有自身超时兜底）。
+            for task in tasks.values():
+                task.cancel()
+            raise
 
         # ⑤ 装配 RiskState（库里持仓 ∪ 交易所持仓；并集 = 更严）
         if self.assembler.equity_provider is None:
@@ -1795,7 +1853,8 @@ class Executor:
                                                   detail={"bars": len(feed.get("bars") or ())}),),
                             reason=str(feed.get("reason") or ""))
         # `market_details()` 也是 HTTP（orderBookDetails）→ 同样 off-loop。
-        details = await asyncio.to_thread(self.market.market_details)
+        # 每轮只拉一次：三个标的共用同一份返回，原实现打 3 次相同请求。
+        details = await self._market_details_once()
         info = details.get(symbol)
         return self.lifecycle.decide(
             symbol, feed["bars"], ind=feed["ind"], i=len(feed["bars"]) - 1,

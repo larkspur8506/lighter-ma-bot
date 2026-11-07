@@ -111,6 +111,7 @@ class FakeMarket:
         self.feeds = dict(feeds)
         self.calls = []
         self.fail_on = set()
+        self.details_calls = 0
         #: `snapshot()` 用：symbol -> 实时 mid（不给 = 没有 snapshot 方法，执行器退回计划价）
         self.mids = {}
         self.snapshot_error = None
@@ -135,6 +136,7 @@ class FakeMarket:
         return self.feeds[symbol]
 
     def market_details(self, *, force=False):
+        self.details_calls += 1
         return {sym: (BTC_INFO if sym == BTC else ETH_INFO) for sym in self.feeds}
 
 
@@ -1961,6 +1963,77 @@ class StrategyPositionsTests(unittest.TestCase):
             executor.ExchangePosition(symbol="eth", side=-1, qty=Decimal("1"), market_id=0),), orders=())
         self.assertEqual(len(executor.strategy_positions(account.positions, ("BTC", "ETH"))), 1)
         self.assertEqual(len(executor.strategy_positions(account.positions, ("BTC", "SOL"))), 0)
+
+
+# --------------------------------------------------------------------- 读重试
+
+
+class _FlakyReader(FakeReader):
+    """前 N 次读必炸的替身（测读失败快速重试，P1-3）。"""
+
+    def __init__(self, exchange, *, fail_times=1, **kwargs):
+        super().__init__(exchange, **kwargs)
+        self.fail_times = int(fail_times)
+
+    async def read(self):
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise RuntimeError("flaky read")
+        return await super().read()
+
+
+class ReadRetryTests(Base):
+    """读失败快速重试（READ_RETRY_DELAY_S）：只包读，下单路径不重试。"""
+
+    @staticmethod
+    def _snooze_sleeper():
+        delays = []
+
+        async def _sleeper(seconds):
+            delays.append(float(seconds))
+
+        return delays, _sleeper
+
+    def test_transient_read_failure_is_retried_and_not_counted(self):
+        """瞬时读失败：75s 后重试成功 → 本轮 ok，失败计数不进（熔断不误开）。"""
+        import asyncio
+        delays, sleeper = self._snooze_sleeper()
+        ex = self.make_executor(reader=_FlakyReader(self.exchange, fail_times=1),
+                                sleeper=sleeper)
+        report = self.run_tick(ex)
+        self.assertEqual(report.status, "ok")
+        # 首个 delay 是读重试；后面可能还有 fill-confirm 轮询等也走 `_sleep` 的间隔
+        self.assertEqual(delays[0], executor.READ_RETRY_DELAY_S)
+        self.assertEqual(ex.failures, 0)
+        self.assertFalse(ex.circuit_open)
+        self.assertEqual(len(self.events(executor.READ_RETRY_EVENT)), 1)
+
+    def test_persistent_read_failure_stops_the_round_after_one_retry(self):
+        """持续读失败：只重试一次，仍失败走原 fail-closed 路径（status=error）。"""
+        import asyncio
+        delays, sleeper = self._snooze_sleeper()
+        ex = self.make_executor(reader=_FlakyReader(self.exchange, fail_times=99),
+                                sleeper=sleeper)
+        report = self.run_tick(ex)
+        self.assertEqual(report.status, "error")
+        self.assertEqual(delays, [executor.READ_RETRY_DELAY_S])
+        self.assertGreaterEqual(ex.failures, 1)
+
+    def test_market_details_is_fetched_once_per_tick(self):
+        """`market_details()` 每轮只拉一次（原实现每标的各拉一遍 = 3 次相同 HTTP）。"""
+        import asyncio
+        ex = self.make_executor()
+        self.assertEqual(self.market.details_calls, 0)
+
+        async def _twice():
+            await ex._market_details_once()
+            await ex._market_details_once()
+
+        asyncio.run(_twice())
+        self.assertEqual(self.market.details_calls, 1)
+        ex._details_cache = None                       # 新的一轮：缓存重置后再拉
+        asyncio.run(ex._market_details_once())
+        self.assertEqual(self.market.details_calls, 2)
 
 
 if __name__ == "__main__":                                        # pragma: no cover
