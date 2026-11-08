@@ -68,7 +68,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from app import dd as dd_module
 from app import strategy
-from app.alerts import DISPLAY_TZ as _DISPLAY_TZ
+from app.alerts import DISPLAY_TZ as _DISPLAY_TZ, TZ_LABEL as _TZ_LABEL
 from app.dd import TWR_BASE, TWR_DISPLAY_BASE, TwrState, advance, bootstrap, net_flow, \
     normalise_points
 from app.risk import RiskLimits, drawdown as risk_drawdown
@@ -2084,6 +2084,16 @@ _DD_ACTION_TXT = {"warn": "警戒", "kill": "熔断"}
 _DATA_SOURCE_TXT = {"bar": "K线", "equity_curve": "权益曲线", "unavailable": "无"}
 
 
+def _enum_text(mapping: Mapping[str, str], value: Any, dash: str = "—") -> str:
+    """内部枚举 → 页面文案；未知值原样显示但**必须转义**。
+
+    这三处在 2026-11-07 的术语整改里丢了 `html.escape`（映射命中时安全、未命中时
+    把原始值直接拼进 HTML）—— 值来自 DB/上游 JSON，不能假设干净（2026-11-08 审核 P3）。
+    """
+    raw = "" if value is None else str(value)
+    return html.escape(mapping.get(raw, raw or dash))
+
+
 def _qty_text(value: Any) -> str:
     out = _finite(value)
     return "—" if out is None else f"{out:g}"
@@ -2217,18 +2227,18 @@ def _status_html(block: Mapping[str, Any], mode: str) -> str:
         f'<span class="dot {html.escape(level)}"></span>',
         f'<b>{html.escape(str(block.get("state") or "降级"))}</b>',
         f'<span class="kv">权益 <b>{_money(block.get("equity"))} U</b>'
-        f' <span class="dim">（{_EQUITY_SOURCE_TXT.get(str(block.get("equity_source")), block.get("equity_source"))}）</span></span>',
+        f' <span class="dim">（{_enum_text(_EQUITY_SOURCE_TXT, block.get("equity_source"))}）</span></span>',
         f'<span class="kv">持仓 <b>{int(block.get("open_count") or 0)}'
         f'/{int(block.get("max_positions") or 0)}</b></span>',
         f'<span class="kv">kill <b>{"ON" if block.get("kill") else "off"}</b></span>',
         _mr_status_chip(block.get("mr")),
         f'<span class="kv">回撤 <b>{_pct(dd.get("drawdown"))}</b>'
-        f' <span class="dim">（{_DD_ACTION_TXT.get(str(dd.get("action")), dd.get("action") or "—")}）</span></span>',
+        f' <span class="dim">（{_enum_text(_DD_ACTION_TXT, dd.get("action"))}）</span></span>',
         f'<span class="kv">模式 <b>{html.escape(mode)}</b></span>',
         f'<span class="kv">凭据 <b>{credentials_text}</b></span>',
         f'<span class="kv">上次巡检 <b>{html.escape(str(block.get("last_tick_text")))}</b></span>',
         f'<span class="kv">数据源 <b>{"ok" if (block.get("data_source") or {}).get("ok") else "异常"}</b>'
-        f' <span class="dim">{_DATA_SOURCE_TXT.get(str((block.get("data_source") or {}).get("name")), (block.get("data_source") or {}).get("name"))}</span></span>',
+        f' <span class="dim">{_enum_text(_DATA_SOURCE_TXT, (block.get("data_source") or {}).get("name"))}</span></span>',
         "</section>",
     ]
     reasons = block.get("reasons") or []
@@ -2642,7 +2652,7 @@ def render_records_html(status: Mapping[str, Any], records: Mapping[str, Any],
 <body><div class="wrap">
 <h1>{html.escape(title)} <a class="navlink" href="/">← 返回概览</a></h1>
 {''.join(body)}
-<footer>生成于 {_ts_text(generated, '%Y-%m-%d %H:%M:%S')}（北京时间） ·
+<footer>生成于 {_ts_text(generated, '%Y-%m-%d %H:%M:%S')}（{html.escape(_TZ_LABEL)}） ·
 记录页（只读：成交与权益均来自本地库；账号私有读数由 tick 注入）</footer>
 <script>{_ADMIN_JS}</script>
 </div></body></html>
@@ -2810,7 +2820,7 @@ def render_html(snapshot: Mapping[str, Any], *, symbols: Sequence[str] = DEFAULT
 <body><div class="wrap">
 <h1>{html.escape(title)} <a class="navlink" href="/records">记录页 →</a></h1>
 {''.join(body)}
-<footer>生成于 {_ts_text(generated, '%Y-%m-%d %H:%M:%S')}（北京时间） ·
+<footer>生成于 {_ts_text(generated, '%Y-%m-%d %H:%M:%S')}（{html.escape(_TZ_LABEL)}） ·
 监控面板（读 DB + 公开行情；私有读数由 tick 注入） · 人工操作见⑥：
 kill / 清仓 / 重置回撤，用带 ?k=&lt;ADMIN_TOKEN&gt; 的链接打开一次即保存到本浏览器 ·
 成交与事件流见记录页</footer>

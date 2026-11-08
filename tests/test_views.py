@@ -563,6 +563,35 @@ class DisplayPolishTests(PanelFixture):
         self.assertIn("data-l=", page, "窄屏数值标签（data-l）必须渲染出来")
         self.assertIn("data-l='密集'", page)
 
+    def test_footer_timezone_label_comes_from_alerts(self) -> None:
+        """页脚时区名必须跟 `app.alerts.TZ_LABEL` 同源（2026-11-08 审核 P3）。
+
+        原来写死「北京时间」：改 `DISPLAY_TZ_LABEL` 后推送说「UTC」、页脚还说「北京时间」。
+        """
+        from app import alerts
+        want = f"（{alerts.TZ_LABEL}）"
+        page = self.seeded_panel().page()
+        self.assertIn(want, page)
+        records = self.seeded_panel().records_page()
+        self.assertIn(want, records)
+        # 换一个标签必须跟着变 —— 写死的「北京时间」在这里立刻红。
+        old = views._TZ_LABEL
+        try:
+            views._TZ_LABEL = "UTC+8"
+            self.assertIn("（UTC+8）", self.seeded_panel().page())
+            self.assertIn("（UTC+8）", self.seeded_panel().records_page())
+        finally:
+            views._TZ_LABEL = old
+
+    def test_enum_text_escapes_unknown_values(self) -> None:
+        """术语映射未命中时也要转义 —— 值来自 DB/上游 JSON，不能直接拼进 HTML。"""
+        self.assertEqual(views._enum_text(views._EQUITY_SOURCE_TXT, "provider"), "实时读数")
+        self.assertEqual(views._enum_text(views._EQUITY_SOURCE_TXT, None), "—")
+        self.assertEqual(views._enum_text(views._DD_ACTION_TXT, "<script>x</script>"),
+                         "&lt;script&gt;x&lt;/script&gt;")
+        page = self.seeded_panel().page()
+        self.assertNotIn("<span class=\"dim\">（None）", page)
+
 
 class RecordsTests(PanelFixture):
     """记录页：订单明细 + 「成交后余额」+ 资金概览（数据全部来自库，零网络）。"""
